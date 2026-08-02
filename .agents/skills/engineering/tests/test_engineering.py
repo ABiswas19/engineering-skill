@@ -281,6 +281,26 @@ class Task2ContractTests(unittest.TestCase):
             text=True,
         )
 
+    def require_cli_private_acl(self, root: Path) -> None:
+        """Normalize a synthetic controller before testing its real child process."""
+        if os.name != "nt":
+            return
+        controller = self.module()._project_controller_dir(root)
+        controller.mkdir(parents=True, exist_ok=True)
+        try:
+            for candidate in [
+                controller,
+                *sorted(
+                    controller.rglob("*"),
+                    key=lambda path: (len(path.parts), str(path)),
+                ),
+            ]:
+                self.module()._windows_owner_private(candidate, enforce=True)
+        except self.module().EngineeringError:
+            self.skipTest(
+                "Windows host cannot establish the owner-private ACL required by the CLI"
+            )
+
     def write_controls(
         self,
         root: Path,
@@ -1204,6 +1224,7 @@ class Task2ContractTests(unittest.TestCase):
     def test_prepare_cli_emits_json_and_uses_blocked_exit_code(self):
         root, _ = self.prepared_repo("prepare-cli")
         self.module().approve_checks(root)
+        self.require_cli_private_acl(root)
 
         ready = self.run_cli(
             "prepare",
@@ -4756,6 +4777,7 @@ class Task5ContractTests(unittest.TestCase):
     git = Task2ContractTests.git
     commit_all = Task2ContractTests.commit_all
     run_cli = Task2ContractTests.run_cli
+    require_cli_private_acl = Task2ContractTests.require_cli_private_acl
     write_controls = Task2ContractTests.write_controls
     write_fake_graphify = Task2ContractTests.write_fake_graphify
     prepared_repo = Task2ContractTests.prepared_repo
@@ -5387,6 +5409,7 @@ class Task5ContractTests(unittest.TestCase):
             "complete-cli", scope=["README.md"]
         )
         (root / "README.md").write_text("# Updated\n", encoding="utf-8")
+        self.require_cli_private_acl(root)
 
         result = self.run_cli(
             "complete",
