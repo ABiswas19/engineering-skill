@@ -4290,6 +4290,7 @@ class Task3AmendedContractTests(unittest.TestCase):
                 "_bounded_worktree_remove",
                 side_effect=remove_fixture,
             ),
+            patch.object(module.os, "killpg", return_value=None, create=True),
         ):
             result = module.dispatch_hook(
                 root,
@@ -4380,6 +4381,7 @@ class Task3AmendedContractTests(unittest.TestCase):
                 "_bounded_worktree_remove",
                 side_effect=remove_fixture,
             ),
+            patch.object(module, "_recover_worker_tree_state", return_value=None),
         ):
             result = module.dispatch_hook(
                 root,
@@ -4396,12 +4398,8 @@ class Task3AmendedContractTests(unittest.TestCase):
             self.assertNotIn("worker_pgid", result["operation"])
         else:
             self.assertEqual(2_147_000_000, result["operation"].get("worker_pgid"))
-        if os.name == "nt":
-            self.assertFalse(result["cleanup"]["completed"])
-            self.assertEqual("live_worker_process_tree", result["cleanup"]["reason"])
-        else:
-            self.assertTrue(result["operation"]["worker_process_tree_dead"])
-            self.assertTrue(result["cleanup"]["completed"])
+        self.assertFalse(result["cleanup"]["completed"])
+        self.assertEqual("live_worker_process_tree", result["cleanup"]["reason"])
 
     @unittest.skipUnless(os.name == "posix", "real POSIX process-group proof")
     def test_real_posix_timeout_kills_descendant_that_ignores_sigterm(self):
