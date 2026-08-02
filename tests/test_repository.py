@@ -39,6 +39,16 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_ci_installs_the_pinned_graphify_dependency(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "python -m pip install \"git+https://github.com/safishamsi/graphify.git"
+            "@d89ec68af95e0cad801b56d88df383991e659823\"",
+            workflow,
+        )
+
     def test_skill_tree_is_generic_and_exact(self) -> None:
         actual = {
             path.relative_to(SKILL_ROOT).as_posix()

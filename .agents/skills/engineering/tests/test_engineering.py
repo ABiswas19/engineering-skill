@@ -206,6 +206,8 @@ class Task2ContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        engineering._enforce_owner_private(root)
+        engineering._enforce_owner_private(root / ".git")
         subprocess.run(
             ["git", "-C", str(root), "config", "user.email", "synthetic"],
             check=True,
@@ -817,6 +819,15 @@ class Task2ContractTests(unittest.TestCase):
             ("update", "query", "path", "explain"),
             identity.required_commands,
         )
+
+    def test_synthetic_repo_has_an_owner_private_controller_directory(self):
+        module = self.module()
+        root = self.init_repo("private-controller")
+        controller = module._project_controller_dir(root)
+        controller.mkdir(parents=True)
+
+        module._enforce_owner_private(controller)
+        module._verify_owner_private(controller, directory=True)
 
     def test_graphify_install_argv_is_exact_and_pinned(self):
         module = self.module()
