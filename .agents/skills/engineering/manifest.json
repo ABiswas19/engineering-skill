@@ -1,0 +1,11 @@
+{
+  "name": "engineering",
+  "version": "2.1.0",
+  "controller_schema": 1,
+  "graphify": {
+    "repository": "https://github.com/safishamsi/graphify",
+    "tag": "v0.9.5",
+    "version": "0.9.5",
+    "commit": "d89ec68af95e0cad801b56d88df383991e659823"
+  }
+}

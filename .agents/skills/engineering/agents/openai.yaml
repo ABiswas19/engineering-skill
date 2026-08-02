@@ -1,0 +1,4 @@
+interface:
+  display_name: "Engineering"
+  short_description: "Govern non-trivial software work, evidence, maintenance, and applied learning."
+  default_prompt: "Use $engineering for this non-trivial engineering task."
