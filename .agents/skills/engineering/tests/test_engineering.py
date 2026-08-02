@@ -6822,6 +6822,24 @@ class Task7ContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn(str(source), receipt_text)
 
+    def test_install_validation_allows_only_generated_controller_bytecode(self):
+        module = self.module()
+        source = self.bundle_repo("bytecode-cache")
+        receipt = module.install_bundle(source, self.home)
+        canonical = self.home / ".agents" / "skills" / "engineering"
+        cache = canonical / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "engineering.cpython-312.pyc").write_bytes(b"generated")
+
+        self.assertEqual(
+            receipt["codex_parity_hash"],
+            module._validated_installed_bundle(canonical, receipt),
+        )
+
+        (cache / "untrusted.cpython-312.pyc").write_bytes(b"unexpected")
+        with self.assertRaisesRegex(module.EngineeringError, "unexpected bytecode"):
+            module._validated_installed_bundle(canonical, receipt)
+
     def test_install_replay_is_exact_and_known_good_rollback_restores_prior(self):
         module = self.module()
         source = self.bundle_repo()

@@ -7597,8 +7597,22 @@ def _tree_digest(path: Path) -> str:
     for candidate in sorted(path.rglob("*"), key=lambda value: value.as_posix()):
         if _is_reparse_point(candidate):
             raise EngineeringError("Engineering installed bundle contains a link/reparse point.")
+        relative_path = candidate.relative_to(path)
+        if relative_path.parts[:2] == ("scripts", "__pycache__"):
+            if candidate.is_dir():
+                continue
+            if (
+                len(relative_path.parts) == 3
+                and candidate.is_file()
+                and re.fullmatch(
+                    r"engineering(?:\.[A-Za-z0-9_-]+)?\.pyc",
+                    relative_path.name,
+                )
+            ):
+                continue
+            raise EngineeringError("Engineering installed bundle has unexpected bytecode.")
         if candidate.is_file():
-            relative = candidate.relative_to(path).as_posix()
+            relative = relative_path.as_posix()
             digest.update(relative.encode("utf-8") + b"\0")
             digest.update(candidate.read_bytes() + b"\0")
     return "sha256:" + digest.hexdigest()
