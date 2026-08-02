@@ -5983,7 +5983,11 @@ def _worktree_roots(root: Path) -> list[Path]:
 
 def _is_reparse_point(path: Path) -> bool:
     try:
-        return path.is_symlink() or bool(
+        if path.is_symlink():
+            return True
+        if os.name != "nt":
+            return False
+        return bool(
             getattr(path.lstat(), "st_file_attributes", 0)
             & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         )

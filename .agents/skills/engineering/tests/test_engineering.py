@@ -46,6 +46,23 @@ def load_engineering():
 engineering = load_engineering()
 
 
+class CrossPlatformFilesystemTests(unittest.TestCase):
+    def test_posix_ignores_windows_reparse_attributes(self):
+        class OrdinaryPath:
+            def is_symlink(self):
+                return False
+
+            def lstat(self):
+                return type(
+                    "StatResult",
+                    (),
+                    {"st_file_attributes": getattr(engineering.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 1024)},
+                )()
+
+        with patch.object(engineering.os, "name", "posix"):
+            self.assertFalse(engineering._is_reparse_point(OrdinaryPath()))
+
+
 class SkillShapeTests(unittest.TestCase):
     def test_skill_is_engineering_and_human_readable(self):
         self.assertTrue(SKILL.exists(), "SKILL.md must exist")
