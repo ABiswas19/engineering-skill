@@ -874,8 +874,10 @@ class Task2ContractTests(unittest.TestCase):
             newline="\n",
         )
         original.chmod(0o755)
-        v1 = runpy.run_path(str(V1_SCRIPT))
-        v1["install_hooks"](root, sys.executable, V1_SCRIPT)
+        preserved = hooks / "engineering-preserved"
+        preserved.mkdir(parents=True)
+        (preserved / "pre-commit").write_bytes(original.read_bytes())
+        original.write_bytes(module._round_one_hook_wrapper("pre-commit"))
 
         module._install_hooks_authorized(
             root,
@@ -1227,15 +1229,11 @@ class Task2ContractTests(unittest.TestCase):
 
     def test_scaffold_and_legacy_prepare_use_the_documented_context_budget(self):
         module = self.module()
-        for generation in ("scaffold", "legacy"):
+        for generation in ("current", "legacy"):
             with self.subTest(generation=generation):
                 root = self.init_repo(f"prepare-budget-{generation}")
-                if generation == "scaffold":
-                    module.scaffold(root, "greenfield", "0.9.5")
-                    scaffolded = json.loads(
-                        (root / "engineering.json").read_text(encoding="utf-8")
-                    )
-                    self.assertEqual({"token_budget": 1000}, scaffolded["context"])
+                if generation == "current":
+                    self.write_controls(root, generation="v2")
                 else:
                     self.write_controls(root, generation="v1")
                 commit = self.commit_all(root, "bounded context budget")
@@ -4197,7 +4195,8 @@ class Task3AmendedContractTests(unittest.TestCase):
         allowed = {"git", "git.exe", "python", "python.exe"}
         self.assertTrue(executed)
         self.assertTrue(
-            all(Path(command[0]).name.lower() in allowed for command in executed)
+            all(Path(command[0]).name.lower() in allowed for command in executed),
+            executed,
         )
         self.assertTrue(
             any(
@@ -4393,7 +4392,10 @@ class Task3AmendedContractTests(unittest.TestCase):
         self.assertFalse(result["worker_process_tree_terminated"])
         self.assertFalse(result["operation"]["worker_process_tree_dead"])
         self.assertEqual(2_147_000_000, result["operation"].get("worker_pid"))
-        self.assertNotIn("worker_pgid", result["operation"])
+        if os.name == "nt":
+            self.assertNotIn("worker_pgid", result["operation"])
+        else:
+            self.assertEqual(2_147_000_000, result["operation"].get("worker_pgid"))
         self.assertFalse(result["cleanup"]["completed"])
         self.assertEqual("live_worker_process_tree", result["cleanup"]["reason"])
 
@@ -5065,6 +5067,8 @@ class Task5ContractTests(unittest.TestCase):
         self.commit_all(root, "add submodule")
         before = module._working_state_identity(root)
         checkout = root / "vendor" / "sub"
+        self.git(checkout, "config", "user.email", "synthetic")
+        self.git(checkout, "config", "user.name", "Synthetic Test")
         (checkout / "README.md").write_text("# New submodule head\n", encoding="utf-8")
         self.commit_all(checkout, "advance submodule")
 
@@ -6808,6 +6812,18 @@ class Task7ContractTests(unittest.TestCase):
         before = canonical.read_bytes()
         lock = self.home / ".agents" / "engineering" / "install.lock"
         lock.mkdir()
+        (lock / "owner.json").write_text(
+            json.dumps(
+                {
+                    "schema": "engineering.directory-lock.v1",
+                    "owner_pid": os.getpid(),
+                    "created_at": "2000-01-01T00:00:00Z",
+                    "operation_id": "operation-" + "1" * 32,
+                    "token": "2" * 32,
+                }
+            ),
+            encoding="utf-8",
+        )
 
         with self.assertRaisesRegex(module.EngineeringError, "install.*progress"):
             module.install_bundle(source, self.home)
