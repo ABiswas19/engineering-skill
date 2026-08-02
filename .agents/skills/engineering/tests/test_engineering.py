@@ -6486,6 +6486,28 @@ class Task7ContractTests(unittest.TestCase):
         self.assertEqual("$true", run.call_args.args[0][-2])
         self.assertEqual("$false", run.call_args.args[0][-1])
 
+        system_private = {
+            **private,
+            "access": [
+                *private["access"],
+                {
+                    "sid": "S-1-5-18",
+                    "type": "Allow",
+                    "inherited": False,
+                    "inheritance": "None",
+                    "propagation": "None",
+                },
+            ],
+        }
+        result = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(system_private), stderr=""
+        )
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.subprocess, "run", return_value=result),
+        ):
+            self.real_owner_private(target)
+
         for change in (
             {"protected": False},
             {

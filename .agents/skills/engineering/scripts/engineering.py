@@ -6130,7 +6130,7 @@ def _windows_owner_private(path: Path, *, enforce: bool) -> None:
         or not access
         or any(
             not isinstance(item, dict)
-            or item.get("sid") != current_sid
+            or item.get("sid") not in {current_sid, "S-1-5-18"}
             or item.get("type") != "Allow"
             or item.get("inherited") is not False
             or item.get("inheritance")
