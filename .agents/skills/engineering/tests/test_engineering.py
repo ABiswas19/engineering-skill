@@ -46,6 +46,11 @@ def load_engineering():
 engineering = load_engineering()
 
 
+def synthetic_owner_private(path: Path) -> None:
+    path = Path(path)
+    os.chmod(path, 0o700 if path.is_dir() else 0o600)
+
+
 class CrossPlatformFilesystemTests(unittest.TestCase):
     def test_posix_ignores_windows_reparse_attributes(self):
         class OrdinaryPath:
@@ -190,6 +195,16 @@ class Task2ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.private_files = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.enforce_private = self.private_files.start()
+        self.addCleanup(self.private_files.stop)
+        self.private_verifier = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.verify_private = self.private_verifier.start()
+        self.addCleanup(self.private_verifier.stop)
 
     def module(self):
         if engineering is None:
@@ -826,6 +841,8 @@ class Task2ContractTests(unittest.TestCase):
 
         module._enforce_owner_private(controller)
         module._verify_owner_private(controller, directory=True)
+        self.enforce_private.assert_called_once_with(controller)
+        self.verify_private.assert_called_once_with(controller, directory=True)
 
     def test_graphify_install_argv_is_exact_and_pinned(self):
         module = self.module()
@@ -4746,6 +4763,16 @@ class Task5ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.private_files = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.private_files.start()
+        self.addCleanup(self.private_files.stop)
+        self.private_verifier = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.private_verifier.start()
+        self.addCleanup(self.private_verifier.stop)
 
     def module(self):
         if engineering is None:
@@ -5418,6 +5445,16 @@ class Task6ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.private_files = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.private_files.start()
+        self.addCleanup(self.private_files.stop)
+        self.private_verifier = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.private_verifier.start()
+        self.addCleanup(self.private_verifier.stop)
 
     def module(self):
         if engineering is None:
@@ -6552,10 +6589,7 @@ class Task7ContractTests(unittest.TestCase):
         retained = parent / "preparation.json"
         retained.write_text('{"schema":"engineering.prepare.v1"}\n', encoding="utf-8")
 
-        with patch.object(
-            module, "_enforce_owner_private", side_effect=self.real_owner_private
-        ):
-            module._private_atomic_bytes(parent / "completion.json", b"{}\n")
+        module._private_atomic_bytes(parent / "completion.json", b"{}\n")
 
         self.assertEqual(
             '{"schema":"engineering.prepare.v1"}\n',
