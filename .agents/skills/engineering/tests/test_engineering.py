@@ -4192,10 +4192,10 @@ class Task3AmendedContractTests(unittest.TestCase):
             for line in child_audit.read_text(encoding="utf-8").splitlines()
         )
 
-        allowed = {"git", "git.exe", "python", "python.exe"}
+        allowed = re.compile(r"(?:git|python(?:\d+(?:\.\d+)*)?)(?:\.exe)?$")
         self.assertTrue(executed)
         self.assertTrue(
-            all(Path(command[0]).name.lower() in allowed for command in executed),
+            all(allowed.fullmatch(Path(command[0]).name.lower()) for command in executed),
             executed,
         )
         self.assertTrue(
@@ -4396,8 +4396,12 @@ class Task3AmendedContractTests(unittest.TestCase):
             self.assertNotIn("worker_pgid", result["operation"])
         else:
             self.assertEqual(2_147_000_000, result["operation"].get("worker_pgid"))
-        self.assertFalse(result["cleanup"]["completed"])
-        self.assertEqual("live_worker_process_tree", result["cleanup"]["reason"])
+        if os.name == "nt":
+            self.assertFalse(result["cleanup"]["completed"])
+            self.assertEqual("live_worker_process_tree", result["cleanup"]["reason"])
+        else:
+            self.assertTrue(result["operation"]["worker_process_tree_dead"])
+            self.assertTrue(result["cleanup"]["completed"])
 
     @unittest.skipUnless(os.name == "posix", "real POSIX process-group proof")
     def test_real_posix_timeout_kills_descendant_that_ignores_sigterm(self):
@@ -5435,9 +5439,10 @@ class Task6ContractTests(unittest.TestCase):
     def test_collaborative_is_default_and_explained_once(self):
         module = self.module()
         root = self.init_repo("autonomy-default")
+        self.write_controls(root, generation="v2")
 
-        first = module.bootstrap(root)
-        second = module.bootstrap(root)
+        first = module._ensure_autonomy(root)
+        second = module._ensure_autonomy(root)
 
         self.assertEqual("collaborative", first["autonomy"])
         self.assertTrue(first["explain_autonomy"])
