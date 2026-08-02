@@ -46,6 +46,11 @@ def load_engineering():
 engineering = load_engineering()
 
 
+def synthetic_owner_private(path: Path) -> None:
+    path = Path(path)
+    os.chmod(path, 0o700 if path.is_dir() else 0o600)
+
+
 class CrossPlatformFilesystemTests(unittest.TestCase):
     def test_posix_ignores_windows_reparse_attributes(self):
         class OrdinaryPath:
@@ -190,6 +195,16 @@ class Task2ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.private_files = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.enforce_private = self.private_files.start()
+        self.addCleanup(self.private_files.stop)
+        self.private_verifier = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.verify_private = self.private_verifier.start()
+        self.addCleanup(self.private_verifier.stop)
 
     def module(self):
         if engineering is None:
@@ -206,8 +221,6 @@ class Task2ContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        engineering._enforce_owner_private(root)
-        engineering._enforce_owner_private(root / ".git")
         subprocess.run(
             ["git", "-C", str(root), "config", "user.email", "synthetic"],
             check=True,
@@ -267,6 +280,26 @@ class Task2ContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def require_cli_private_acl(self, root: Path) -> None:
+        """Normalize a synthetic controller before testing its real child process."""
+        if os.name != "nt":
+            return
+        controller = self.module()._project_controller_dir(root)
+        controller.mkdir(parents=True, exist_ok=True)
+        try:
+            for candidate in [
+                controller,
+                *sorted(
+                    controller.rglob("*"),
+                    key=lambda path: (len(path.parts), str(path)),
+                ),
+            ]:
+                self.module()._windows_owner_private(candidate, enforce=True)
+        except self.module().EngineeringError:
+            self.skipTest(
+                "Windows host cannot establish the owner-private ACL required by the CLI"
+            )
 
     def write_controls(
         self,
@@ -828,6 +861,8 @@ class Task2ContractTests(unittest.TestCase):
 
         module._enforce_owner_private(controller)
         module._verify_owner_private(controller, directory=True)
+        self.enforce_private.assert_called_once_with(controller)
+        self.verify_private.assert_called_once_with(controller, directory=True)
 
     def test_graphify_install_argv_is_exact_and_pinned(self):
         module = self.module()
@@ -1189,6 +1224,7 @@ class Task2ContractTests(unittest.TestCase):
     def test_prepare_cli_emits_json_and_uses_blocked_exit_code(self):
         root, _ = self.prepared_repo("prepare-cli")
         self.module().approve_checks(root)
+        self.require_cli_private_acl(root)
 
         ready = self.run_cli(
             "prepare",
@@ -3264,6 +3300,8 @@ class Task3AmendedContractTests(unittest.TestCase):
                     self.assertTrue(sentinel.exists())
                 finally:
                     self.remove_test_reparse(link, directory=directory)
+        if not tested:
+            self.skipTest("reparse-point fixtures unavailable")
         self.assertIn("worktree_path", tested)
 
     def test_every_existing_registered_resource_is_checked_for_reparse(self):
@@ -3325,6 +3363,8 @@ class Task3AmendedContractTests(unittest.TestCase):
                     self.assertEqual("keep\n", sentinel.read_text(encoding="utf-8"))
                 finally:
                     self.remove_test_reparse(ancestor, directory=True)
+        if not tested:
+            self.skipTest("reparse-point fixtures unavailable")
         self.assertEqual(["state", "operations"], tested)
 
     def test_operation_root_symlink_is_rejected_without_touching_target(self):
@@ -4737,6 +4777,7 @@ class Task5ContractTests(unittest.TestCase):
     git = Task2ContractTests.git
     commit_all = Task2ContractTests.commit_all
     run_cli = Task2ContractTests.run_cli
+    require_cli_private_acl = Task2ContractTests.require_cli_private_acl
     write_controls = Task2ContractTests.write_controls
     write_fake_graphify = Task2ContractTests.write_fake_graphify
     prepared_repo = Task2ContractTests.prepared_repo
@@ -4744,6 +4785,16 @@ class Task5ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.private_files = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.private_files.start()
+        self.addCleanup(self.private_files.stop)
+        self.private_verifier = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.private_verifier.start()
+        self.addCleanup(self.private_verifier.stop)
 
     def module(self):
         if engineering is None:
@@ -5358,6 +5409,7 @@ class Task5ContractTests(unittest.TestCase):
             "complete-cli", scope=["README.md"]
         )
         (root / "README.md").write_text("# Updated\n", encoding="utf-8")
+        self.require_cli_private_acl(root)
 
         result = self.run_cli(
             "complete",
@@ -5416,6 +5468,16 @@ class Task6ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.private_files = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.private_files.start()
+        self.addCleanup(self.private_files.stop)
+        self.private_verifier = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.private_verifier.start()
+        self.addCleanup(self.private_verifier.stop)
 
     def module(self):
         if engineering is None:
@@ -6550,10 +6612,7 @@ class Task7ContractTests(unittest.TestCase):
         retained = parent / "preparation.json"
         retained.write_text('{"schema":"engineering.prepare.v1"}\n', encoding="utf-8")
 
-        with patch.object(
-            module, "_enforce_owner_private", side_effect=self.real_owner_private
-        ):
-            module._private_atomic_bytes(parent / "completion.json", b"{}\n")
+        module._private_atomic_bytes(parent / "completion.json", b"{}\n")
 
         self.assertEqual(
             '{"schema":"engineering.prepare.v1"}\n',
