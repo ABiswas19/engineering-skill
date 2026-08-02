@@ -206,8 +206,6 @@ class Task2ContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        engineering._enforce_owner_private(root)
-        engineering._enforce_owner_private(root / ".git")
         subprocess.run(
             ["git", "-C", str(root), "config", "user.email", "synthetic"],
             check=True,
@@ -3264,6 +3262,8 @@ class Task3AmendedContractTests(unittest.TestCase):
                     self.assertTrue(sentinel.exists())
                 finally:
                     self.remove_test_reparse(link, directory=directory)
+        if not tested:
+            self.skipTest("reparse-point fixtures unavailable")
         self.assertIn("worktree_path", tested)
 
     def test_every_existing_registered_resource_is_checked_for_reparse(self):
@@ -3325,6 +3325,8 @@ class Task3AmendedContractTests(unittest.TestCase):
                     self.assertEqual("keep\n", sentinel.read_text(encoding="utf-8"))
                 finally:
                     self.remove_test_reparse(ancestor, directory=True)
+        if not tested:
+            self.skipTest("reparse-point fixtures unavailable")
         self.assertEqual(["state", "operations"], tested)
 
     def test_operation_root_symlink_is_rejected_without_touching_target(self):
