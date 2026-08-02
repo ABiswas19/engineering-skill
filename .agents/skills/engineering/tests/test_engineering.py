@@ -62,6 +62,18 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
         with patch.object(engineering.os, "name", "posix"):
             self.assertFalse(engineering._is_reparse_point(OrdinaryPath()))
 
+    def test_interpreter_alias_is_validated_after_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            alias = Path(temporary) / "python-alias"
+            try:
+                os.symlink(sys.executable, alias)
+            except OSError:
+                self.skipTest("test environment cannot create interpreter aliases")
+
+            identity = engineering._interpreter_identity(Path(temporary).resolve(), alias)
+
+        self.assertEqual(str(Path(sys.executable).resolve()), identity["path"])
+
 
 class SkillShapeTests(unittest.TestCase):
     def test_skill_is_engineering_and_human_readable(self):

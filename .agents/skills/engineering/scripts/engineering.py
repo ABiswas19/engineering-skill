@@ -332,8 +332,8 @@ def _interpreter_identity(root: Path, executable: Path | str) -> dict:
     supplied = Path(executable).expanduser()
     if not supplied.is_absolute():
         raise EngineeringError("Graphify interpreter must be an exact absolute path.")
-    _reject_reparse_ancestors(supplied)
     interpreter = supplied.resolve()
+    _reject_reparse_ancestors(interpreter)
     if not interpreter.is_file() or _is_reparse_point(interpreter):
         raise EngineeringError("Graphify interpreter is unavailable or a reparse point.")
     try:
