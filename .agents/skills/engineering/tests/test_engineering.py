@@ -8939,15 +8939,18 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
 
     def test_task_authority_allows_only_exact_safe_declared_checks(self):
         module = self.module()
-        checks = [[sys.executable, "-m", "unittest", "--help"]]
         # This contract covers command/effect authority, not the checkout
         # hosting the test runner.  CI uses a deliberately shallow checkout.
-        with patch.object(
-            module,
-            "_project_contribution_digest",
-            return_value="sha256:" + "1" * 64,
-        ):
-            claims = module._check_capability_claims(Path("."), checks)
+        def claims_for(checks):
+            with patch.object(
+                module,
+                "_project_contribution_digest",
+                return_value="sha256:" + "1" * 64,
+            ):
+                return module._check_capability_claims(Path("."), checks)
+
+        checks = [[sys.executable, "-m", "unittest", "--help"]]
+        claims = claims_for(checks)
         authority = {
             "schema": "engineering.task-authority.v1",
             "task_id": "task-local-checks",
@@ -8972,12 +8975,12 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
                 module.EngineeringError, "authority"
             ):
                 module.validate_task_check_authority(changed, claims)
-        inline = module._check_capability_claims(Path("."), [[sys.executable, "-c", "print(1)"]])
+        inline = claims_for([[sys.executable, "-c", "print(1)"]])
         with self.assertRaisesRegex(module.EngineeringError, "authority"):
             module.validate_task_check_authority(
                 {**authority, "commands_digest": inline["commands_digest"]}, inline
             )
-        shell = module._check_capability_claims(Path("."), [["bash", "check.sh"]])
+        shell = claims_for([["bash", "check.sh"]])
         with self.assertRaisesRegex(module.EngineeringError, "authority"):
             module.validate_task_check_authority(
                 {**authority, "commands_digest": shell["commands_digest"]}, shell
