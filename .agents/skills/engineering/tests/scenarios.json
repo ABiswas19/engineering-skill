@@ -32,6 +32,12 @@
       "must_not": ["prompt_jargon", "project_private_data"]
     },
     {
+      "id": "compact-handoff",
+      "request": "Finish the authorized local change.",
+      "must": ["outcome_first", "now", "next"],
+      "must_not": ["routine_four_heading_trace", "unnecessary_technical_caveat"]
+    },
+    {
       "id": "applied-learning",
       "request": "This practice worked in a second independent project. Promote it.",
       "must": ["verify_terminal_evidence", "explicit_promote_and_apply", "future_relevant_use_only"],

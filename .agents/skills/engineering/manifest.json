@@ -1,6 +1,6 @@
 {
   "name": "engineering",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "controller_schema": 1,
   "graphify": {
     "repository": "https://github.com/safishamsi/graphify",
