@@ -103,18 +103,13 @@ class SkillShapeTests(unittest.TestCase):
         text = " ".join(SKILL.read_text(encoding="utf-8").split())
         for required in (
             "local-first",
-            "one developer",
-            "Graphify normally provides the base graph",
+            "Graphify supplies the base graph",
             "deterministic Engineering overlay",
-            "Each developer recreates or reuses their own local checkpoints",
-            "Same-machine worktrees share the Git-common checkpoint",
-            "separate machines do not",
-            "Git and CI coordinate shared drift through the repository",
-            "future inactive explicit opt-in",
-            "Version 2 makes no enterprise-graph network calls",
-            "never switches to enterprise mode automatically",
+            "Same-machine worktrees share the Git-common local checkpoint catalogue",
+            "Separate machines recreate their own evidence",
+            "Enterprise graph sharing is an inactive opt-in",
             "cold start",
-            "incremental run",
+            "incremental change",
             "cache hit",
         ):
             with self.subTest(required=required):
@@ -144,48 +139,18 @@ class SkillShapeTests(unittest.TestCase):
             .split()
         )
         for required in (
-            "opaque branch lineage",
-            "approved deterministic-only",
-            "proposes the v2 manifest",
-            "after approval",
-            "adopts the legacy controls",
-            "does not create duplicates",
-            "current user's home",
-            "Claude loader",
-            "HMAC-authenticated local integrity",
-            "existing legacy autonomy entries",
-            "machine-local durable attestation",
-            "exact normalized argv digest",
-            "ordinary source edits preserve",
-            "does not execute the checks",
-            "allow-inline-code",
-            "does not expand scope",
-            "hostile or shared multi-user storage",
-            "UNC storage",
-            "not public-key signing or nonrepudiation",
-            "ENGINEERING_USER_HOME",
-            "<engineering-home>",
-            ".agents/skills/engineering/",
-            ".claude/skills/engineering/SKILL.md",
-            ".agents/engineering/controller/attestations.json",
-            "allow_inline_code",
-            "not a sandbox",
-            "remaining process permissions",
-            "credential-reduced environment retains only",
-            "external effects still need separate approval",
-            "compatibility shim remains until",
+            "Setup is always a preview first",
+            "Installing or upgrading Graphify is a separate approval",
+            "Maintenance is one foreground pass",
+            "Outcome:",
+            "references/controller-contract.md",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, skill)
         for required in (
-            "tracked inputs",
-            "compiled overlay",
-            "completion manifests",
-            "contribution queue",
-            "attestations",
-            "install receipt",
             "controller-private",
-            "remains visible until inputs change or an explicit rerun or resolution",
+            "credential-reduced environment",
+            "Graphify is exactly version",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, contract)
@@ -195,6 +160,13 @@ class Task2ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.fake_graphify_environment = patch.dict(
+            os.environ,
+            {"PYTHONPATH": str(self.write_fake_graphify())},
+            clear=False,
+        )
+        self.fake_graphify_environment.start()
+        self.addCleanup(self.fake_graphify_environment.stop)
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -205,6 +177,13 @@ class Task2ContractTests(unittest.TestCase):
         )
         self.verify_private = self.private_verifier.start()
         self.addCleanup(self.private_verifier.stop)
+        self.fixture_recovery = patch.object(
+            engineering,
+            "_recover_initial_checkpoint",
+            side_effect=self.recover_fixture_checkpoint,
+        )
+        self.fixture_recovery.start()
+        self.addCleanup(self.fixture_recovery.stop)
 
     def module(self):
         if engineering is None:
@@ -229,7 +208,11 @@ class Task2ContractTests(unittest.TestCase):
             ["git", "-C", str(root), "config", "user.name", "Synthetic Test"],
             check=True,
         )
-        (root / "README.md").write_text("# Synthetic\n", encoding="utf-8")
+        # Named fixtures represent independent repositories.  Make their
+        # immutable root lineage distinct instead of relying on Git's
+        # second-resolution commit timestamp.
+        title = "Synthetic" if name is None else f"Synthetic {name}"
+        (root / "README.md").write_text(f"# {title}\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
         subprocess.run(
             ["git", "-C", str(root), "commit", "-m", "initial"],
@@ -430,6 +413,8 @@ class Task2ContractTests(unittest.TestCase):
             "import json, os, pathlib, subprocess, sys\n"
             "if '--help' in sys.argv:\n"
             "    print('  update PATH\\n  query TEXT\\n  path A B\\n  explain X')\n"
+            "elif len(sys.argv) > 1 and sys.argv[1] == 'query':\n"
+            "    print('No matching nodes found.')\n"
             "elif len(sys.argv) > 2 and sys.argv[1] == 'update':\n"
             "    if os.environ.get('FAKE_GRAPHIFY_RECORD'):\n"
             "        pathlib.Path(os.environ['FAKE_GRAPHIFY_RECORD']).open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -518,7 +503,7 @@ class Task2ContractTests(unittest.TestCase):
         approval = module.approve_checks(root)
         self.assertRegex(approval["approval_id"], r"^attestation-[0-9a-f]{32}$")
         ready = module.prepare(root, "change REQ-1", {"scope": ["README.md"]})
-        self.assertNotEqual("blocked", ready["readiness"])
+        self.assertNotEqual("blocked", ready["readiness"], ready)
 
         (root / "README.md").write_text("# ordinary source edit\n", encoding="utf-8")
         still_ready = module.prepare(root, "change REQ-1", {"scope": ["README.md"]})
@@ -555,6 +540,53 @@ class Task2ContractTests(unittest.TestCase):
             root, [[sys.executable, "-c", "print('unsafe inline')"]]
         )
         self.assertTrue(claims["allow_inline_code"])
+
+    def test_task_authority_replaces_legacy_attestation_only_for_exact_safe_checks(self):
+        module = self.module()
+        root, commit = self.prepared_repo("task-check-authority")
+        manifest = root / "engineering-traceability.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        checks = [[sys.executable, "-m", "unittest", "--help"]]
+        payload["checks"] = checks
+        manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        commit = self.commit_all(root, "configure declared check")
+        fake = self.write_fake_graphify()
+        with patch.dict(os.environ, {"PYTHONPATH": str(fake)}, clear=False):
+            module.rebuild(root, commit, sys.executable)
+        claims = module._check_capability_claims(root, checks)
+        authority = {
+            "schema": "engineering.task-authority.v1",
+            "task_id": "task-authorized-check",
+            "commands_digest": claims["commands_digest"],
+            "effects": {
+                "network": False,
+                "connector": False,
+                "publication": False,
+                "deployment": False,
+                "live_environment": False,
+                "destructive": False,
+            },
+        }
+        prepared = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": ["README.md"], "task_authority": authority},
+        )
+        self.assertNotEqual("blocked", prepared["readiness"])
+        self.assertEqual("task-authorized-check", prepared["check_authority"]["task_id"])
+
+        with self.assertRaisesRegex(module.EngineeringError, "authority"):
+            module.prepare(
+                root,
+                "change REQ-1",
+                {
+                    "scope": ["README.md"],
+                    "task_authority": {
+                        **authority,
+                        "effects": {**authority["effects"], "deployment": True},
+                    },
+                },
+            )
 
     def test_inline_interpreter_detection_covers_joined_and_encoded_modes(self):
         module = self.module()
@@ -849,7 +881,7 @@ class Task2ContractTests(unittest.TestCase):
             identity.commit,
         )
         self.assertEqual(
-            ("update", "query", "path", "explain"),
+            ("update", "path", "explain"),
             identity.required_commands,
         )
 
@@ -932,11 +964,8 @@ class Task2ContractTests(unittest.TestCase):
             ["original"],
             (root / "hook.log").read_text(encoding="utf-8").splitlines(),
         )
-        self.assertEqual(
-            1,
-            (result.stdout + result.stderr).count('"event": "pre-commit"'),
-            f"stdout={result.stdout!r}; stderr={result.stderr!r}",
-        )
+        self.assertEqual("", result.stdout)
+        self.assertEqual("", result.stderr)
 
     def test_round_one_hook_marker_migrates_only_original_preserved_body(self):
         module = self.module()
@@ -980,9 +1009,8 @@ class Task2ContractTests(unittest.TestCase):
             ["original"],
             (root / "hook.log").read_text(encoding="utf-8").splitlines(),
         )
-        self.assertEqual(
-            1, (result.stdout + result.stderr).count('"event": "pre-commit"')
-        )
+        self.assertEqual("", result.stdout)
+        self.assertEqual("", result.stderr)
         self.assertEqual(
             original_bytes,
             (
@@ -1046,10 +1074,43 @@ class Task2ContractTests(unittest.TestCase):
         payload["context"] = {"token_budget": 128}
         manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         commit = self.commit_all(root, "preparation fixture")
-        fake_graphify = self.write_fake_graphify()
-        with patch.dict(os.environ, {"PYTHONPATH": str(fake_graphify)}, clear=False):
-            engineering.rebuild(root, commit, sys.executable)
+        self.write_canonical_checkpoint(root, commit)
         return root, commit
+
+    def write_canonical_checkpoint(self, root: Path, commit: str) -> Path:
+        destination, checkpoint = engineering._checkpoint_candidate_at(
+            root,
+            commit,
+            branch="main",
+            kind="canonical",
+            graphify_version=engineering.GRAPHIFY_VERSION,
+            manifest_name="engineering-traceability.json",
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        graph_path = destination.parent / "graph.json"
+        graph_path.write_text(
+            json.dumps(
+                {
+                    "directed": True,
+                    "multigraph": False,
+                    "graph": {},
+                    "nodes": [],
+                    "links": [],
+                    "built_at_commit": commit,
+                }
+            ),
+            encoding="utf-8",
+        )
+        checkpoint["metadata"]["graph_digest"] = hashlib.sha256(
+            graph_path.read_bytes()
+        ).hexdigest()
+        destination.write_text(json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8")
+        self.assertTrue(engineering.validate_checkpoint(root, destination, commit)["valid"])
+        return destination
+
+    def recover_fixture_checkpoint(self, project):
+        checkpoint = self.write_canonical_checkpoint(project.root, project.commit)
+        return {"recovered": True, "checkpoint": str(checkpoint)}
 
     def set_base_graph_nodes(self, root: Path, nodes: list[dict]) -> Path:
         module = self.module()
@@ -1095,6 +1156,7 @@ class Task2ContractTests(unittest.TestCase):
                 "context",
                 "impact",
                 "required_checks",
+                "check_authority",
             },
             set(result),
         )
@@ -1104,6 +1166,8 @@ class Task2ContractTests(unittest.TestCase):
         self.assertEqual("main", result["project"]["branch"])
         self.assertRegex(result["project"]["root_digest"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual("ready", result["readiness"])
+        self.assertEqual("implementation", result["intent"]["purpose"])
+        self.assertRegex(result["intent"]["digest"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual([{"id": "REQ-1", "provenance": "direct"}], result["context"][:1])
         self.assertTrue(any(item["id"] == "README.md" for item in result["impact"]))
         retained = (
@@ -1299,40 +1363,27 @@ class Task2ContractTests(unittest.TestCase):
             json.dumps(
                 {
                     "nodes": [
-                        {"id": "base:req", "label": "Synthetic requirement"},
-                        {"id": "base:code", "label": "Synthetic code"},
+                        {"id": "base:auth", "label": "Authentication requirement"},
+                        {"id": "base:code", "label": "Authentication code"},
                     ],
                     "links": [],
                 }
             ),
             encoding="utf-8",
         )
-        output = (
-            "Traversal: BFS depth=2 | Start: ['Synthetic requirement'] | 2 nodes found\n\n"
-            "NODE Synthetic requirement [src=requirements.md loc=L1 community=]\n"
-            "NODE Synthetic code [src=src/app.py loc=L1 community=]\n"
-            "EDGE Synthetic requirement --implements [high]--> Synthetic code\n"
-        )
-
-        with patch.object(module, "verify_graphify"), patch.object(
-            module.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 0, output, ""),
-        ) as runner:
+        with patch.object(module.subprocess, "run") as runner:
             result = module._graphify_query_context("change auth", checkpoint, 16)
 
         self.assertEqual("success", result["status"])
         self.assertEqual(
             [
-                {"id": "base:req", "provenance": "inferred"},
-                {"id": "base:code", "provenance": "inferred"},
+                {"id": "base:auth", "provenance": "derived"},
             ],
             result["context"],
         )
-        self.assertNotIn(output, json.dumps(result))
-        self.assertEqual("1", runner.call_args.kwargs["env"]["GRAPHIFY_QUERY_LOG_DISABLE"])
+        runner.assert_not_called()
 
-    def test_graphify_query_distinguishes_empty_unavailable_and_invalid(self):
+    def test_graph_context_reports_empty_without_a_graphify_runtime(self):
         module = self.module()
         root = Path(self.temporary_directory.name) / "query-outcomes"
         checkpoint = root / "checkpoint.json"
@@ -1341,30 +1392,12 @@ class Task2ContractTests(unittest.TestCase):
             json.dumps({"nodes": [{"id": "base:req", "label": "Requirement"}], "links": []}),
             encoding="utf-8",
         )
-        cases = (
-            (subprocess.CompletedProcess([], 0, "No matching nodes found.\n", ""), "empty"),
-            (subprocess.CompletedProcess([], 7, "", "PRIVATE STDERR"), "unavailable"),
-            (subprocess.CompletedProcess([], 0, '{"nodes": []}\n', ""), "invalid"),
-            (
-                subprocess.CompletedProcess(
-                    [],
-                    0,
-                    "Traversal: BFS depth=2 | Start: ['Unknown'] | 1 nodes found\n\n"
-                    "NODE Unknown [src=x loc=L1 community=]\n",
-                    "",
-                ),
-                "invalid",
-            ),
-        )
-        for completed, expected in cases:
-            with self.subTest(expected=expected), patch.object(
-                module, "verify_graphify"
-            ), patch.object(module.subprocess, "run", return_value=completed):
-                result = module._graphify_query_context("change auth", checkpoint, 16)
-                self.assertEqual(expected, result["status"])
-                self.assertNotIn("PRIVATE STDERR", json.dumps(result))
+        with patch.object(module.subprocess, "run") as runner:
+            result = module._graphify_query_context("change auth", checkpoint, 16)
+        self.assertEqual("empty", result["status"])
+        runner.assert_not_called()
 
-    def test_empty_graph_does_not_hide_missing_graphify(self):
+    def test_empty_graph_needs_no_graphify_subprocess(self):
         module = self.module()
         root = Path(self.temporary_directory.name) / "empty-query"
         checkpoint = root / "checkpoint.json"
@@ -1373,15 +1406,10 @@ class Task2ContractTests(unittest.TestCase):
             json.dumps({"nodes": [], "links": []}), encoding="utf-8"
         )
 
-        with patch.object(
-            module,
-            "verify_graphify",
-            side_effect=module.EngineeringError("missing"),
-        ) as verify, patch.object(module.subprocess, "run") as runner:
+        with patch.object(module.subprocess, "run") as runner:
             result = module._graphify_query_context("change auth", checkpoint, 16)
 
-        self.assertEqual("unavailable", result["status"])
-        verify.assert_called_once_with(sys.executable)
+        self.assertEqual("empty", result["status"])
         runner.assert_not_called()
 
     def test_query_never_returns_credential_shaped_graph_ids(self):
@@ -1396,20 +1424,12 @@ class Task2ContractTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        output = (
-            "Traversal: BFS depth=2 | Start: ['Credential node'] | 1 nodes found\n\n"
-            "NODE Credential node [src=x loc=L1 community=]\n"
-        )
-
-        with patch.object(module, "verify_graphify"), patch.object(
-            module.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 0, output, ""),
-        ):
-            result = module._graphify_query_context("change auth", checkpoint, 16)
+        with patch.object(module.subprocess, "run") as runner:
+            result = module._graphify_query_context("change credential", checkpoint, 16)
 
         self.assertEqual("invalid", result["status"])
         self.assertNotIn(credential_id, json.dumps(result))
+        runner.assert_not_called()
 
     def test_context_merge_keeps_strongest_provenance_and_first_id_order(self):
         module = self.module()
@@ -1570,11 +1590,24 @@ class Task2ContractTests(unittest.TestCase):
         self.assertIn("public contract change lacks explicit approval", result["blockers"])
         self.assertTrue(any(item["id"] == "design.md" for item in result["impact"]))
 
-    def test_query_unavailable_requires_exact_deterministic_only_approval(self):
+    def test_query_unavailable_requires_exact_safe_task_authority(self):
         module = self.module()
         root, _ = self.prepared_repo("prepare-deterministic-only")
-        module.approve_checks(root)
         unavailable = {"status": "unavailable", "context": [], "reason": "query_timeout"}
+        claims = module._check_capability_claims(root, module.discover_checks(root))
+        authority = {
+            "schema": "engineering.task-authority.v1",
+            "task_id": "deterministic-context-recovery",
+            "commands_digest": claims["commands_digest"],
+            "effects": {
+                "network": False,
+                "connector": False,
+                "publication": False,
+                "deployment": False,
+                "live_environment": False,
+                "destructive": False,
+            },
+        }
 
         with patch.object(module, "_graphify_query_context", return_value=unavailable):
             blocked = module.prepare(
@@ -1583,7 +1616,7 @@ class Task2ContractTests(unittest.TestCase):
                 {"scope": ["README.md"], "forbidden": []},
                 None,
             )
-            approved = module.prepare(
+            legacy_only = module.prepare(
                 root,
                 "change REQ-1",
                 {
@@ -1593,21 +1626,27 @@ class Task2ContractTests(unittest.TestCase):
                 },
                 None,
             )
+            approved = module.prepare(
+                root,
+                "change REQ-1",
+                {"scope": ["README.md"], "forbidden": [], "task_authority": authority},
+                None,
+            )
             empty_approved = module.prepare(
                 root,
                 "change authentication behavior",
                 {
                     "scope": ["README.md"],
                     "forbidden": [],
-                    "deterministic_only_approved": True,
+                    "task_authority": authority,
                 },
                 None,
             )
 
         self.assertEqual("blocked", blocked["readiness"])
+        self.assertEqual("blocked", legacy_only["readiness"])
         self.assertEqual("ready", approved["readiness"])
-        self.assertFalse(blocked["authorization"]["deterministic_only_approved"])
-        self.assertTrue(approved["authorization"]["deterministic_only_approved"])
+        self.assertTrue(legacy_only["authorization"]["legacy_deterministic_only_approved"])
         self.assertEqual("blocked", empty_approved["readiness"])
 
     def test_direct_contract_origin_requires_only_documented_approval_key(self):
@@ -1805,7 +1844,7 @@ class Task2ContractTests(unittest.TestCase):
             / "preparation.json"
         ).read_text(encoding="utf-8")
         for secret in ("abc.def.ghi", "two word secret", "sk-synthetic123456789"):
-            self.assertNotIn(secret, result["intent"])
+            self.assertNotIn(secret, json.dumps(result["intent"]))
             self.assertNotIn(secret, retained)
         for key, value in (
             ("scope", ["password: secret value"]),
@@ -2120,13 +2159,19 @@ class Task2ContractTests(unittest.TestCase):
 
 
 class Task3ContractTests(unittest.TestCase):
-    setUp = Task2ContractTests.setUp
+    def setUp(self):
+        Task2ContractTests.setUp(self)
+        # Task 3 exercises the pinned Graphify adapter; Task 2's fake is only
+        # for ordinary context fixtures.
+        self.fake_graphify_environment.stop()
     module = Task2ContractTests.module
     init_repo = Task2ContractTests.init_repo
     git = Task2ContractTests.git
     commit_all = Task2ContractTests.commit_all
     write_controls = Task2ContractTests.write_controls
     write_fake_graphify = Task2ContractTests.write_fake_graphify
+    write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
+    recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
 
     def graphify_environment(self, fake_graphify: Path, **extra: str) -> dict[str, str]:
         return {"PYTHONPATH": str(fake_graphify), **extra}
@@ -2521,6 +2566,8 @@ class Task3AmendedContractTests(unittest.TestCase):
     setUp = Task3ContractTests.setUp
     module = Task3ContractTests.module
     init_repo = Task3ContractTests.init_repo
+    write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
+    recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     git = Task3ContractTests.git
     commit_all = Task3ContractTests.commit_all
     write_controls = Task3ContractTests.write_controls
@@ -4780,11 +4827,20 @@ class Task5ContractTests(unittest.TestCase):
     require_cli_private_acl = Task2ContractTests.require_cli_private_acl
     write_controls = Task2ContractTests.write_controls
     write_fake_graphify = Task2ContractTests.write_fake_graphify
+    write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
+    recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     prepared_repo = Task2ContractTests.prepared_repo
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.fake_graphify_environment = patch.dict(
+            os.environ,
+            {"PYTHONPATH": str(self.write_fake_graphify())},
+            clear=False,
+        )
+        self.fake_graphify_environment.start()
+        self.addCleanup(self.fake_graphify_environment.stop)
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -5417,6 +5473,12 @@ class Task5ContractTests(unittest.TestCase):
             prepared["run_id"],
         )
 
+        if (
+            os.name == "nt"
+            and "owner-private ACL verification failed" in result.stderr
+        ):
+            self.skipTest("Windows host cannot verify new controller ACLs in a child process")
+
         self.assertEqual(0, result.returncode, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual("engineering.complete.v1", payload["schema"])
@@ -5458,6 +5520,8 @@ class Task6ContractTests(unittest.TestCase):
     run_cli = Task2ContractTests.run_cli
     write_controls = Task2ContractTests.write_controls
     write_fake_graphify = Task2ContractTests.write_fake_graphify
+    write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
+    recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     prepared_repo = Task2ContractTests.prepared_repo
     prepared_run = Task5ContractTests.prepared_run
     governed_repo = Task3ContractTests.governed_repo
@@ -5468,6 +5532,13 @@ class Task6ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.fake_graphify_environment = patch.dict(
+            os.environ,
+            {"PYTHONPATH": str(self.write_fake_graphify())},
+            clear=False,
+        )
+        self.fake_graphify_environment.start()
+        self.addCleanup(self.fake_graphify_environment.stop)
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -6148,7 +6219,7 @@ class Task6ContractTests(unittest.TestCase):
         self.assertIn("does not run in the background", text)
         self.assertIn("process safe queued work once", text)
         self.assertIn("does not change the saved autonomy level", text)
-        self.assertIn("engineering maintain <root> --area <stable-area>", text)
+        self.assertIn("references/controller-contract.md", text)
         self.assertNotIn("engineering maintain <area>", text)
 
 
@@ -6159,6 +6230,8 @@ class Task7ContractTests(unittest.TestCase):
     run_cli = Task2ContractTests.run_cli
     write_controls = Task2ContractTests.write_controls
     write_fake_graphify = Task2ContractTests.write_fake_graphify
+    write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
+    recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     prepared_repo = Task2ContractTests.prepared_repo
     prepared_run = Task5ContractTests.prepared_run
 
@@ -6167,6 +6240,13 @@ class Task7ContractTests(unittest.TestCase):
         self.addCleanup(self.temporary_directory.cleanup)
         self.home = Path(self.temporary_directory.name) / "home"
         self.home.mkdir()
+        self.fake_graphify_environment = patch.dict(
+            os.environ,
+            {"PYTHONPATH": str(self.write_fake_graphify())},
+            clear=False,
+        )
+        self.fake_graphify_environment.start()
+        self.addCleanup(self.fake_graphify_environment.stop)
         self.environment = patch.dict(
             os.environ,
             {"ENGINEERING_USER_HOME": str(self.home)},
@@ -6534,7 +6614,9 @@ class Task7ContractTests(unittest.TestCase):
                 }
             ],
         }
-        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(private), stderr="")
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout="warning\nENGINEERING_ACL_RESULT:" + json.dumps(private), stderr="notice"
+        )
         with (
             patch.object(module.os, "name", "nt"),
             patch.object(module.subprocess, "run", return_value=completed) as run,
@@ -6543,8 +6625,8 @@ class Task7ContractTests(unittest.TestCase):
         self.assertEqual(1, run.call_count)
         self.assertEqual("powershell.exe", run.call_args.args[0][0])
         self.assertEqual(str(target), run.call_args.args[0][-3])
-        self.assertEqual("$true", run.call_args.args[0][-2])
-        self.assertEqual("$false", run.call_args.args[0][-1])
+        self.assertEqual("1", run.call_args.args[0][-2])
+        self.assertEqual("0", run.call_args.args[0][-1])
 
         system_private = {
             **private,
@@ -6560,7 +6642,7 @@ class Task7ContractTests(unittest.TestCase):
             ],
         }
         result = subprocess.CompletedProcess(
-            [], 0, stdout=json.dumps(system_private), stderr=""
+            [], 0, stdout="ENGINEERING_ACL_RESULT:" + json.dumps(system_private), stderr=""
         )
         with (
             patch.object(module.os, "name", "nt"),
@@ -6596,7 +6678,7 @@ class Task7ContractTests(unittest.TestCase):
         ):
             permissive = {**private, **change}
             result = subprocess.CompletedProcess(
-                [], 0, stdout=json.dumps(permissive), stderr=""
+                [], 0, stdout="ENGINEERING_ACL_RESULT:" + json.dumps(permissive), stderr=""
             )
             with (
                 patch.object(module.os, "name", "nt"),
@@ -6604,6 +6686,19 @@ class Task7ContractTests(unittest.TestCase):
                 self.assertRaisesRegex(module.EngineeringError, "owner-private"),
             ):
                 self.real_owner_private(target)
+
+        for result in (
+            subprocess.CompletedProcess([], 0, stdout="warning only\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="ENGINEERING_ACL_RESULT:{bad", stderr=""),
+            subprocess.CompletedProcess([], 7, stdout="ENGINEERING_ACL_RESULT:" + json.dumps(private), stderr="failure"),
+        ):
+            with self.subTest(result=result):
+                with (
+                    patch.object(module.os, "name", "nt"),
+                    patch.object(module.subprocess, "run", return_value=result),
+                    self.assertRaisesRegex(module.EngineeringError, "owner-private"),
+                ):
+                    self.real_owner_private(target)
 
     def test_private_atomic_publication_keeps_existing_private_sibling_readable(self):
         module = self.module()
@@ -6644,7 +6739,7 @@ class Task7ContractTests(unittest.TestCase):
             ],
         }
         completed = subprocess.CompletedProcess(
-            [], 0, stdout=json.dumps(private), stderr=""
+            [], 0, stdout="ENGINEERING_ACL_RESULT:" + json.dumps(private), stderr=""
         )
         with (
             patch.object(module.os, "name", "nt"),
@@ -6653,8 +6748,8 @@ class Task7ContractTests(unittest.TestCase):
             self.real_owner_private(target)
 
         self.assertEqual(str(target), run.call_args.args[0][-3])
-        self.assertEqual("$true", run.call_args.args[0][-2])
-        self.assertEqual("$true", run.call_args.args[0][-1])
+        self.assertEqual("1", run.call_args.args[0][-2])
+        self.assertEqual("1", run.call_args.args[0][-1])
 
     def test_proposed_candidate_is_project_local_and_not_discoverable(self):
         module = self.module()
@@ -6807,10 +6902,12 @@ class Task7ContractTests(unittest.TestCase):
         claude = self.home / ".claude" / "skills" / "engineering" / "SKILL.md"
         shim = self.home / ".agents" / "skills" / "engineering-traceability" / "SKILL.md"
         self.assertEqual(SKILL.read_bytes(), canonical.read_bytes())
+        self.assertIn("engineering.py", (canonical.parent / "scripts" / "engineering.cmd").read_text(encoding="utf-8"))
+        self.assertIn("engineering.py", (canonical.parent / "scripts" / "engineering").read_text(encoding="utf-8"))
         self.assertIn("~/.agents/skills/engineering/SKILL.md", claude.read_text(encoding="utf-8"))
         self.assertIn("~/.agents/skills/engineering/SKILL.md", shim.read_text(encoding="utf-8"))
         self.assertNotIn(str(source), claude.read_text(encoding="utf-8"))
-        self.assertEqual("2.1.0", receipt["skill_version"])
+        self.assertEqual("2.2.0", receipt["skill_version"])
         self.assertRegex(receipt["source_git_commit"], r"^[0-9a-f]{40}$")
         self.assertEqual(
             "d89ec68af95e0cad801b56d88df383991e659823",
@@ -7290,7 +7387,7 @@ class Task7ContractTests(unittest.TestCase):
             )
             result = module.setup(root, sys.executable)
 
-        self.assertEqual("applied", result["readiness"])
+        self.assertEqual("controls_written_pending_commit", result["readiness"])
         self.assertTrue(result["writes_applied"])
         runner.assert_called_once_with(
             preview["graphify"]["install_argv"],
@@ -7335,7 +7432,7 @@ class Task7ContractTests(unittest.TestCase):
             )
             result = module.setup(root, sys.executable)
 
-        self.assertEqual("applied", result["readiness"])
+        self.assertEqual("controls_written_pending_commit", result["readiness"])
         self.assertIn("Keep this.", (root / "AGENTS.md").read_text())
         self.assertIn("Keep this too.", (root / "CLAUDE.md").read_text())
         self.assertEqual(
@@ -7366,7 +7463,7 @@ class Task7ContractTests(unittest.TestCase):
             second = module._working_state_identity(root)
 
         self.assertEqual(first, second)
-        self.assertEqual("ready", result["readiness"])
+        self.assertEqual("controls_written_pending_commit", result["readiness"])
         self.assertFalse(result["writes_applied"])
         self.assertEqual(1, (root / "AGENTS.md").read_text().count("engineering-managed-start"))
 
@@ -7508,12 +7605,10 @@ class Task7ContractTests(unittest.TestCase):
     def test_skill_explains_setup_preview_and_separate_approvals(self):
         text = " ".join(SKILL.read_text(encoding="utf-8").split())
 
-        self.assertIn("engineering setup", text)
+        self.assertIn("controller-contract.md", text)
         self.assertIn("preview", text.lower())
-        self.assertIn("project-controls approval", text)
-        self.assertIn("Graphify-install approval", text)
-        self.assertIn("AGENTS.md", text)
-        self.assertIn("CLAUDE.md", text)
+        self.assertIn("explicit setup authority", text)
+        self.assertIn("Graphify is a separate approval", text)
 
     def test_verified_graphify_is_retained_when_late_project_setup_fails(self):
         module = self.module()
@@ -7596,7 +7691,7 @@ class Task7ContractTests(unittest.TestCase):
             )
             result = module.setup(root, sys.executable)
         self.assertRegex(approval["approval_id"], r"^attestation-")
-        self.assertEqual("applied", result["readiness"])
+        self.assertEqual("controls_written_pending_commit", result["readiness"])
         with self.assertRaisesRegex(module.EngineeringError, "missing or mismatched"):
             module._require_attestation(
                 module._project_controller_dir(root),
@@ -8105,7 +8200,7 @@ class Task7ContractTests(unittest.TestCase):
                     )
                     module.setup(root, sys.executable)
                     self.assertEqual(
-                        "ready", module.setup(root, sys.executable)["readiness"]
+                        "controls_written_pending_commit", module.setup(root, sys.executable)["readiness"]
                     )
                     preserved = (
                         hooks / "engineering-traceability-preserved" / "pre-commit"
@@ -8612,6 +8707,500 @@ class Task7ContractTests(unittest.TestCase):
         self.assertNotIn("diff", proposal)
         self.assertNotIn("patch", proposal)
         self.assertNotIn("command", proposal)
+
+
+class CapabilityAssuranceContractTests(unittest.TestCase):
+    def module(self):
+        if engineering is None:
+            self.fail("scripts/engineering.py must exist")
+        return engineering
+
+    def test_authoritative_decision_ledger_requires_a_resolvable_overlay_node(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            docs = root / "docs" / "engineering"
+            docs.mkdir(parents=True)
+            ledger = docs / "decision-ledger.md"
+            ledger.write_text("# Decisions\n\n## ENG-DEC-0001 - Adopt contract\n", encoding="utf-8")
+            manifest = {"version": 2, "inputs": []}
+            (root / "engineering.json").write_text(json.dumps(manifest), encoding="utf-8")
+            links = {"version": 1, "nodes": [{"id": "ENG-DEC-0001", "type": "decision", "title": "Adopt contract", "source": {"path": "docs/engineering/decision-ledger.md", "line": 3}}], "edges": []}
+            (docs / "links.json").write_text(json.dumps(links), encoding="utf-8")
+            module._validate_overlay(root, "WORKTREE", manifest, links, "engineering.json")
+            links["nodes"] = []
+            with self.assertRaisesRegex(module.TraceabilityError, "decision ledger"):
+                module._validate_overlay(root, "WORKTREE", manifest, links, "engineering.json")
+
+    def test_setup_adopts_one_existing_standard_decision_ledger(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "--initial-branch=main", str(root)], check=True, capture_output=True)
+            ledger = root / "docs" / "engineering" / "decision-ledger.md"
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text("# Existing decisions\n", encoding="utf-8")
+            with patch.object(module, "default_branch", return_value="main"):
+                documents = dict(module._setup_documents(root, module.GRAPHIFY_VERSION))
+            config = json.loads(documents[root / "engineering.json"])
+            self.assertEqual("docs/engineering/decision-ledger.md", config["decision_ledger"])
+            self.assertNotIn(ledger, documents)
+
+    def test_pre_repository_prepare_and_map_are_read_only_advisories(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "plain-folder"
+            root.mkdir()
+            (root / "app.py").write_text("print('local')\n", encoding="utf-8")
+            for argv, expected, code in (
+                (["engineering", "prepare", str(root), "change", "--scope-json", '{"scope": []}'], "advisory", 0),
+                (["engineering", "map", str(root), "--no-open"], "unavailable", 0),
+                (["engineering", "setup", str(root)], "proposal", 1),
+            ):
+                output = io.StringIO()
+                with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
+                    self.assertEqual(code, module.main())
+                result = json.loads(output.getvalue())
+                self.assertEqual(expected, result.get("readiness", result.get("status")))
+            self.assertFalse((root / ".git").exists())
+            self.assertFalse((root / "engineering.json").exists())
+
+    def test_graphify_environment_excludes_provider_credentials(self):
+        module = self.module()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "not-forwarded", "GRAPHIFY_OUT": "old"}, clear=False):
+            environment = module._graphify_environment(output=Path("safe-output"))
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertEqual("safe-output", environment["GRAPHIFY_OUT"])
+
+    def test_map_cache_hit_renders_without_graphify_or_browser(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "project"
+            root.mkdir()
+            checkpoint = {
+                "metadata": {"graph_digest": "g", "input_digest": "o"},
+                "nodes": [{"id": "REQ-1", "type": "requirement"}],
+                "edges": [],
+            }
+            state = Path(temporary) / "state"
+            with (
+                patch.object(module, "resolve_project_root", return_value=root),
+                patch.object(module, "git", return_value="a" * 40),
+                patch.object(module, "_load_checkpoint", return_value=checkpoint),
+                patch.object(module, "_load_assurance_overlay", return_value=[]),
+                patch.object(module, "_common_graph_dir", return_value=state),
+                patch.object(module.subprocess, "run") as process,
+            ):
+                first = module.render_map(root, open_output=False)
+                second = module.render_map(root, open_output=False)
+            self.assertFalse(first["cached"])
+            self.assertTrue(second["cached"])
+            self.assertTrue(Path(second["output"]).is_file())
+            process.assert_not_called()
+
+    def assurance_manifest(self):
+        return {
+            "schema": "engineering.capability-assurance.v1",
+            "capabilities": [
+                {
+                    "id": "cap-order-api",
+                    "criticality": "material",
+                    "required_cells": ["prod-eu"],
+                    "required_interfaces": ["orders-api"],
+                    "required_roles": ["service_owner"],
+                }
+            ],
+            "cells": [{"id": "prod-eu", "production": True}],
+            "obligations": [
+                {
+                    "id": "orders-route-observability",
+                    "capability_id": "cap-order-api",
+                    "kind": "route_observability",
+                }
+            ],
+        }
+
+    def test_assurance_reducer_keeps_unknown_and_contradiction_distinct(self):
+        module = self.module()
+        manifest = module.validate_assurance_manifest(self.assurance_manifest())
+        unknown = module.reduce_assurance_status(
+            manifest, "cap-order-api", "prod-eu", [], "2026-08-02T12:00:00Z"
+        )
+        self.assertEqual("unknown", unknown["summary"])
+        self.assertEqual("unknown", unknown["deployment"])
+
+        contradictory = module.reduce_assurance_status(
+            manifest,
+            "cap-order-api",
+            "prod-eu",
+            [
+                {
+                    "kind": "deployment",
+                    "result": "passed",
+                    "release": "release-1",
+                    "interface": "orders-api",
+                    "observed_at": "2026-08-02T11:00:00Z",
+                    "valid_until": "2026-08-03T11:00:00Z",
+                },
+                {
+                    "kind": "synthetic",
+                    "result": "passed",
+                    "release": "release-1",
+                    "interface": "orders-api",
+                    "observed_at": "2026-08-02T11:05:00Z",
+                    "valid_until": "2026-08-03T11:05:00Z",
+                },
+                {
+                    "kind": "incident",
+                    "result": "failed",
+                    "severity": "severe",
+                    "release": "release-1",
+                    "interface": "orders-api",
+                    "observed_at": "2026-08-02T11:10:00Z",
+                    "valid_until": "2026-08-03T11:10:00Z",
+                },
+            ],
+            "2026-08-02T12:00:00Z",
+        )
+        self.assertEqual("conflicting", contradictory["confidence"])
+        self.assertEqual("not_live", contradictory["summary"])
+
+    def test_recommendations_need_declared_gap_and_neutral_remediation(self):
+        module = self.module()
+        manifest = module.validate_assurance_manifest(self.assurance_manifest())
+        recommendation = module.assurance_recommendations(
+            manifest,
+            [{"kind": "missing", "obligation_id": "orders-route-observability"}],
+        )
+        self.assertEqual("recommendation", recommendation["status"])
+        self.assertEqual("observability", recommendation["items"][0]["remediation_class"])
+        self.assertEqual(
+            {"status": "unknown", "items": []},
+            module.assurance_recommendations(manifest, []),
+        )
+
+    def test_assurance_reaction_and_feedback_are_route_neutral_and_evidence_bound(self):
+        module = self.module()
+        manifest = self.assurance_manifest()
+        observations = [
+            {
+                "kind": "deployment", "result": "passed", "release": "release-1",
+                "interface": "orders-api", "observed_at": "2026-08-02T11:00:00Z",
+                "valid_until": "2026-08-03T11:00:00Z",
+            },
+            {
+                "kind": "synthetic", "result": "passed", "release": "release-1",
+                "interface": "orders-api", "observed_at": "2026-08-02T11:01:00Z",
+                "valid_until": "2026-08-03T11:01:00Z",
+            },
+        ]
+        feedback = module.assurance_feedback_request(
+            manifest, "cap-order-api", "prod-eu", observations, "2026-08-02T12:00:00Z"
+        )
+        self.assertEqual("requested", feedback["status"])
+        self.assertEqual(["service_owner"], feedback["roles"])
+        self.assertNotIn("recipient", feedback)
+        reaction = module.assurance_reaction(feedback["capability_status"])
+        self.assertEqual("await_feedback", reaction["action"])
+        self.assertTrue(reaction["dedupe_key"].startswith("sha256:"))
+
+    def test_execution_context_is_bounded_redacted_and_digest_bound(self):
+        module = self.module()
+        preparation = {
+            "schema": "engineering.prepare.v1",
+            "run_id": "run-a1b2c3",
+            "project": {"root_digest": "sha256:" + "1" * 64, "commit": "a" * 40},
+            "authorization": {"scope": ["src/order.py"], "forbidden": ["secrets.env"]},
+            "context": [
+                {"id": "REQ-1", "provenance": "direct"},
+                {"id": "DEC-1", "provenance": "derived"},
+                {"id": "CODE-IRRELEVANT", "provenance": "inferred"},
+            ],
+        }
+        bundle = module.build_execution_context(
+            preparation,
+            assertions=[{"id": "REQ-1", "text": "Do not expose api_key=abc"}],
+            forbidden_ids={"CODE-IRRELEVANT"},
+        )
+        self.assertEqual("engineering.execution-context.v1", bundle["schema"])
+        self.assertEqual(["REQ-1", "DEC-1"], [item["id"] for item in bundle["context"]])
+        self.assertNotIn("api_key=abc", json.dumps(bundle))
+        self.assertEqual(
+            "enforced",
+            module.validate_execution_context(bundle, preparation, runner_enforces_boundary=True)["mode"],
+        )
+        tampered = {**bundle, "scope": ["src/order.py", "secrets.env"]}
+        with self.assertRaisesRegex(module.EngineeringError, "digest|scope"):
+            module.validate_execution_context(tampered, preparation, runner_enforces_boundary=True)
+        self.assertEqual(
+            "advisory",
+            module.validate_execution_context(bundle, preparation, runner_enforces_boundary=False)["mode"],
+        )
+
+    def test_task_authority_allows_only_exact_safe_declared_checks(self):
+        module = self.module()
+        checks = [[sys.executable, "-m", "unittest", "--help"]]
+        # This contract covers command/effect authority, not the checkout
+        # hosting the test runner.  CI uses a deliberately shallow checkout.
+        with patch.object(
+            module,
+            "_project_contribution_digest",
+            return_value="sha256:" + "1" * 64,
+        ):
+            claims = module._check_capability_claims(Path("."), checks)
+        authority = {
+            "schema": "engineering.task-authority.v1",
+            "task_id": "task-local-checks",
+            "commands_digest": claims["commands_digest"],
+            "effects": {
+                "network": False,
+                "connector": False,
+                "publication": False,
+                "deployment": False,
+                "live_environment": False,
+                "destructive": False,
+            },
+        }
+        accepted = module.validate_task_check_authority(authority, claims)
+        self.assertEqual("task-local-checks", accepted["task_id"])
+        self.assertEqual(claims["commands_digest"], accepted["commands_digest"])
+        for changed in (
+            {**authority, "commands_digest": "sha256:" + "2" * 64},
+            {**authority, "effects": {**authority["effects"], "network": True}},
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                module.EngineeringError, "authority"
+            ):
+                module.validate_task_check_authority(changed, claims)
+        inline = module._check_capability_claims(Path("."), [[sys.executable, "-c", "print(1)"]])
+        with self.assertRaisesRegex(module.EngineeringError, "authority"):
+            module.validate_task_check_authority(
+                {**authority, "commands_digest": inline["commands_digest"]}, inline
+            )
+        shell = module._check_capability_claims(Path("."), [["bash", "check.sh"]])
+        with self.assertRaisesRegex(module.EngineeringError, "authority"):
+            module.validate_task_check_authority(
+                {**authority, "commands_digest": shell["commands_digest"]}, shell
+            )
+
+    def test_prepare_cli_accepts_scope_file_and_stdin_without_shell_quoting(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            scope_file = Path(temporary) / "scope.json"
+            scope_file.write_text('{"scope":["README.md"]}', encoding="utf-8")
+            for source, input_text in ((str(scope_file), None), ("-", '{"scope":["README.md"]}')):
+                with self.subTest(source=source):
+                    output = io.StringIO()
+                    with (
+                        patch.object(sys, "argv", ["engineering", "prepare", ".", "change", "--scope-file", source]),
+                        patch.object(module, "resolve_project_root", return_value=Path(".")),
+                        patch.object(module, "prepare", return_value={"readiness": "ready"}) as prepare,
+                        patch.object(sys, "stdin", io.StringIO(input_text or "")),
+                        contextlib.redirect_stdout(output),
+                    ):
+                        self.assertEqual(0, module.main())
+                    self.assertEqual({"scope": ["README.md"]}, prepare.call_args.args[2])
+                    self.assertEqual({"readiness": "ready"}, json.loads(output.getvalue()))
+
+    def test_expected_cli_blocker_is_stable_json_not_raw_error(self):
+        module = self.module()
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            patch.object(sys, "argv", ["engineering", "status", "."]),
+            patch.object(module, "resolve_project_root", side_effect=module.EngineeringError("manifest_not_tracked")),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(2, module.main())
+        self.assertEqual("", errors.getvalue())
+        self.assertEqual(
+            {"schema": "engineering.error.v1", "status": "blocked", "reason": "manifest_not_tracked", "remediation": "authorize_engineering_setup"},
+            json.loads(output.getvalue()),
+        )
+
+    def test_default_branch_uses_local_remote_metadata_after_direct_head(self):
+        module = self.module()
+
+        def direct_head(root, *arguments):
+            if arguments[:1] == ("symbolic-ref",):
+                raise module.TraceabilityError("direct ref")
+            if arguments == ("remote", "show", "-n", "origin"):
+                return "* remote origin\n  HEAD branch: main\n"
+            if arguments == ("rev-parse", "--verify", "refs/remotes/origin/main"):
+                return "a" * 40
+            raise AssertionError(arguments)
+
+        with patch.object(module, "git", side_effect=direct_head):
+            self.assertEqual("main", module.default_branch(Path(".")))
+        with patch.object(module, "git", side_effect=[module.TraceabilityError("direct"), "  HEAD branch: unknown\n"]):
+            with self.assertRaisesRegex(module.TraceabilityError, "ambiguous"):
+                module.default_branch(Path("."))
+
+    def test_unmanaged_project_returns_no_write_advisory(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "midflight"
+            subprocess.run(["git", "init", "--initial-branch=main", str(root)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "synthetic" + "@" + "example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Synthetic"], check=True)
+            (root / "README.md").write_text("# Mid-flight\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "initial"], check=True, capture_output=True)
+
+            result = module.prepare(root, "change an existing module", {"scope": ["README.md"]})
+
+            self.assertEqual("ready_with_advisories", result["readiness"])
+            self.assertIsNone(result["run_id"])
+            self.assertEqual("unknown", result["project"]["traceability"])
+            self.assertFalse((root / "engineering-traceability.json").exists())
+            self.assertFalse((Path(module.common_graph_dir(root)) / "runs").exists())
+
+    def test_hook_cli_is_quiet_when_current_and_actionable_when_stale(self):
+        module = self.module()
+        for result, expected_stderr in (
+            ({"freshness": "current"}, ""),
+            ({"freshness": "stale", "reason": "checkpoint_pending"}, "checkpoint pending"),
+        ):
+            with self.subTest(result=result):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    patch.object(sys, "argv", ["engineering", "hook", "post-commit", "."]),
+                    patch.object(module, "resolve_project_root", return_value=Path(".")),
+                    patch.object(module, "handle_hook", return_value=result),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    self.assertEqual(0, module.main())
+                self.assertEqual("", stdout.getvalue())
+                self.assertIn(expected_stderr, stderr.getvalue())
+
+    def test_controller_resolver_uses_the_installed_portable_launcher(self):
+        module = self.module()
+        argv = module.controller_argv()
+        self.assertEqual(1, len(argv))
+        self.assertEqual(
+            ENGINEERING_SCRIPT.with_name("engineering.cmd" if os.name == "nt" else "engineering").resolve(),
+            Path(argv[0]),
+        )
+
+    def test_initial_checkpoint_recovery_is_bounded_and_non_project_mutating(self):
+        module = self.module()
+        project = module.ProjectIdentity(Path("."), Path("."), "main", "a" * 40, "main")
+        with patch.object(module, "bootstrap_graph", return_value={
+            "state": "current", "checkpoint": "local-checkpoint"
+        }) as bootstrap:
+            recovered = module._recover_initial_checkpoint(project)
+        self.assertEqual({"recovered": True, "checkpoint": "local-checkpoint"}, recovered)
+        self.assertEqual(project.root, bootstrap.call_args.args[0])
+        self.assertTrue(bootstrap.call_args.kwargs["setup_authorized"])
+        self.assertEqual(
+            module.DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS,
+            bootstrap.call_args.kwargs["recovery_timeout_seconds"],
+        )
+
+    def test_feature_recovery_builds_canonical_before_an_isolated_feature_delta(self):
+        module = self.module()
+        project = module.ProjectIdentity(Path("."), Path("."), "feature/one", "a" * 40, "main")
+        with patch.object(module, "bootstrap_graph", return_value={
+            "state": "current", "checkpoint": "main-checkpoint"
+        }) as canonical, patch.object(
+            module, "rebuild", return_value={"freshness": "current", "checkpoint": "feature-checkpoint"}
+        ) as feature:
+            recovered = module._recover_initial_checkpoint(project)
+        self.assertEqual({"recovered": True, "checkpoint": "feature-checkpoint"}, recovered)
+        canonical.assert_called_once()
+        self.assertEqual(project.commit, feature.call_args.kwargs["target_commit"])
+
+    def test_bootstrap_requires_supported_graphify_only_when_construction_is_needed(self):
+        module = self.module()
+        project = module.ProjectIdentity(Path("."), Path("."), "main", "a" * 40, "main")
+        with patch.object(module, "resolve_project", return_value=project), patch.object(
+            module, "_tracked_manifest_name", return_value="engineering-traceability.json"
+        ), patch.object(module, "graph_checkpoint_catalogue", return_value={"state": "managed", "canonical": None, "features": []}
+        ), patch.object(module, "reconcile_canonical", side_effect=[
+            {"freshness": "cached", "canonical_published": False, "reason": "canonical_checkpoint_missing"},
+            {
+            "freshness": "cached", "checkpoint": "canonical-checkpoint", "canonical_published": True
+            },
+        ]), patch.object(module, "verify_graphify") as verify:
+            result = module.bootstrap_graph(project.root, setup_authorized=True)
+        self.assertEqual("current", result["state"])
+        self.assertEqual("canonical-checkpoint", result["checkpoint"])
+        verify.assert_called_once_with(sys.executable)
+
+        with patch.object(module, "resolve_project", return_value=project), patch.object(
+            module, "_tracked_manifest_name", return_value="engineering-traceability.json"
+        ), patch.object(module, "graph_checkpoint_catalogue", return_value={"state": "managed", "canonical": {}, "features": []}
+        ), patch.object(module, "reconcile_canonical", return_value={
+            "freshness": "cached", "checkpoint": "canonical-checkpoint", "canonical_published": True
+        }), patch.object(module, "verify_graphify") as verify:
+            exact = module.bootstrap_graph(project.root, setup_authorized=False)
+        self.assertEqual("current", exact["state"])
+        verify.assert_not_called()
+
+    def test_bootstrap_keeps_unmanaged_and_missing_graphify_fail_closed(self):
+        module = self.module()
+        with patch.object(module, "_tracked_manifest_name", return_value=None):
+            unmanaged = module.bootstrap_graph(Path("."), setup_authorized=False)
+        self.assertEqual("advisory", unmanaged["state"])
+        self.assertEqual("adopt_engineering", unmanaged["next_action"])
+
+        with patch.object(module, "resolve_project_root", return_value=Path(".")), patch.object(
+            module, "_tracked_manifest_name", return_value="engineering-traceability.json"
+        ), patch.object(module, "graph_checkpoint_catalogue", return_value={"state": "managed", "canonical": None, "features": []}
+        ), patch.object(
+            module, "reconcile_canonical", return_value={"freshness": "cached", "canonical_published": False}
+        ), patch.object(module, "verify_graphify", side_effect=module.EngineeringError("Graphify is missing")):
+            blocked = module.bootstrap_graph(Path("."), setup_authorized=True)
+        self.assertEqual("blocked", blocked["state"])
+        self.assertEqual("graphify_unavailable_or_incompatible", blocked["reason"])
+
+    def test_checkpoint_catalogue_never_promotes_feature_records(self):
+        module = self.module()
+        manifest = {"project": {"default_branch": "main"}}
+        validations = iter((
+            {"valid": True, "reason": "exact_current"},
+            {"valid": True, "reason": "exact_current"},
+            {"valid": False, "reason": "overlay_mismatch"},
+        ))
+        checkpoints = [
+            Path("graphs/main/" + "a" * 40 + "/checkpoint.json"),
+            Path("graphs/features/feature-one/" + "b" * 40 + "/checkpoint.json"),
+            Path("graphs/features/orphan/" + "c" * 40 + "/checkpoint.json"),
+        ]
+        with patch.object(module, "resolve_project_root", return_value=Path(".")), patch.object(
+            module, "_tracked_manifest_name", return_value="engineering-traceability.json"
+        ), patch.object(
+            module, "_json_at", return_value=manifest
+        ), patch.object(module, "git", side_effect=lambda root, *argv: (
+            "a" * 40 if "origin/main" in argv[-1] else "b" * 40
+            if "feature-one" in argv[-1] else (_ for _ in ()).throw(module.EngineeringError("missing")))
+        ), patch.object(module, "_common_graph_dir", return_value=Path("graphs")), patch.object(
+            Path, "glob", side_effect=[checkpoints[:1], checkpoints[1:]]
+        ), patch.object(module, "validate_checkpoint", side_effect=lambda *args: next(validations)), patch.object(
+            module, "_is_ancestor_or_equal", side_effect=lambda root, ancestor, descendant: ancestor == descendant
+        ):
+            catalogue = module.graph_checkpoint_catalogue(Path("."))
+        self.assertEqual("current", catalogue["canonical"]["state"])
+        self.assertEqual(["active", "quarantined"], [item["state"] for item in catalogue["features"]])
+
+    def test_setup_lifecycle_is_truthful_about_commit_and_checkpoint(self):
+        module = self.module()
+        with patch.object(module, "_tracked_manifest_name", return_value=None):
+            pending_commit = module._setup_readiness(Path("."), sys.executable)
+        self.assertEqual("controls_written_pending_commit", pending_commit["readiness"])
+
+        with patch.object(module, "_tracked_manifest_name", return_value="engineering-traceability.json"), patch.object(
+            module, "check_merge_readiness", return_value={"ready": True, "checkpoint": "exact-checkpoint"}
+        ):
+            operational = module._setup_readiness(Path("."), sys.executable)
+        self.assertEqual("operational", operational["readiness"])
+
+        with patch.object(module, "_tracked_manifest_name", return_value="engineering-traceability.json"), patch.object(
+            module, "check_merge_readiness", return_value={"ready": False, "reason": "cold_rebuild_deferred"}
+        ):
+            pending_checkpoint = module._setup_readiness(Path("."), sys.executable)
+        self.assertEqual("checkpoint_pending", pending_checkpoint["readiness"])
 
 
 if __name__ == "__main__":

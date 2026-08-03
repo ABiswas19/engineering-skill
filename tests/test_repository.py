@@ -16,6 +16,8 @@ EXPECTED_SKILL_FILES = {
     "manifest.json",
     "agents/openai.yaml",
     "references/controller-contract.md",
+    "scripts/engineering",
+    "scripts/engineering.cmd",
     "scripts/engineering.py",
     "tests/scenarios.json",
     "tests/test_engineering.py",
@@ -60,6 +62,20 @@ class RepositoryContractTests(unittest.TestCase):
             text = (SKILL_ROOT / relative).read_text(encoding="utf-8")
             self.assertIsNone(FORBIDDEN_CONTENT.search(text), relative)
             self.assertIsNone(ABSOLUTE_USER_PATH.search(text), relative)
+
+    def test_human_skill_is_compact_and_defers_protocol_detail(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertLessEqual(len(re.findall(r"\S+", skill)), 700)
+        for required in (
+            "automatically",
+            "canonical default-branch checkpoint",
+            "Unknown",
+            "Outcome:",
+            "authorize",
+            "controller-contract.md",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, skill)
 
     def test_repository_has_no_generated_or_private_state(self) -> None:
         forbidden_names = {
