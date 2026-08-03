@@ -2346,13 +2346,25 @@ class Task3ContractTests(unittest.TestCase):
         fake, environment = self.cold_checkpoint(root)
         self.commit_file(root, "src/budgeted.py", "budgeted = True\n")
 
-        with patch.dict(os.environ, environment, clear=False):
+        captured = []
+
+        def bounded_operation(*args, **kwargs):
+            captured.append(kwargs["timeout_seconds"])
+            return {"mode": "changed_path_adapter", "freshness": "current"}
+
+        with (
+            patch.dict(os.environ, environment, clear=False),
+            patch.object(module, "_run_graph_operation", side_effect=bounded_operation),
+        ):
             result = module.dispatch_hook(
                 root, "post-commit", graphify_python=sys.executable
             )
 
         self.assertEqual("changed_path_adapter", result["mode"])
         self.assertEqual("current", result["freshness"])
+        self.assertEqual(1, len(captured))
+        self.assertGreater(captured[0], 0)
+        self.assertLessEqual(captured[0], 60)
 
     def test_post_commit_never_runs_a_cold_full_rebuild(self):
         module = self.module()
