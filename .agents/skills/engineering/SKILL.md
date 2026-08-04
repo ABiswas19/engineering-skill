@@ -17,9 +17,9 @@ translation, formatting, or simple inspection.
 It prepares applicable work and completes its evidence automatically.
 Engineering completion runs automatically before claiming non-trivial work is
 ready. The controller commands are diagnostics and CI interfaces, not normal
-user steps. Use the installed `scripts/engineering` launcher (or
-`engineering.cmd` on Windows) for `engineering map`; it avoids a typed
-interpreter path. See
+user steps. Use `engineering map`; installation publishes it through a managed
+launcher directory (open a new terminal after installation).
+See
 `references/controller-contract.md` for exact commands and stored receipts.
 
 ## Graph and context

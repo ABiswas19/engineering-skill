@@ -1,143 +1,110 @@
 # Engineering
 
-Engineering is a project-neutral skill for starting, reconstructing, maintaining, and completing software work with traceable requirements, decisions, changes, verification, and exact-commit code graphs.
+## Why, what, how
 
-It works in new and mid-flight Git repositories, supports selectable autonomy levels, and can install its pinned Graphify dependency after explicit inspection and approval. Generated graphs and deterministic controller state live outside project history so linked worktrees share one local checkpoint catalogue without committing private runtime state.
+Engineering prevents an attractive but unsafe shortcut: calling a change
+"ready" because a graph, test, or task happened to pass. It gives each Git
+project a local, evidence-bound view of requirements, decisions, code, checks,
+and known gaps. It works in the foreground: assess the repository, preview any
+setup, establish or reconstruct a baseline, prepare bounded work, then verify
+and complete it. Missing or contradictory evidence remains **Unknown**. It
+does not alter a project, publish code, or make a live decision automatically.
 
-Installing Engineering does not establish a repository graph. Its first use
-silently assesses whether the repository is unmanaged, greenfield, or managed,
-then inspects Graphify and local checkpoint evidence before making graph-derived
-claims. A managed repository with no valid canonical default-branch checkpoint
-builds or refreshes one only through the supported pinned Graphify runner; an
-unavailable or incompatible runner is an actionable blocker, never a substitute
-generator. The Graphify graph and deterministic overlay are published and
-validated together at one exact default-branch commit. Feature and scratch
-checkpoints remain isolated local evidence: active work stays feature-scoped,
-merged work is historical, and stale, orphaned, or corrupt records are excluded
-from canonical claims rather than silently merged or deleted.
+## How it works
 
-The skill source is `.agents/skills/engineering`. Read its `SKILL.md` for the human operating model and `references/controller-contract.md` for storage and command details.
+For a greenfield repository, Engineering assesses the local Git state, previews
+project controls, and—after approval—scaffolds the controls. Its first eligible
+commit gets a canonical local graph and deterministic overlay. For a mid-flight
+repository, it assesses first, previews adoption, reconstructs an advisory
+baseline, and preserves historical gaps as Unknown until they are reviewed and
+accepted. In both cases the everyday flow is: **assess → preview/approve setup
+→ baseline → prepare bounded work → verify/complete**.
 
-## Capability Assurance direction
+## Deterministic and LLM-assisted work
 
-The approved next design makes Capability Assurance a core Engineering
-capability for every project, including software maintained by one developer.
-It will distinguish what is intended, implemented, deployed, reachable,
-verified, recently observed, contradicted, and accepted. Missing evidence will
-remain unknown rather than being presented as green.
+| Phase | Mode |
+| --- | --- |
+| Setup preview/mutation, pinned Graphify build/update/traversal/map, overlays, reducers, hooks, status, coverage, impact, assurance, receipts, maintenance | Local deterministic; no LLM or provider call. |
+| Graphify installation | Network only after explicit approval; no LLM. |
+| Codex/Claude design, planning, implementation, review, bounded-context interpretation, and optional semantic-evidence authoring | LLM-assisted and task-dependent. |
+| Greenfield setup | Controls can be scaffolded mechanically; intent and requirements still need human or host reasoning. |
+| Mid-flight reconstruction | The host may help; exact links stay evidence-bound and incomplete history stays Unknown/advisory. |
 
-The design keeps the exact-commit Engineering graph immutable. Time-varying
-deployment, telemetry, incident, synthetic-check, and role-authenticated human
-evidence lives in a separate local operational overlay and is joined to the
-graph when status is queried. There is no persisted `is_live` boolean.
+Engineering has no daemon or background LLM loop. Map, status, hooks, and the
+controller never silently call an LLM; host usage depends on the task.
 
-Capability Assurance is implemented in Engineering 2.2. The independently
-reviewed scope, verification boundary, and explicitly deferred surrounding
-harness services remain in
-[`docs/specs/engineering-capability-assurance-design.md`](docs/specs/engineering-capability-assurance-design.md).
+## Dependencies and prerequisites
 
-## Bounded execution context direction
+- Required: a local Git repository and an eligible commit for a canonical map.
+  Without Git, Engineering stays useful in advisory mode and recommends local
+  initialization; it does not create a remote or commit implicitly.
+- Required for graph features: pinned Graphify 0.9.5 at reviewed commit
+  `d89ec68af95e0cad801b56d88df383991e659823`, so the code graph is
+  reproducible. The package does not declare a broader Python support range.
+- Optional: Codex or Claude for host reasoning; deterministic CLI/map paths do
+  not depend on either. Network is needed only for approved dependency install
+  or separately authorized external work.
+- Optional enhancements: schedulers, telemetry, identity, feedback, and
+  portfolio services. They are not hidden dependencies.
 
-For a governed worker task, the approved 2.2 design will have the controller
-produce one redacted, digest-validated execution-context bundle from the
-authorized scope and exact context closure. It will carry stable provenance but
-no raw source bodies, credentials, connector payloads, or unbounded history.
-The runner must reject a stale, altered, scope-expanded, or malformed bundle
-before dispatch. Existing project context systems remain authoritative; this
-adds no second context store or router.
+## Quick start
 
-The bundle is an enforced context boundary only when the runner prevents other
-graph-derived context from reaching the worker. Where that isolation is not
-available, Engineering reports the bundle as advisory rather than pretending it
-provided the worker with only the relevant context.
+Ask Codex or Claude to use Engineering for the current project. For routine
+local inspection, run `engineering --help`, then use `engineering map`,
+`status`, `coverage`, `trace`, `impact`, `assurance-status`, `autonomy`, or
+`maintain status` as appropriate. On Windows, installation adds its one managed
+command directory to the user PATH; open a new terminal after first install.
 
-## Surrounding engineering harness
+Setup approval, `prepare`/`complete`, hooks, checkpoint/rebuild, and the
+learning lifecycle are controller or CI operations—not routine user commands.
 
-Engineering remains a per-project skill. During setup and reconstruction, the
-Capability Assurance design requires it to inspect the project and recommend
-missing surrounding controls only when it has all three grounds: a declared
-assurance obligation, observed missing or contradictory evidence, and a
-project-neutral remediation class. Common gaps use deterministic detector
-packs; a non-catalogue recommendation is an evidence-bound advisory. Without
-those grounds, Engineering reports **unknown** rather than guessing.
+| Autonomy | May do | Never does |
+| --- | --- | --- |
+| Guided | Detect and recommend. | Edit project controls without approval. |
+| Collaborative (default) | Handle routine, authorized in-scope work; queue unrelated maintenance. | Make consequential changes. |
+| Steward | Collaborative work plus one safe foreground maintenance pass. | Start a background service or expand authority. |
 
-Illustrative examples include:
+All levels still need explicit approval for setup, dependencies, public or
+persisted contracts, publication, merge, deployment, security, credentials,
+financial decisions, destructive work, and ambiguity.
 
-- exact release and deployment identity;
-- environment, region, tenant, cohort, or feature-flag topology;
-- telemetry, synthetic-check, incident, and bug adapters;
-- an authenticated route for role-relevant human feedback;
-- a scheduler for periodic evidence collection;
-- a private cross-project status registry or portfolio view; and
-- notification and decision-routing controls.
+## What ships in 2.2
 
-These examples are illustrative, not a fixed catalogue or a promise that the
-skill can detect every gap. Engineering may recommend a different
-project-neutral control only when discovered evidence grounds it. A
-recommendation is diagnostic only: the skill does not install a service, create
-a user interface, activate a connector, or change a live environment.
+2.2 ships the local capability manifest/topology, evidence reducer,
+deployment-cell assessment, bounded execution context, project-owned decision
+ledger indexing, and exact-commit Graphify plus deterministic overlays. It also
+supports opt-in `semantic_matrices`: only a declared ownership, routing,
+responsibility, classification, or state matrix touched by the change is
+checked. Each row needs one owner (or explicit unavailable/unowned state), one
+code identity, and positive and negative verification. Undeclared matrices,
+historical gaps, and unrelated work are not blocked.
 
-Engineering owns each project's capability manifest and topology, evidence
-requirements, assurance reducer, environment/cell status, bounded bug/incident
-mapping adapters, selective feedback contract, and grounded recommendations. It
-is not a scheduler, telemetry warehouse, identity provider, feedback UI, or
-cross-project portfolio/admission authority. A surrounding harness owns those
-services and is the only authority that may aggregate a fully-live result across
-projects.
+Decisions remain project-owned. Engineering indexes them but never infers
+approval or implementation from code, tests, or graph edges. Local/private
+evidence stays outside Git, and no live state changes automatically.
 
-## Decisions stay project-owned
+## Scale and limits
 
-Engineering uses one authoritative project decision ledger. A project may
-declare its existing ledger with `decision_ledger`; otherwise Engineering uses
-its standard project ledger. Graphify and the deterministic overlay only index
-that ledger. A material, user-approved architecture, contract, governance,
-security, scope, dependency, deployment, or supersession decision must retain
-its project-native ID and source-resolvable overlay node. Routine code choices,
-tests, progress, and task completion do not create or advance decisions.
+| Context | Evidence today |
+| --- | --- |
+| Solo developer | Intended and locally validated; worktrees on one machine share local evidence. |
+| Team | Manifests/ledgers are tracked; each machine regenerates checkpoints. Tests model clones, worktrees, locking, reconciliation, and concurrency, not a real multi-user deployment. |
+| Enterprise | Capability/topology reducers have cell and boundary fixtures, but this is not an enterprise platform claim. No centralized HA service, distributed operational store, SSO/RBAC authority, telemetry platform, scheduler, cross-project live aggregator, or large-enterprise field validation ships in 2.2. |
 
-## Local map
+Very large monorepos, many concurrent users or machines, long-duration
+operational evidence, and real corporate topology/adapters remain untested or
+partially tested. The surrounding harness services above are roadmap/deferred
+work, not shipped dependencies.
 
-Run `engineering map` from a Git project to open its current exact-checkpoint
-map; use `--no-open` for CI. It renders only the pinned Graphify code AST and
-the deterministic/assurance overlays already stored in the local common Git
-state. It never calls an LLM, `graphify extract`, a network service, or a
-second store. `--budget` on Graphify context queries is a returned-context cap,
-not an API-token spend. Exact cache hits only reopen the existing map; a source
-change follows the existing incremental Graphify update path.
+## Troubleshooting and deeper detail
 
-This restriction applies to graph construction, traversal, and rendering. It
-does not restrict the host Codex or Claude agent from reasoning about an
-authorized task. When prose is necessary, the host uses the bounded, redacted
-execution-context slice; Engineering never turns that into a Graphify backend
-or semantic document-ingestion call.
+If a map is unavailable, check Git/commit state, the pinned Graphify runner,
+and checkpoint freshness; Engineering reports the smallest recovery action.
+Read [SKILL.md](.agents/skills/engineering/SKILL.md) for operating guidance,
+the [controller contract](.agents/skills/engineering/references/controller-contract.md)
+for exact commands and receipts, and the
+[Capability Assurance design](docs/specs/engineering-capability-assurance-design.md)
+for the reviewed scope and deferred services.
 
-## What remains outside Engineering v2.2
-
-Version 2.2 owns the per-project capability manifest and topology, evidence
-obligations, status reducer, deployment-cell assessment, adapter contracts,
-selective-feedback contract, execution-context bundle, and evidence-grounded
-harness-gap recommendations.
-
-Always-on scheduling and evidence collection, telemetry storage, identity and
-role verification, feedback UI or channel, credentials and connectors,
-cross-project operational storage or portfolio roll-up, notifications and
-decision routing, and cross-project fully-live authority remain outside the
-skill. Those surrounding components can provide fresher and more complete
-evidence, automate periodic reassessment, support independent post-deployment
-verification, and offer cross-project visibility.
-
-They are enhancements, not dependencies: Engineering remains usable without
-them and reports **unknown** when the required evidence is absent. During setup
-or completion it may recommend one only when a declared assurance obligation
-and an observed gap or contradiction support a project-neutral remediation
-class. Otherwise it omits the suggestion or reports **unknown**. The examples
-above remain illustrative, not a promise to detect arbitrary needs.
-
-Where human feedback is relevant, a project README or generated status output
-should identify the supported feedback route, required role, release and
-environment scope, privacy boundary, and evidence freshness. The README itself
-is guidance, not an authenticated feedback store. Projects should normally
-reuse an existing issue tracker, service portal, collaboration surface, or
-product interface before building a new frontend.
-
-This repository is available under the Apache License 2.0. Verification does not authorize installation or use in a live project.
+This repository is available under Apache-2.0. Verification does not authorize
+installation or use in a live project.

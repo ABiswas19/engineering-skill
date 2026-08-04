@@ -177,6 +177,7 @@ PREPARATION_BLOCKERS = {
     "unapproved_check_capability": "project check capability lacks explicit local approval",
     "missing_required_source": "required source or exact context is missing",
     "checkpoint_pending": "the first exact checkpoint is pending; run the reported foreground recovery",
+    "semantic_matrix_incomplete": "an impacted declared ownership or routing matrix lacks atomic coverage",
 }
 PREPARATION_ADVISORIES = {
     "remote_freshness_unknown": "canonical remote freshness is unknown",
@@ -1474,6 +1475,52 @@ def _source(record: dict, label: str) -> tuple[str, int]:
     return path.replace("\\", "/"), line
 
 
+def _semantic_matrix_issues(manifest: dict, nodes: list[dict], scope: set[str]) -> list[str]:
+    """Validate only declared matrix rows touched by the authorized change."""
+    matrices = manifest.get("semantic_matrices")
+    if matrices is None:
+        return []
+    if not isinstance(matrices, list):
+        raise EngineeringError("Engineering semantic_matrices must be an array.")
+    by_id = {node["id"]: node for node in nodes}
+    issues: list[str] = []
+    for matrix in matrices:
+        if not isinstance(matrix, dict) or not isinstance(matrix.get("source"), str):
+            raise EngineeringError("Engineering semantic matrix is invalid.")
+        items = matrix.get("items")
+        if not isinstance(items, list) or not items:
+            raise EngineeringError("Engineering semantic matrix items are invalid.")
+        references = [value for item in items if isinstance(item, dict) for value in (
+            item.get("implementation"), item.get("positive"), item.get("negative"))]
+        impacted = matrix["source"].replace("\\", "/") in scope or any(
+            isinstance(identifier, str)
+            and identifier in by_id
+            and isinstance(by_id[identifier].get("source"), dict)
+            and by_id[identifier]["source"].get("path", "").replace("\\", "/") in scope
+            for identifier in references
+        )
+        if not impacted:
+            continue
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                raise EngineeringError("Engineering semantic matrix item is invalid.")
+            owner, state = item.get("owner"), item.get("state")
+            has_owner = isinstance(owner, str) and bool(owner)
+            if not (has_owner ^ (state in {"unavailable", "unowned"})):
+                issues.append(item["id"])
+                continue
+            targets = (item.get("implementation"), item.get("positive"), item.get("negative"))
+            if any(not isinstance(target, str) or target not in by_id for target in targets):
+                issues.append(item["id"])
+                continue
+            if by_id[targets[0]].get("type") != "code_symbol" or any(
+                by_id[target].get("type") not in {"test", "evaluation", "verification_receipt"}
+                for target in targets[1:]
+            ):
+                issues.append(item["id"])
+    return sorted(set(issues))
+
+
 def _validate_overlay(
     root: Path,
     commit: str,
@@ -1499,6 +1546,10 @@ def _validate_overlay(
     input_paths = {config_path, links_path}
     ledger_path = decision_ledger_path(root, manifest)
     input_paths.add(ledger_path)
+    for matrix in manifest.get("semantic_matrices", []):
+        if not isinstance(matrix, dict) or not isinstance(matrix.get("source"), str):
+            raise TraceabilityError("Engineering semantic matrix is invalid.")
+        input_paths.add(matrix["source"].replace("\\", "/"))
     for path in manifest.get("inputs", []):
         if not isinstance(path, str):
             raise TraceabilityError("Manifest inputs must be project-relative paths.")
@@ -5221,6 +5272,9 @@ def prepare(
             blocker_codes.append("checkpoint_pending")
 
     nodes = {node["id"]: node for node in checkpoint["nodes"]}
+    matrix_issues = _semantic_matrix_issues(config, checkpoint["nodes"], set(authorization["scope"]))
+    if matrix_issues:
+        blocker_codes.append("semantic_matrix_incomplete")
     explicit, missing = _explicit_context_ids(bounded_intent, scope, nodes)
     if missing:
         blocker_codes.append("missing_required_source")
@@ -8502,10 +8556,69 @@ def _install_paths(home: Path) -> dict[str, Path]:
         "previous": home / ".agents" / "skills" / ".engineering.previous",
         "claude": home / ".claude" / "skills" / "engineering",
         "shim": home / ".agents" / "skills" / "engineering-traceability",
+        "command": home / ".agents" / "bin",
         "receipt": home / ".agents" / "engineering" / "install-receipt.json",
         "previous_receipt": home / ".agents" / "engineering" / "previous-install-receipt.json",
         "lock": home / ".agents" / "engineering" / "install.lock",
     }
+
+
+def _command_launcher_contents() -> tuple[str, str]:
+    return (
+        '#!/bin/sh\nexec "$(dirname "$0")/../skills/engineering/scripts/engineering" "$@"\n',
+        "@echo off\n\"%~dp0..\\skills\\engineering\\scripts\\engineering.cmd\" %*\n",
+    )
+
+
+def _write_command_launchers(path: Path) -> None:
+    portable, windows = _command_launcher_contents()
+    path.mkdir(parents=True)
+    (path / "engineering").write_text(portable, encoding="utf-8", newline="\n")
+    (path / "engineering.cmd").write_text(windows, encoding="utf-8", newline="")
+
+
+def _valid_command_launchers(path: Path) -> bool:
+    portable, windows = _command_launcher_contents()
+    return (
+        path.is_dir()
+        and not _is_reparse_point(path)
+        and (path / "engineering").is_file()
+        and (path / "engineering.cmd").is_file()
+        and not _is_reparse_point(path / "engineering")
+        and not _is_reparse_point(path / "engineering.cmd")
+        and (path / "engineering").read_text(encoding="utf-8") == portable
+        and (path / "engineering.cmd").read_text(encoding="utf-8") == windows
+    )
+
+
+def _register_windows_command_directory(directory: Path) -> None:
+    """Add Engineering's single managed command directory to the user PATH."""
+    import winreg
+
+    normalized = os.path.normcase(os.path.normpath(str(directory)))
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        "Environment",
+        0,
+        winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
+    ) as key:
+        try:
+            value, value_type = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            value, value_type = "", winreg.REG_EXPAND_SZ
+        entries = [entry for entry in str(value).split(";") if entry]
+        if not any(os.path.normcase(os.path.normpath(entry)) == normalized for entry in entries):
+            entries.append(str(directory))
+            winreg.SetValueEx(
+                key,
+                "Path",
+                0,
+                value_type if value_type in {winreg.REG_SZ, winreg.REG_EXPAND_SZ} else winreg.REG_EXPAND_SZ,
+                ";".join(entries),
+            )
+    current = os.environ.get("PATH", "")
+    if not any(os.path.normcase(os.path.normpath(entry)) == normalized for entry in current.split(";")):
+        os.environ["PATH"] = ";".join([entry for entry in (current, str(directory)) if entry])
 
 
 def _install_key(home: Path) -> bytes:
@@ -8741,7 +8854,7 @@ def install_bundle(source: Path, home: Path) -> dict:
     stages: dict[str, Path] = {
         key: path.with_name(f".{path.name}.backup-{token}")
         for key, path in paths.items()
-        if key in {"canonical", "previous", "claude", "shim", "receipt", "previous_receipt"}
+        if key in {"canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"}
     }
     stages = {key: path.with_name(path.name.replace(".backup-", ".stage-")) for key, path in stages.items()}
     try:
@@ -8756,7 +8869,10 @@ def install_bundle(source: Path, home: Path) -> dict:
                 and current["source_digest"] == source_digest
                 and _valid_forwarder(paths["claude"], "engineering")
                 and _valid_forwarder(paths["shim"], "engineering-traceability")
+                and _valid_command_launchers(paths["command"])
             ):
+                if os.name == "nt":
+                    _register_windows_command_directory(paths["command"])
                 return current
         elif any(paths[key].exists() for key in ("canonical", "previous", "previous_receipt")):
             raise EngineeringError("Engineering install state is incomplete.")
@@ -8771,6 +8887,7 @@ def install_bundle(source: Path, home: Path) -> dict:
         (stages["shim"] / "SKILL.md").write_text(
             _forwarder("engineering-traceability"), encoding="utf-8", newline="\n"
         )
+        _write_command_launchers(stages["command"])
         parity = _validated_installed_bundle(stages["canonical"])
         receipt = _sign_install_receipt({
             "schema": "engineering.install.v1",
@@ -8786,7 +8903,7 @@ def install_bundle(source: Path, home: Path) -> dict:
         stages["receipt"].parent.mkdir(parents=True, exist_ok=True)
         stages["receipt"].write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         replacements = [
-            (stages[key], paths[key]) for key in ("canonical", "claude", "shim", "receipt")
+            (stages[key], paths[key]) for key in ("canonical", "claude", "shim", "command", "receipt")
         ]
         if current is not None:
             shutil.copytree(paths["canonical"], stages["previous"])
@@ -8794,7 +8911,15 @@ def install_bundle(source: Path, home: Path) -> dict:
             replacements.extend(
                 (stages[key], paths[key]) for key in ("previous", "previous_receipt")
             )
-        _transactional_replace(replacements, token)
+        _transactional_replace(
+            replacements,
+            token,
+            after_publication=(
+                lambda: _register_windows_command_directory(paths["command"])
+                if os.name == "nt"
+                else None
+            ),
+        )
         return receipt
     finally:
         for path in stages.values():
@@ -8817,7 +8942,7 @@ def rollback_install(home: Path) -> dict:
     stages = {
         key: path.with_name(f".{path.name}.stage-{token}")
         for key, path in paths.items()
-        if key in {"canonical", "previous", "claude", "shim", "receipt", "previous_receipt"}
+        if key in {"canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"}
     }
     try:
         install_key = _install_key(home)
@@ -8837,6 +8962,7 @@ def rollback_install(home: Path) -> dict:
             (stages[key] / "SKILL.md").write_text(
                 _forwarder(name), encoding="utf-8", newline="\n"
             )
+        _write_command_launchers(stages["command"])
         restored = _sign_install_receipt({
             **previous,
             "status": "rolled_back",
@@ -8850,9 +8976,14 @@ def rollback_install(home: Path) -> dict:
         )
         _transactional_replace(
             [(stages[key], paths[key]) for key in (
-                "canonical", "previous", "claude", "shim", "receipt", "previous_receipt"
+                "canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"
             )],
             token,
+            after_publication=(
+                lambda: _register_windows_command_directory(paths["command"])
+                if os.name == "nt"
+                else None
+            ),
         )
         return restored
     finally:
