@@ -6369,7 +6369,7 @@ class Task7ContractTests(unittest.TestCase):
     def managed_snapshot(self, module, home):
         paths = module._install_paths(home)
         snapshot = {}
-        for key in ("canonical", "previous", "claude", "shim", "receipt", "previous_receipt"):
+        for key in ("canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"):
             path = paths[key]
             snapshot[key] = (
                 ("tree", module._tree_digest(path))
@@ -6919,7 +6919,10 @@ class Task7ContractTests(unittest.TestCase):
         self.assertIn("~/.agents/skills/engineering/SKILL.md", claude.read_text(encoding="utf-8"))
         self.assertIn("~/.agents/skills/engineering/SKILL.md", shim.read_text(encoding="utf-8"))
         self.assertNotIn(str(source), claude.read_text(encoding="utf-8"))
-        self.assertEqual("2.2.0", receipt["skill_version"])
+        self.assertEqual(
+            json.loads((source / "manifest.json").read_text(encoding="utf-8"))["version"],
+            receipt["skill_version"],
+        )
         self.assertRegex(receipt["source_git_commit"], r"^[0-9a-f]{40}$")
         self.assertEqual(
             "d89ec68af95e0cad801b56d88df383991e659823",
@@ -6930,6 +6933,31 @@ class Task7ContractTests(unittest.TestCase):
             self.home / ".agents" / "engineering" / "install-receipt.json"
         ).read_text(encoding="utf-8")
         self.assertNotIn(str(source), receipt_text)
+
+    def test_install_publishes_a_discoverable_windows_command_launcher(self):
+        module = self.module()
+        source = self.bundle_repo("command-launcher")
+        module.install_bundle(source, self.home)
+
+        launcher = self.home / ".agents" / "bin" / "engineering.cmd"
+        self.assertTrue(launcher.is_file())
+        self.assertIn("..\\skills\\engineering\\scripts\\engineering.cmd", launcher.read_text(encoding="utf-8"))
+        self.assertTrue(module._valid_command_launchers(launcher.parent))
+
+    def test_semantic_matrix_blocks_only_impacted_declared_rows(self):
+        module = self.module()
+        nodes = [
+            {"id": "code-orbit", "type": "code_symbol", "source": {"path": "src/orbit.py"}},
+            {"id": "test-positive", "type": "test", "source": {"path": "tests/test_orbit.py"}},
+            {"id": "test-negative", "type": "test", "source": {"path": "tests/test_orbit.py"}},
+        ]
+        manifest = {"semantic_matrices": [{"source": "docs/routes.md", "items": [{
+            "id": "orbit-route", "owner": "operations", "implementation": "code-orbit",
+            "positive": "test-positive", "negative": "missing-negative",
+        }]}]}
+
+        self.assertEqual(["orbit-route"], module._semantic_matrix_issues(manifest, nodes, {"src/orbit.py"}))
+        self.assertEqual([], module._semantic_matrix_issues(manifest, nodes, {"README.md"}))
 
     def test_install_validation_allows_only_generated_controller_bytecode(self):
         module = self.module()
@@ -7254,7 +7282,7 @@ class Task7ContractTests(unittest.TestCase):
 
     def test_every_late_install_publication_failure_restores_exact_state(self):
         module = self.module()
-        for index, key in enumerate(("claude", "shim", "receipt", "previous", "previous_receipt")):
+        for index, key in enumerate(("claude", "shim", "command", "receipt", "previous", "previous_receipt")):
             with self.subTest(key=key):
                 source = self.bundle_repo(f"install-fault-{index}")
                 home = Path(self.temporary_directory.name) / f"install-home-{index}"
@@ -7275,7 +7303,7 @@ class Task7ContractTests(unittest.TestCase):
 
     def test_every_late_rollback_publication_failure_restores_exact_state(self):
         module = self.module()
-        for index, key in enumerate(("claude", "shim", "receipt", "previous", "previous_receipt")):
+        for index, key in enumerate(("claude", "shim", "command", "receipt", "previous", "previous_receipt")):
             with self.subTest(key=key):
                 source = self.bundle_repo(f"rollback-fault-{index}")
                 home = Path(self.temporary_directory.name) / f"rollback-home-{index}"

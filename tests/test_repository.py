@@ -77,6 +77,20 @@ class RepositoryContractTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, skill)
 
+    def test_readme_states_the_operating_and_evidence_boundaries(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for required in (
+            "## Why, what, how",
+            "## Deterministic and LLM-assisted work",
+            "## Dependencies and prerequisites",
+            "## Quick start",
+            "## Scale and limits",
+            "Unknown",
+            "semantic_matrices",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, readme)
+
     def test_repository_has_no_generated_or_private_state(self) -> None:
         forbidden_names = {
             "__pycache__",

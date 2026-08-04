@@ -443,6 +443,17 @@ ordinary user prose is never an approval substitute.
 
 ## Completion contract
 
+### Declared finite semantic matrices
+
+`semantic_matrices` is opt-in and belongs in the project manifest only where an
+approved project contract already declares a finite ownership, routing,
+responsibility, classification, or state-distribution inventory. A touched row
+has exactly one `owner`, or an explicit `state` of `unavailable` or `unowned`,
+and references one `code_symbol` plus positive and negative verification nodes.
+Engineering blocks only the impacted change when that atomic identity is missing
+or conflicting. It does not infer inventories, add domain types, or block
+undeclared, historical, or unrelated work.
+
 Completion runs automatically after the authorized work. It compares predicted
 and actual artifacts, runs or verifies selected checks, reconciles direct links,
 refreshes the feature checkpoint, clears verified stale items, queues unrelated
@@ -581,7 +592,10 @@ canonical bundle, prior bundle and loaders are
 `<engineering-home>/.agents/skills/engineering/`,
 `<engineering-home>/.agents/skills/.engineering.previous/`,
 `<engineering-home>/.agents/skills/engineering-traceability/`, and
-`<engineering-home>/.claude/skills/engineering/`. The machine controller is
+`<engineering-home>/.claude/skills/engineering/`. The installed command launchers
+are `<engineering-home>/.agents/bin/engineering` and `engineering.cmd`; on Windows
+installation adds only that managed directory to the user `PATH` (a new terminal
+picks it up). The machine controller is
 `<engineering-home>/.agents/engineering/controller/`; its key, attestations and
 index are `attestation.key`, `attestations.json`, and
 `contribution-index.json`. The queue and operation locks are
@@ -689,7 +703,7 @@ diff, command, commit, publication, release, or installation action.
 validates the tracked Git source closure and rejects symlinks, junctions,
 reparse points, unpinned Graphify metadata, and non-Git sources. Under one
 foreground install lock it stages beside the canonical target, replaces the
-canonical bundle and generic loaders, and writes `engineering.install.v1` with
+canonical bundle, generic loaders, and command launchers, and writes `engineering.install.v1` with
 the skill version, source commit, source digest, Graphify commit, UTC timestamp,
 and equal Codex/Claude canonical-skill hashes. A failure restores the exact
 prior surfaces. Publication of every bundle, loader, receipt, and rollback
