@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
+import html
 import json
 import math
 import os
@@ -22,17 +23,39 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import quote
+import webbrowser
+from urllib.parse import quote, unquote
 
 
 GRAPHIFY_REPOSITORY = "https://github.com/safishamsi/graphify"
 GRAPHIFY_TAG = "v0.9.5"
 GRAPHIFY_VERSION = "0.9.5"
 GRAPHIFY_COMMIT = "d89ec68af95e0cad801b56d88df383991e659823"
-REQUIRED_GRAPHIFY_COMMANDS = ("update", "query", "path", "explain")
+REQUIRED_GRAPHIFY_COMMANDS = ("update", "path", "explain")
 CLEANUP_TERMINATION_GRACE_SECONDS = 0.25
 ORPHAN_MINIMUM_AGE_SECONDS = 30.0
 DEFAULT_CONTEXT_TOKEN_BUDGET = 1000
+DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS = 30.0
+ASSURANCE_SCHEMA = "engineering.capability-assurance.v1"
+EXECUTION_CONTEXT_SCHEMA = "engineering.execution-context.v1"
+TASK_AUTHORITY_SCHEMA = "engineering.task-authority.v1"
+ASSURANCE_EVIDENCE_KINDS = {
+    "implementation",
+    "deployment",
+    "availability",
+    "synthetic",
+    "feedback",
+    "incident",
+    "missing",
+}
+TASK_CHECK_EFFECTS = {
+    "network",
+    "connector",
+    "publication",
+    "deployment",
+    "live_environment",
+    "destructive",
+}
 HOOK_EVENTS = (
     "pre-commit",
     "post-commit",
@@ -153,6 +176,7 @@ PREPARATION_BLOCKERS = {
     "unapproved_contract_change": "public contract change lacks explicit approval",
     "unapproved_check_capability": "project check capability lacks explicit local approval",
     "missing_required_source": "required source or exact context is missing",
+    "checkpoint_pending": "the first exact checkpoint is pending; run the reported foreground recovery",
 }
 PREPARATION_ADVISORIES = {
     "remote_freshness_unknown": "canonical remote freshness is unknown",
@@ -160,6 +184,7 @@ PREPARATION_ADVISORIES = {
         "historical gaps remain before baseline acceptance"
     ),
     "unrelated_maintenance": "unrelated maintenance is queued",
+    "checkpoint_recovered": "the required exact checkpoint was rebuilt locally before preparation",
 }
 
 
@@ -186,6 +211,12 @@ class GraphifyIdentity:
     version: str
     commit: str
     required_commands: tuple[str, ...]
+
+
+def controller_argv() -> list[str]:
+    """Return the installed launcher; raw Python remains troubleshooting only."""
+    launcher = Path(__file__).with_name("engineering.cmd" if os.name == "nt" else "engineering")
+    return [str(launcher.resolve())] if launcher.is_file() else [sys.executable, str(Path(__file__).resolve())]
 
 
 def run(
@@ -252,6 +283,54 @@ def resolve_project_root(candidate: str) -> Path:
         return root if os.path.samefile(root, project_root) else project_root
     except TraceabilityError as error:
         raise TraceabilityError(f"Not a Git project root: {root}") from error
+
+
+def pre_repository_advisory(candidate: str) -> dict | None:
+    """Bounded no-write first-use state for one folder that has no Git identity."""
+    root = Path(candidate).expanduser().resolve()
+    if not root.is_dir():
+        raise TraceabilityError(f"Project root does not exist: {root}")
+    try:
+        git(root, "rev-parse", "--show-toplevel")
+        return None
+    except TraceabilityError:
+        pass
+    nested = []
+    for child in root.iterdir():
+        if child.is_dir():
+            try:
+                nested.append(Path(git(child, "rev-parse", "--show-toplevel")).resolve())
+            except TraceabilityError:
+                pass
+    if nested:
+        raise TraceabilityError(
+            "Refusing umbrella workspace: select one folder that is not already another Git project."
+        )
+    return {
+        "schema": "engineering.pre-repository.v1",
+        "state": "not_version_controlled",
+        "root": str(root),
+        "readiness": "advisory",
+        "canonical_map": "unknown",
+        "next_action": "Initialize local Git and adopt Engineering when ready; this creates no remote or publication.",
+    }
+
+
+def pre_repository_setup_preview(advisory: dict) -> dict:
+    plan = {
+        "schema": "engineering.project-controls-plan.v1",
+        "root": advisory["root"],
+        "commands": [["git", "init", advisory["root"]]],
+        "preserves_existing_files": True,
+    }
+    return {
+        "schema": "engineering.setup.v2",
+        "readiness": "proposal",
+        "state": "not_version_controlled",
+        "project_controls": plan,
+        "project_plan_digest": _plan_digest(plan),
+        "next_action": "Authorize this combined local Git-and-Engineering setup plan when ready; it creates no remote, commit, or publication.",
+    }
 
 
 def verify_graphify(executable: Path | str) -> GraphifyIdentity:
@@ -374,9 +453,19 @@ def default_branch(root: Path) -> str:
             root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"
         )
         git(root, "rev-parse", "--verify", f"refs/remotes/{branch}")
-    except TraceabilityError as error:
+        return branch.removeprefix("origin/")
+    except TraceabilityError:
+        pass
+    try:
+        detail = git(root, "remote", "show", "-n", "origin")
+        matches = re.findall(r"(?m)^\s*HEAD branch:\s*([^\s]+)\s*$", detail)
+        if len(matches) != 1 or matches[0] in {"(not queried)", "unknown"}:
+            raise ValueError
+        branch = matches[0]
+        git(root, "rev-parse", "--verify", f"refs/remotes/origin/{branch}")
+        return branch
+    except (TraceabilityError, ValueError) as error:
         raise TraceabilityError("Default branch identity is ambiguous.") from error
-    return branch.removeprefix("origin/")
 
 
 def project_name(root: Path) -> str:
@@ -631,6 +720,37 @@ def _project_paths(root: Path) -> tuple[str, str, str, str]:
     return _project_paths_for_manifest(config_path.name)
 
 
+def decision_ledger_path(root: Path, manifest: dict | None = None) -> str:
+    """Return the one project-owned decision ledger; the overlay is never authority."""
+    config = manifest if manifest is not None else load_project_config(root)
+    declared = config.get("decision_ledger")
+    if declared is None:
+        if manifest is not None:
+            return (
+                f"{V1_TRACE_DIR}/decision-ledger.md"
+                if config.get("version") == 1
+                else f"{V2_TRACE_DIR}/decision-ledger.md"
+            )
+        return _project_paths(root)[2]
+    if not isinstance(declared, str) or not declared or Path(declared).is_absolute() or ".." in Path(declared).parts:
+        raise EngineeringError("Engineering decision_ledger must be a project-relative path.")
+    return declared.replace("\\", "/")
+
+
+def _ledger_decisions(root: Path, commit: str, manifest: dict) -> dict[str, int]:
+    """Read stable IDs only; approval and implementation remain ledger-owned claims."""
+    path = decision_ledger_path(root, manifest)
+    text = _text_at(root, commit, path)
+    decisions: dict[str, int] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        found = re.findall(r"\b[A-Z][A-Z0-9_-]*-DEC-\d+\b", line)
+        for identifier in found:
+            if identifier in decisions:
+                raise EngineeringError("Engineering decision ledger reuses a stable ID.")
+            decisions[identifier] = line_number
+    return decisions
+
+
 def _scaffold_payload(root: Path, mode: str, graphify_version: str) -> dict[Path, str]:
     trace_dir = root / "docs" / "engineering"
     return {
@@ -649,6 +769,7 @@ def _scaffold_payload(root: Path, mode: str, graphify_version: str) -> dict[Path
                 "context": {"token_budget": DEFAULT_CONTEXT_TOKEN_BUDGET},
                 "autonomy": DEFAULT_AUTONOMY,
                 "overlay": {"version": 1},
+                "decision_ledger": f"{V2_TRACE_DIR}/decision-ledger.md",
                 "inputs": [f"{V2_TRACE_DIR}/links.json"],
                 "integrity": {"min_retained_ratio": 0.8},
                 "baseline": (
@@ -841,12 +962,25 @@ def _setup_documents(root: Path, graphify_version: str) -> list[tuple[Path, byte
         _validate_project_controls(root, "WORKTREE", manifests[0])
     else:
         scaffold_payload = _scaffold_payload(root, _setup_mode(root), graphify_version)
-        existing = [path for path in scaffold_payload if path.exists()]
+        ledgers = [
+            path for path in scaffold_payload
+            if path.name == "decision-ledger.md" and path.exists()
+        ]
+        existing = [path for path in scaffold_payload if path.exists() and path not in ledgers]
         if existing:
             raise EngineeringError(
                 "Refusing partial Engineering setup: "
                 + ", ".join(str(path.relative_to(root)) for path in existing)
             )
+        if len(ledgers) > 1:
+            raise EngineeringError("Refusing ambiguous project decision ledgers.")
+        if ledgers:
+            ledger = ledgers[0]
+            config = root / V2_CONFIG
+            payload = json.loads(scaffold_payload[config])
+            payload["decision_ledger"] = ledger.relative_to(root).as_posix()
+            scaffold_payload[config] = json.dumps(payload, indent=2) + "\n"
+            scaffold_payload.pop(ledger)
         desired.update(scaffold_payload)
     desired[root / "AGENTS.md"] = _managed_instruction_text(root / "AGENTS.md")
     desired[root / "CLAUDE.md"] = _managed_instruction_text(root / "CLAUDE.md")
@@ -1168,11 +1302,25 @@ def approve_setup(
         _end_completion(project_root, operation)
 
 
+def _setup_readiness(root: Path, graphify_python: str) -> dict:
+    """Never report written controls as usable before commit and exact read-back."""
+    if _tracked_manifest_name(root) is None:
+        return {"readiness": "controls_written_pending_commit", "checkpoint": None}
+    readiness = check_merge_readiness(root)
+    if readiness.get("ready"):
+        return {"readiness": "operational", "checkpoint": readiness["checkpoint"]}
+    return {
+        "readiness": "checkpoint_pending",
+        "checkpoint": None,
+        "reason": readiness.get("reason", "canonical_checkpoint_missing"),
+    }
+
+
 def setup(root: Path, graphify_python: str) -> dict:
     project_root = resolve_project_root(str(root))
     result, claims = _setup_preview(project_root, graphify_python)
     if not result["approvals_required"]:
-        return result
+        return {**result, **_setup_readiness(project_root, graphify_python)}
     if _matching_setup_attestation(project_root, claims) is None:
         return result
 
@@ -1257,7 +1405,7 @@ def setup(root: Path, graphify_python: str) -> dict:
 
     return {
         **result,
-        "readiness": "applied",
+        "readiness": "controls_written_pending_commit",
         "writes_applied": True,
         "graphify_installed": graphify_installed,
         "created_or_updated": [
@@ -1349,6 +1497,8 @@ def _validate_overlay(
     sources: list[tuple[str, str, int]] = []
     config_path, links_path, _, _ = _project_paths_for_manifest(config_path)
     input_paths = {config_path, links_path}
+    ledger_path = decision_ledger_path(root, manifest)
+    input_paths.add(ledger_path)
     for path in manifest.get("inputs", []):
         if not isinstance(path, str):
             raise TraceabilityError("Manifest inputs must be project-relative paths.")
@@ -1367,6 +1517,24 @@ def _validate_overlay(
         sources.append((identifier, path, line))
         identifiers.add(identifier)
         node_ids.add(identifier)
+
+    ledger_decisions = _ledger_decisions(root, commit, manifest)
+    overlay_decisions = {
+        node["id"]: node
+        for node in nodes
+        if node.get("type") == "decision"
+        and isinstance(node.get("source"), dict)
+        and node["source"].get("path", "").replace("\\", "/") == ledger_path
+    }
+    if set(ledger_decisions) != set(overlay_decisions):
+        raise TraceabilityError(
+            "Authoritative decision ledger and deterministic overlay disagree."
+        )
+    for identifier, line in ledger_decisions.items():
+        if overlay_decisions[identifier]["source"].get("line") != line:
+            raise TraceabilityError(
+                f"Decision overlay source is stale: {identifier}."
+            )
 
     for edge in edges:
         if not isinstance(edge, dict):
@@ -1417,6 +1585,81 @@ def _common_graph_dir(root: Path) -> Path:
     if not common.is_absolute():
         common = (root / common).resolve()
     return common / "engineering-graphs"
+
+
+def _graphify_environment(*, output: Path | None = None) -> dict[str, str]:
+    """Run the code-only Graphify path without forwarding provider credentials."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not re.search(r"(?:api.?key|token|secret|openai|anthropic)", key, re.I)
+    }
+    if output is not None:
+        environment["GRAPHIFY_OUT"] = str(output)
+    return environment
+
+
+def _map_cache_key(checkpoint: dict, assurance: list[dict], options: dict) -> str:
+    payload = {
+        "base_graph": checkpoint["metadata"].get("graph_digest"),
+        "deterministic_overlay": checkpoint["metadata"].get("input_digest"),
+        "assurance_overlay": hashlib.sha256(
+            json.dumps(assurance, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "renderer": "engineering-map.v1",
+        "options": options,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def render_map(root: Path, *, open_output: bool = True, focus: str | None = None) -> dict:
+    """Render the exact checkpoint locally; rendering never invokes Graphify."""
+    project_root = resolve_project_root(str(root))
+    commit = git(project_root, "rev-parse", "HEAD")
+    checkpoint = _load_checkpoint(project_root, commit)
+    assurance = _load_assurance_overlay(project_root)
+    options = {"focus": focus or "", "aggregate": len(checkpoint["nodes"]) > 5000}
+    cache_key = _map_cache_key(checkpoint, assurance, options)
+    destination = _common_graph_dir(project_root) / "maps" / cache_key / "index.html"
+    cached = destination.is_file()
+    if not cached:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        nodes = checkpoint["nodes"]
+        if focus:
+            node_ids = set(_reachable(checkpoint, focus, exact=False)) | {focus}
+            nodes = [node for node in nodes if node["id"] in node_ids]
+        if options["aggregate"]:
+            rows = sorted({str(node["type"]) for node in nodes})
+            body = "".join(
+                f"<tr><td>{html.escape(kind)}</td><td>{sum(node['type'] == kind for node in nodes)}</td></tr>"
+                for kind in rows
+            )
+            table = "<table><thead><tr><th>Type</th><th>Nodes</th></tr></thead><tbody>" + body + "</tbody></table>"
+        else:
+            body = "".join(
+                f"<tr><td>{html.escape(str(node['id']))}</td><td>{html.escape(str(node['type']))}</td></tr>"
+                for node in sorted(nodes, key=lambda item: item["id"])
+            )
+            table = "<table><thead><tr><th>Node</th><th>Type</th></tr></thead><tbody>" + body + "</tbody></table>"
+        document = (
+            "<!doctype html><meta charset='utf-8'><title>Engineering map</title>"
+            "<main><h1>Engineering map</h1>"
+            f"<p>Commit {html.escape(commit)}. {len(nodes)} nodes; {len(checkpoint['edges'])} deterministic links.</p>"
+            f"{table}</main>"
+        )
+        _atomic_text(destination, document)
+    if open_output:
+        webbrowser.open(destination.resolve().as_uri())
+    return {
+        "schema": "engineering.map.v1",
+        "commit": commit,
+        "output": str(destination),
+        "cached": cached,
+        "aggregate": options["aggregate"],
+        "opened": open_output,
+    }
 
 
 def common_graph_dir(root: Path) -> Path:
@@ -2099,12 +2342,13 @@ def _semantic_changes(
         else "docs/engineering/"
     )
     controls = {manifest_name}
+    supported_suffixes = {suffix.lower() for suffix in code_extensions}
     return [
         path
         for path in changed
         if path in controls
         or path.startswith(control_prefix)
-        or Path(path).suffix.lower() not in set(code_extensions)
+        or Path(path).suffix.lower() not in supported_suffixes
     ]
 
 
@@ -2938,6 +3182,11 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
     commit = record["commit"]
     empty_hooks = Path(record["operation_root"]) / "hooks"
     try:
+        removed_environment = {
+            key: os.environ.pop(key)
+            for key in list(os.environ)
+            if re.search(r"(?:api.?key|token|secret|openai|anthropic)", key, re.I)
+        }
         environment_before = os.environ.get("GRAPHIFY_OUT")
         os.environ["GRAPHIFY_OUT"] = str(stage)
         adapter_details, adapter = _verify_graphify_adapter_in_process()
@@ -3021,13 +3270,14 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                     "update",
                     str(worktree),
                 )
-                run(list(command), env=os.environ.copy(), timeout=600)
+                run(list(command), env=_graphify_environment(output=stage), timeout=600)
         finally:
             os.chdir(cwd_before)
             if environment_before is None:
                 os.environ.pop("GRAPHIFY_OUT", None)
             else:
                 os.environ["GRAPHIFY_OUT"] = environment_before
+            os.environ.update(removed_environment)
         graph_path = stage / "graph.json"
         if ancestor:
             incremented_graph = _read_base_graph(graph_path)
@@ -3476,7 +3726,7 @@ def _bound_remote_url(root: Path, remote: str) -> tuple[str, str]:
 
 
 def _canonical_authority_details(
-    root: Path, *, refresh_remote: bool
+    root: Path, *, refresh_remote: bool, allow_cached_remote: bool = False
 ) -> dict:
     project_root = resolve_project_root(str(root))
     manifest_name = _tracked_manifest_name(project_root)
@@ -3522,6 +3772,23 @@ def _canonical_authority_details(
             "refresh_source": None,
         }
     if not refresh_remote:
+        if allow_cached_remote:
+            try:
+                commit = git(project_root, "rev-parse", "--verify", destination)
+            except EngineeringError:
+                pass
+            else:
+                return {
+                    "branch": branch,
+                    "commit": commit,
+                    "remote": remote,
+                    "remote_url_digest": remote_url_digest,
+                    "freshness": "cached",
+                    "source": source,
+                    "destination": destination,
+                    "fetch_argv": [],
+                    "refresh_source": "cached_destination",
+                }
         return {
             "branch": branch,
             "commit": None,
@@ -3577,12 +3844,15 @@ def reconcile_canonical(
     root: Path,
     *,
     refresh_remote: bool,
+    allow_cached_remote: bool = False,
     graphify_python: str = sys.executable,
     hook_budget_seconds: float | None = None,
 ) -> dict:
     project_root = resolve_project_root(str(root))
     authority = _canonical_authority_details(
-        project_root, refresh_remote=refresh_remote
+        project_root,
+        refresh_remote=refresh_remote,
+        allow_cached_remote=allow_cached_remote,
     )
     if authority["freshness"] == "unknown" or authority["commit"] is None:
         return {
@@ -3661,13 +3931,155 @@ def reconcile_canonical(
             "fetched_destination": authority["destination"],
             "fetched_commit": authority["commit"],
             "canonical_published": result.get("freshness")
-            in {"current", "not_configured"},
+            in {"current", "cached", "not_configured"},
             "authority_revalidated_before_publication": (
-                result.get("freshness") in {"current", "not_configured"}
+                result.get("freshness") in {"current", "cached", "not_configured"}
             ),
         }
     )
     return result
+
+
+def bootstrap_graph(
+    root: Path,
+    *,
+    setup_authorized: bool,
+    graphify_python: str = sys.executable,
+    recovery_timeout_seconds: float | None = None,
+) -> dict:
+    """Assess or build the single canonical default-branch graph checkpoint.
+
+    This controller owns only the local exact-ref checkpoint.  It never treats a
+    feature checkpoint as canonical and never invents a substitute graph engine.
+    """
+    project_root = resolve_project_root(str(root))
+    if _tracked_manifest_name(project_root) is None:
+        return {
+            "state": "advisory",
+            "reason": "unmanaged_project",
+            "next_action": "adopt_engineering",
+            "graph_derived_claims": "unknown",
+        }
+    catalogue = graph_checkpoint_catalogue(project_root)
+    try:
+        cached = reconcile_canonical(
+            project_root,
+            refresh_remote=False,
+            allow_cached_remote=True,
+            graphify_python=graphify_python,
+            hook_budget_seconds=0.0,
+        )
+    except EngineeringError as error:
+        return {
+            "state": "unknown",
+            "reason": str(error),
+            "graph_derived_claims": "unknown",
+        }
+    if cached.get("canonical_published") and cached.get("checkpoint"):
+        return {
+            "state": "current",
+            "checkpoint": cached["checkpoint"],
+            "commit": cached.get("commit"),
+            "freshness": cached.get("freshness"),
+            "graph_derived_claims": "available",
+            "catalogue": catalogue,
+        }
+    if not setup_authorized:
+        return {
+            "state": "pending_setup_authority",
+            "reason": cached.get("reason", "canonical_checkpoint_missing"),
+            "next_action": "authorize_engineering_setup",
+            "graph_derived_claims": "unknown",
+            "catalogue": catalogue,
+        }
+    try:
+        verify_graphify(graphify_python)
+    except EngineeringError:
+        return {
+            "state": "blocked",
+            "reason": "graphify_unavailable_or_incompatible",
+            "next_action": "authorize_supported_graphify_setup",
+            "graph_derived_claims": "unknown",
+            "catalogue": catalogue,
+        }
+    result = reconcile_canonical(
+        project_root,
+        refresh_remote=False,
+        allow_cached_remote=True,
+        graphify_python=graphify_python,
+        hook_budget_seconds=recovery_timeout_seconds,
+    )
+    if result.get("canonical_published") and result.get("checkpoint"):
+        return {
+            "state": "current",
+            "preflight": {
+                "action": "reconcile_canonical_graph_and_overlay",
+                "scope": "one exact local default-branch checkpoint",
+                "changes": "local checkpoint catalogue only; no source, branch, or remote mutation",
+            },
+            "checkpoint": result["checkpoint"],
+            "commit": result.get("commit"),
+            "freshness": result.get("freshness"),
+            "graph_derived_claims": "available",
+            "catalogue": graph_checkpoint_catalogue(project_root),
+        }
+    return {
+        "state": "unknown",
+        "reason": result.get("reason", "canonical_checkpoint_pending"),
+        "graph_derived_claims": "unknown",
+        "catalogue": graph_checkpoint_catalogue(project_root),
+    }
+
+
+def graph_checkpoint_catalogue(root: Path) -> dict:
+    """Classify local checkpoints without promoting or deleting any of them."""
+    project_root = resolve_project_root(str(root))
+    manifest_name = _tracked_manifest_name(project_root)
+    if manifest_name is None:
+        return {"canonical": None, "features": [], "state": "unmanaged"}
+    manifest = _json_at(project_root, "HEAD", manifest_name)
+    default = manifest["project"]["default_branch"]
+    try:
+        canonical_commit = git(project_root, "rev-parse", f"refs/remotes/origin/{default}")
+    except EngineeringError:
+        canonical_commit = git(project_root, "rev-parse", f"refs/heads/{default}")
+    graph_dir = _common_graph_dir(project_root)
+    current: dict | None = None
+    features_by_commit: dict[str, dict] = {}
+    for checkpoint in sorted(graph_dir.glob("main/*/checkpoint.json")):
+        commit = checkpoint.parent.name
+        validation = validate_checkpoint(project_root, checkpoint, commit)
+        item = {"commit": commit, "state": "current" if validation["valid"] and commit == canonical_commit else "historical"}
+        if not validation["valid"]:
+            item["state"] = "quarantined"
+            item["reason"] = validation["reason"]
+        if item["state"] == "current":
+            current = item
+    for checkpoint in sorted(graph_dir.glob("features/*/*/checkpoint.json")):
+        commit, branch_token = checkpoint.parent.name, checkpoint.parent.parent.name
+        branch = unquote(branch_token)
+        validation = validate_checkpoint(project_root, checkpoint, commit)
+        item = {"commit": commit, "branch": branch, "state": "archived"}
+        if not validation["valid"]:
+            item.update(state="quarantined", reason=validation["reason"])
+        elif _is_ancestor_or_equal(project_root, commit, canonical_commit):
+            item["state"] = "historical"
+        else:
+            try:
+                branch_head = git(project_root, "rev-parse", f"refs/heads/{branch}")
+            except EngineeringError:
+                item["state"] = "archived"
+            else:
+                item["state"] = "active" if _is_ancestor_or_equal(project_root, commit, branch_head) else "archived"
+        previous = features_by_commit.get(commit)
+        priority = {"active": 3, "historical": 2, "archived": 1, "quarantined": 0}
+        if previous is None or priority[item["state"]] > priority[previous["state"]]:
+            features_by_commit[commit] = item
+    return {
+        "canonical": current,
+        "features": [features_by_commit[key] for key in sorted(features_by_commit)],
+        "state": "managed",
+    }
 
 
 def status(root: Path, *, target_commit: str | None = None) -> dict:
@@ -3737,9 +4149,7 @@ def run_full_graph_maintenance(
     argv = ["graphify", "update", str(project_root)]
     if recorder is not None and hasattr(recorder, "argv"):
         recorder.argv.append(argv)
-    environment = os.environ.copy()
     output = _common_graph_dir(project_root) / "maintenance"
-    environment["GRAPHIFY_OUT"] = str(output)
     run(
         [
             str(Path(graphify_python).expanduser().resolve()),
@@ -3748,7 +4158,7 @@ def run_full_graph_maintenance(
             "update",
             str(project_root),
         ],
-        env=environment,
+        env=_graphify_environment(output=output),
         timeout=600,
     )
     return {"mode": "full_maintenance", "argv": argv, "output": str(output)}
@@ -3899,6 +4309,25 @@ def _bounded_intent(intent: str) -> str:
     return value[:512]
 
 
+def _intent_projection(intent: str) -> dict[str, str]:
+    """Keep request prose only for this process; retain a minimal purpose."""
+    lowered = intent.lower()
+    purpose = next(
+        (
+            name
+            for name, terms in (
+                ("debug", ("debug", "defect", "failure", "incident")),
+                ("review", ("review", "assess", "audit")),
+                ("design", ("design", "plan", "architecture")),
+                ("maintenance", ("maintain", "stale", "drift")),
+            )
+            if any(term in lowered for term in terms)
+        ),
+        "implementation",
+    )
+    return {"digest": "sha256:" + hashlib.sha256(intent.encode("utf-8")).hexdigest(), "purpose": purpose}
+
+
 def _contains_credential(value: str) -> bool:
     return _redact_credentials(value) != value
 
@@ -3926,7 +4355,13 @@ def _scope_envelope(scope: dict) -> dict[str, object]:
     deterministic_only = scope.get("deterministic_only_approved", False)
     if not isinstance(deterministic_only, bool):
         raise EngineeringError("deterministic_only_approved must be boolean.")
-    result["deterministic_only_approved"] = deterministic_only
+    # Compatibility only: task authority, not this caller-supplied flag, permits
+    # degraded deterministic work when graph context is unavailable.
+    result["legacy_deterministic_only_approved"] = deterministic_only
+    if "task_authority" in scope:
+        if not isinstance(scope["task_authority"], dict):
+            raise EngineeringError("Preparation task authority must be an object.")
+        result["task_authority"] = scope["task_authority"]
     return result
 
 
@@ -3958,6 +4393,7 @@ def _explicit_context_ids(intent: str, scope: dict, nodes: dict[str, dict]) -> t
 def _graphify_query_context(
     intent: str, checkpoint_path: Path, token_budget: int
 ) -> dict:
+    """Select bounded code-graph context deterministically; never call an LLM CLI."""
     graph_path = checkpoint_path.parent / "graph.json"
     if not graph_path.is_file():
         return {"status": "unavailable", "context": [], "reason": "graph_missing"}
@@ -3971,85 +4407,20 @@ def _graphify_query_context(
             "context": [],
             "reason": "token_budget_not_configured",
         }
-    try:
-        verify_graphify(sys.executable)
-    except EngineeringError:
-        return {"status": "unavailable", "context": [], "reason": "graphify_unavailable"}
-    environment = os.environ.copy()
-    environment["GRAPHIFY_OUT"] = str(checkpoint_path.parent)
-    environment["GRAPHIFY_QUERY_LOG_DISABLE"] = "1"
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "graphify",
-                "query",
-                intent,
-                "--budget",
-                str(token_budget),
-                "--graph",
-                str(graph_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=environment,
-        )
-    except subprocess.TimeoutExpired:
-        return {"status": "unavailable", "context": [], "reason": "query_timeout"}
-    except (OSError, subprocess.SubprocessError):
-        return {"status": "unavailable", "context": [], "reason": "query_unavailable"}
-    if result.returncode:
-        return {"status": "unavailable", "context": [], "reason": "query_failed"}
-    output = result.stdout.strip()
-    if output == "No matching nodes found.":
-        return {"status": "empty", "context": []}
-    lines = output.splitlines()
-    header = re.fullmatch(
-        r"Traversal: (?:BFS|DFS) depth=\d+ \| Start: .* \| (\d+) nodes found",
-        lines[0] if lines else "",
-    )
-    if not header:
-        return {"status": "invalid", "context": [], "reason": "invalid_query_output"}
-    labels: dict[str, list[str]] = {}
-    for node in graph["nodes"]:
-        identifier = node["id"]
-        labels.setdefault(str(node.get("label", identifier)), []).append(identifier)
-    selected, used, seen = [], 0, set()
-    for line in lines[1:]:
-        if not line:
+    terms = {term for term in re.findall(r"[a-z0-9_]{3,}", intent.lower())}
+    selected, used = [], 0
+    for node in sorted(graph["nodes"], key=lambda item: str(item["id"])):
+        identifier = str(node["id"])
+        label = str(node.get("label", identifier)).lower()
+        if not terms.intersection(re.findall(r"[a-z0-9_]{3,}", f"{identifier} {label}".lower())):
             continue
-        node_match = re.fullmatch(r"NODE (.+) \[src=.* loc=.* community=.*\]", line)
-        if node_match:
-            matches = sorted(labels.get(node_match.group(1), []))
-            if not matches:
-                return {"status": "invalid", "context": [], "reason": "unknown_query_id"}
-            for identifier in matches:
-                if _contains_credential(identifier):
-                    return {
-                        "status": "invalid",
-                        "context": [],
-                        "reason": "credential_query_id",
-                    }
-                cost = max(1, (len(identifier) + 3) // 4)
-                if identifier not in seen and used + cost <= token_budget:
-                    selected.append(
-                        {
-                            "id": identifier,
-                            "provenance": "inferred" if len(matches) == 1 else "ambiguous",
-                        }
-                    )
-                    seen.add(identifier)
-                    used += cost
+        if _contains_credential(identifier):
+            return {"status": "invalid", "context": [], "reason": "credential_query_id"}
+        cost = max(1, (len(identifier) + 3) // 4)
+        if used + cost > token_budget:
             continue
-        if line.startswith("EDGE ") and "-->" in line:
-            continue
-        if line.startswith("... (truncated"):
-            continue
-        return {"status": "invalid", "context": [], "reason": "invalid_query_output"}
-    if int(header.group(1)) and not selected:
-        return {"status": "invalid", "context": [], "reason": "invalid_query_output"}
+        selected.append({"id": identifier, "provenance": "derived"})
+        used += cost
     return {"status": "success" if selected else "empty", "context": selected}
 
 
@@ -4755,9 +5126,69 @@ def _contract_change_approved(scope: dict) -> bool:
     return scope.get("contract_change_approved") is True
 
 
+def _recover_initial_checkpoint(project: ProjectIdentity) -> dict:
+    """Build canonical first, then an isolated feature checkpoint when needed."""
+    try:
+        canonical = bootstrap_graph(
+            project.root,
+            setup_authorized=True,
+            graphify_python=sys.executable,
+            recovery_timeout_seconds=DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS,
+        )
+        if canonical.get("state") != "current" or not canonical.get("checkpoint"):
+            return {"recovered": False, "reason": str(canonical.get("reason", "checkpoint_pending"))}
+        if project.branch == project.default_branch:
+            return {"recovered": True, "checkpoint": canonical["checkpoint"]}
+        result = rebuild(project.root, sys.executable, target_commit=project.commit)
+    except EngineeringError as error:
+        return {"recovered": False, "reason": str(error)[:160]}
+    if result.get("freshness") == "current" and result.get("checkpoint"):
+        return {"recovered": True, "checkpoint": result.get("checkpoint")}
+    return {"recovered": False, "reason": str(result.get("reason", "checkpoint_pending"))}
+
+
+def _unmanaged_preparation(root: Path, intent: str, scope: dict, override: str | None) -> dict:
+    """Give adoptable projects a no-write readiness result, never a fake run."""
+    project_root = resolve_project_root(str(root))
+    authorization = _scope_envelope(scope)
+    autonomy = override or DEFAULT_AUTONOMY
+    if autonomy not in AUTONOMY_LEVELS:
+        raise EngineeringError(f"Invalid Engineering autonomy: {autonomy}")
+    checks = discover_checks(project_root)
+    check_authority = None
+    advisories = [
+        "Engineering controls are not tracked in this checkout; traceability and capability status are unknown.",
+        "Setup remains a separate approved project-control action; no files or controller state were written.",
+    ]
+    if checks and "task_authority" in authorization:
+        check_authority = validate_task_check_authority(
+            authorization["task_authority"], _check_capability_claims(project_root, checks)
+        )
+    elif checks:
+        advisories.append("Project-native check authority remains outside Engineering until controls are adopted.")
+    return {
+        "schema": "engineering.prepare.v1",
+        "run_id": None,
+        "project": {"commit": git(project_root, "rev-parse", "HEAD"), "traceability": "unknown"},
+        "intent": _intent_projection(_bounded_intent(intent)),
+        "authorization": authorization,
+        "autonomy": autonomy,
+        "readiness": "ready_with_advisories",
+        "blockers": [],
+        "advisories": advisories,
+        "context": [],
+        "impact": [],
+        "required_checks": checks,
+        "check_authority": check_authority,
+        "completion_available": False,
+    }
+
+
 def prepare(
     root: Path, intent: str, scope: dict, override: str | None = None
 ) -> dict:
+    if _tracked_manifest_name(resolve_project_root(str(root))) is None:
+        return _unmanaged_preparation(root, intent, scope, override)
     project = resolve_project(Path(root))
     bounded_intent = _bounded_intent(intent)
     authorization = _scope_envelope(scope)
@@ -4780,7 +5211,14 @@ def prepare(
         checkpoint_path = Path(readiness["checkpoint"])
         checkpoint = _load_checkpoint(project.root, project.commit)
     else:
-        blocker_codes.append("missing_current_checkpoint")
+        recovered = _recover_initial_checkpoint(project)
+        readiness = check_merge_readiness(project.root)
+        if readiness["ready"]:
+            checkpoint_path = Path(readiness["checkpoint"])
+            checkpoint = _load_checkpoint(project.root, project.commit)
+            advisory_codes.append("checkpoint_recovered")
+        else:
+            blocker_codes.append("checkpoint_pending")
 
     nodes = {node["id"]: node for node in checkpoint["nodes"]}
     explicit, missing = _explicit_context_ids(bounded_intent, scope, nodes)
@@ -4800,8 +5238,13 @@ def prepare(
         if checkpoint_path is not None
         else {"status": "unavailable", "context": [], "reason": "checkpoint_unavailable"}
     )
-    deterministic_only = authorization["deterministic_only_approved"]
-    if query_outcome["status"] in {"unavailable", "invalid"} and not deterministic_only:
+    task_check_authority = None
+    if "task_authority" in authorization:
+        task_check_authority = validate_task_check_authority(
+            authorization["task_authority"],
+            _check_capability_claims(project.root, required_checks),
+        )
+    if query_outcome["status"] in {"unavailable", "invalid"} and task_check_authority is None:
         blocker_codes.append("missing_required_source")
     query_ids = [item["id"] for item in query_outcome["context"]]
     selected_ids = list(dict.fromkeys([*explicit, *query_ids]))
@@ -4851,14 +5294,20 @@ def prepare(
         for action in authorization["forbidden"]
     ):
         blocker_codes.append("conflicting_authority")
+    check_authority = task_check_authority
     if required_checks:
         try:
-            _require_attestation(
-                _project_controller_dir(project.root),
-                "check_capability",
-                _check_capability_claims(project.root, required_checks),
-            )
+            claims = _check_capability_claims(project.root, required_checks)
+            if task_check_authority is not None:
+                check_authority = task_check_authority
+            else:
+                _require_attestation(
+                    _project_controller_dir(project.root), "check_capability", claims
+                )
+                check_authority = {"mode": "legacy_attestation", "commands_digest": claims["commands_digest"]}
         except EngineeringError:
+            if "task_authority" in authorization:
+                raise
             blocker_codes.append("unapproved_check_capability")
 
     try:
@@ -4895,7 +5344,7 @@ def prepare(
             "branch": project.branch,
             "commit": project.commit,
         },
-        "intent": bounded_intent,
+        "intent": _intent_projection(bounded_intent),
         "authorization": authorization,
         "autonomy": autonomy,
         "readiness": (
@@ -4917,6 +5366,7 @@ def prepare(
         "context": context,
         "impact": impact,
         "required_checks": required_checks,
+        "check_authority": check_authority,
     }
     if applied_practices:
         result["applied_practices"] = applied_practices
@@ -5053,10 +5503,18 @@ def _check_capability_claims(root: Path, checks: list[list[str]]) -> dict:
         raise EngineeringError("Engineering check capability contains credential-shaped data.")
     identities = [_check_identity(argv) for argv in checks]
     inline_code = any(_contains_inline_code(argv) for argv in checks)
+    shell = any(
+        re.fullmatch(
+            r"(?:sh|bash|zsh|ksh|dash|cmd|powershell|pwsh)(?:\d+(?:\.\d+)*)?",
+            Path(argv[0]).stem.lower(),
+        )
+        for argv in checks
+    )
     return {
         "repository_id": _project_contribution_digest(root),
         "commands_digest": _json_digest(identities),
         "inline_code": inline_code,
+        "shell_free": not shell,
         "allow_inline_code": inline_code,
     }
 
@@ -5630,11 +6088,16 @@ def complete(root: Path, run_id: str, receipts: list[dict]) -> dict:
         if discover_checks(project.root) != required:
             raise EngineeringError("Engineering project check capability changed after preparation.")
         if required:
-            _require_attestation(
-                _project_controller_dir(project.root),
-                "check_capability",
-                _check_capability_claims(project.root, required),
-            )
+            claims = _check_capability_claims(project.root, required)
+            task_authority = authorization.get("task_authority")
+            if task_authority is not None:
+                validated_authority = validate_task_check_authority(task_authority, claims)
+                if preparation.get("check_authority") != validated_authority:
+                    raise EngineeringError("Engineering task check authority changed after preparation.")
+            else:
+                _require_attestation(
+                    _project_controller_dir(project.root), "check_capability", claims
+                )
         checks: list[dict] = []
         for argv in required:
             command_id = _check_identity(argv)
@@ -6044,9 +6507,12 @@ _WINDOWS_PRIVATE_ACL = r"""
 & {
 param(
     [Parameter(Mandatory=$true)][string]$path,
-    [bool]$enforce,
-    [bool]$directory
+    [Parameter(Mandatory=$true)][ValidateSet('0','1')][string]$enforceFlag,
+    [Parameter(Mandatory=$true)][ValidateSet('0','1')][string]$directoryFlag
 )
+$ErrorActionPreference = 'Stop'
+$enforce = $enforceFlag -eq '1'
+$directory = $directoryFlag -eq '1'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 if ($enforce) {
     $acl = Get-Acl -LiteralPath $path
@@ -6088,12 +6554,13 @@ $entries = @($verified.Access | ForEach-Object {
 $ownerSid = (New-Object System.Security.Principal.NTAccount($verified.Owner)).Translate(
     [System.Security.Principal.SecurityIdentifier]
 ).Value
-@{
+$result = @{
     protected = $verified.AreAccessRulesProtected
     owner_sid = $ownerSid
     current_sid = $sid.Value
     access = $entries
 } | ConvertTo-Json -Compress -Depth 4
+[Console]::Out.WriteLine('ENGINEERING_ACL_RESULT:' + $result)
 }
 """.strip()
 
@@ -6108,23 +6575,33 @@ def _windows_owner_private(path: Path, *, enforce: bool) -> None:
             "-Command",
             _WINDOWS_PRIVATE_ACL,
             str(path),
-            "$true" if enforce else "$false",
-            "$true" if directory else "$false",
+            "1" if enforce else "0",
+            "1" if directory else "0",
         ],
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
     )
+    if result.returncode != 0:
+        raise EngineeringError("Engineering controller owner-private ACL verification failed.")
+    records = [
+        line.removeprefix("ENGINEERING_ACL_RESULT:")
+        for line in result.stdout.splitlines()
+        if line.startswith("ENGINEERING_ACL_RESULT:")
+    ]
+    if len(records) != 1:
+        raise EngineeringError("Engineering controller owner-private ACL verification failed.")
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(records[0])
     except json.JSONDecodeError as error:
         raise EngineeringError("Engineering controller owner-private ACL verification failed.") from error
+    if not isinstance(payload, dict):
+        raise EngineeringError("Engineering controller owner-private ACL verification failed.")
     current_sid = payload.get("current_sid")
     access = payload.get("access")
     if (
-        result.returncode != 0
-        or payload.get("protected") is not True
+        payload.get("protected") is not True
         or payload.get("owner_sid") != payload.get("current_sid")
         or not isinstance(access, list)
         or not access
@@ -6193,6 +6670,396 @@ def _canonical_json(value: object) -> bytes:
 
 def _json_digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _assurance_id(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+        or _contains_credential(value)
+    ):
+        raise EngineeringError(f"Engineering assurance {label} is invalid.")
+    return value
+
+
+def _assurance_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise EngineeringError("Engineering assurance timestamp is invalid.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise EngineeringError("Engineering assurance timestamp is invalid.") from error
+    if parsed.tzinfo is None:
+        raise EngineeringError("Engineering assurance timestamp is invalid.")
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_assurance_manifest(value: object) -> dict:
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "capabilities", "cells", "obligations"
+    } or value.get("schema") != ASSURANCE_SCHEMA:
+        raise EngineeringError("Engineering capability assurance manifest is invalid.")
+    capabilities = value.get("capabilities")
+    cells = value.get("cells")
+    obligations = value.get("obligations")
+    if (
+        not isinstance(capabilities, list)
+        or not isinstance(cells, list)
+        or not isinstance(obligations, list)
+        or len(capabilities) > 256
+        or len(cells) > 256
+        or len(obligations) > 512
+    ):
+        raise EngineeringError("Engineering capability assurance manifest is invalid.")
+    normalized_cells = []
+    for cell in cells:
+        if not isinstance(cell, dict) or set(cell) != {"id", "production"}:
+            raise EngineeringError("Engineering capability assurance cell is invalid.")
+        if not isinstance(cell["production"], bool):
+            raise EngineeringError("Engineering capability assurance cell is invalid.")
+        normalized_cells.append({"id": _assurance_id(cell["id"], "cell"), "production": cell["production"]})
+    cell_ids = {item["id"] for item in normalized_cells}
+    if len(cell_ids) != len(normalized_cells):
+        raise EngineeringError("Engineering capability assurance cell is invalid.")
+    normalized_capabilities = []
+    for capability in capabilities:
+        if not isinstance(capability, dict) or set(capability) != {
+            "id", "criticality", "required_cells", "required_interfaces", "required_roles"
+        }:
+            raise EngineeringError("Engineering capability assurance capability is invalid.")
+        if capability["criticality"] not in {"routine", "material", "critical"}:
+            raise EngineeringError("Engineering capability assurance capability is invalid.")
+        normalized = {
+            "id": _assurance_id(capability["id"], "capability"),
+            "criticality": capability["criticality"],
+        }
+        for field in ("required_cells", "required_interfaces", "required_roles"):
+            items = capability[field]
+            if not isinstance(items, list) or len(items) > 64:
+                raise EngineeringError("Engineering capability assurance capability is invalid.")
+            normalized[field] = [_assurance_id(item, field) for item in items]
+            if len(set(normalized[field])) != len(normalized[field]):
+                raise EngineeringError("Engineering capability assurance capability is invalid.")
+        if not normalized["required_cells"] or not normalized["required_interfaces"]:
+            raise EngineeringError("Engineering capability assurance capability is invalid.")
+        if not set(normalized["required_cells"]).issubset(cell_ids):
+            raise EngineeringError("Engineering capability assurance capability is invalid.")
+        normalized_capabilities.append(normalized)
+    capability_ids = {item["id"] for item in normalized_capabilities}
+    if len(capability_ids) != len(normalized_capabilities):
+        raise EngineeringError("Engineering capability assurance capability is invalid.")
+    remediation = {
+        "route_observability": "observability",
+        "release_identity": "release_evidence",
+        "incident_mapping": "incident_mapping",
+        "feedback_route": "feedback_route",
+    }
+    normalized_obligations = []
+    for obligation in obligations:
+        if not isinstance(obligation, dict) or set(obligation) != {"id", "capability_id", "kind"}:
+            raise EngineeringError("Engineering capability assurance obligation is invalid.")
+        if obligation["kind"] not in remediation:
+            raise EngineeringError("Engineering capability assurance obligation is invalid.")
+        normalized = {
+            "id": _assurance_id(obligation["id"], "obligation"),
+            "capability_id": _assurance_id(obligation["capability_id"], "capability"),
+            "kind": obligation["kind"],
+        }
+        if normalized["capability_id"] not in capability_ids:
+            raise EngineeringError("Engineering capability assurance obligation is invalid.")
+        normalized_obligations.append(normalized)
+    if len({item["id"] for item in normalized_obligations}) != len(normalized_obligations):
+        raise EngineeringError("Engineering capability assurance obligation is invalid.")
+    return {
+        "schema": ASSURANCE_SCHEMA,
+        "capabilities": normalized_capabilities,
+        "cells": normalized_cells,
+        "obligations": normalized_obligations,
+    }
+
+
+def _validated_assurance_observations(observations: object, now: datetime) -> list[dict]:
+    if not isinstance(observations, list) or len(observations) > 2048:
+        raise EngineeringError("Engineering assurance observations are invalid.")
+    normalized = []
+    for observation in observations:
+        if not isinstance(observation, dict) or not set(observation).issubset(
+            {"kind", "result", "severity", "release", "interface", "observed_at", "valid_until", "role", "obligation_id"}
+        ):
+            raise EngineeringError("Engineering assurance observation is invalid.")
+        kind = observation.get("kind")
+        if kind not in ASSURANCE_EVIDENCE_KINDS:
+            raise EngineeringError("Engineering assurance observation is invalid.")
+        if kind == "missing":
+            if set(observation) != {"kind", "obligation_id"}:
+                raise EngineeringError("Engineering assurance observation is invalid.")
+            normalized.append({"kind": "missing", "obligation_id": _assurance_id(observation["obligation_id"], "obligation")})
+            continue
+        required = {"kind", "result", "release", "interface", "observed_at", "valid_until"}
+        if not required.issubset(observation) or observation["result"] not in {"passed", "failed", "accepted", "rejected"}:
+            raise EngineeringError("Engineering assurance observation is invalid.")
+        normalized_item = {key: observation[key] for key in required}
+        normalized_item["release"] = _assurance_id(normalized_item["release"], "release")
+        normalized_item["interface"] = _assurance_id(normalized_item["interface"], "interface")
+        observed_at = _assurance_timestamp(normalized_item["observed_at"])
+        valid_until = _assurance_timestamp(normalized_item["valid_until"])
+        if valid_until < observed_at or observed_at > now + timedelta(minutes=5):
+            raise EngineeringError("Engineering assurance observation is invalid.")
+        for optional in ("severity", "role"):
+            if optional in observation:
+                normalized_item[optional] = _assurance_id(observation[optional], optional)
+        normalized.append(normalized_item)
+    return normalized
+
+
+def reduce_assurance_status(
+    manifest: object, capability_id: str, cell_id: str, observations: object, as_of: str
+) -> dict:
+    assurance = validate_assurance_manifest(manifest)
+    capability = next((item for item in assurance["capabilities"] if item["id"] == capability_id), None)
+    if capability is None or cell_id not in capability["required_cells"]:
+        raise EngineeringError("Engineering assurance capability or cell is invalid.")
+    now = _assurance_timestamp(as_of)
+    items = _validated_assurance_observations(observations, now)
+    current = [item for item in items if item["kind"] != "missing" and _assurance_timestamp(item["valid_until"]) >= now]
+    stale = [item for item in items if item["kind"] != "missing" and item not in current]
+    interfaces = set(capability["required_interfaces"])
+    deployed = {item["interface"] for item in current if item["kind"] == "deployment" and item["result"] == "passed"}
+    synthetic = {item["interface"] for item in current if item["kind"] == "synthetic" and item["result"] == "passed"}
+    failed = [item for item in current if item["result"] in {"failed", "rejected"}]
+    severe = any(item["kind"] == "incident" and item.get("severity") == "severe" for item in failed)
+    feedback_roles = {item.get("role") for item in current if item["kind"] == "feedback" and item["result"] == "accepted"}
+    deployment = "present" if interfaces.issubset(deployed) else "partial" if deployed else "unknown"
+    verification = "failed" if failed else "passed" if interfaces.issubset(synthetic) else "unknown"
+    availability = "unavailable" if severe else "healthy" if any(item["kind"] == "availability" and item["result"] == "passed" for item in current) else "unknown"
+    acceptance = (
+        "not_required" if not capability["required_roles"]
+        else "accepted" if set(capability["required_roles"]).issubset(feedback_roles)
+        else "pending"
+    )
+    confidence = "conflicting" if severe or (failed and (deployed or synthetic)) else "strong" if current else "unknown"
+    freshness = "current" if current and not stale else "stale" if stale else "unknown"
+    lifecycle = "implemented" if any(item["kind"] == "implementation" and item["result"] == "passed" for item in current) else "unknown"
+    if severe or verification == "failed" or availability == "unavailable":
+        summary = "not_live"
+    elif not current:
+        summary = "unknown"
+    elif deployment == "present" and verification == "passed" and availability == "healthy" and acceptance in {"accepted", "not_required"} and freshness == "current":
+        summary = "fully_live"
+    else:
+        summary = "partially_live"
+    return {
+        "schema": "engineering.capability-status.v1",
+        "capability_id": capability_id,
+        "cell_id": cell_id,
+        "lifecycle": lifecycle,
+        "deployment": deployment,
+        "availability": availability,
+        "verification": verification,
+        "acceptance": acceptance,
+        "confidence": confidence,
+        "freshness": freshness,
+        "summary": summary,
+    }
+
+
+def assurance_recommendations(manifest: object, observations: object) -> dict:
+    assurance = validate_assurance_manifest(manifest)
+    items = _validated_assurance_observations(observations, datetime.now(timezone.utc))
+    obligations = {item["id"]: item for item in assurance["obligations"]}
+    remediation = {
+        "route_observability": "observability",
+        "release_identity": "release_evidence",
+        "incident_mapping": "incident_mapping",
+        "feedback_route": "feedback_route",
+    }
+    recommendations = []
+    for observation in items:
+        if observation["kind"] != "missing" or observation["obligation_id"] not in obligations:
+            continue
+        obligation = obligations[observation["obligation_id"]]
+        recommendations.append(
+            {
+                "obligation_id": obligation["id"],
+                "capability_id": obligation["capability_id"],
+                "remediation_class": remediation[obligation["kind"]],
+                "title": f"Provide {obligation['kind'].replace('_', ' ')} evidence",
+            }
+        )
+    return {"status": "recommendation", "items": recommendations} if recommendations else {"status": "unknown", "items": []}
+
+
+def assurance_feedback_request(
+    manifest: object, capability_id: str, cell_id: str, observations: object, as_of: str
+) -> dict:
+    """Produce a role-only request contract; this function never contacts anyone."""
+    assurance = validate_assurance_manifest(manifest)
+    capability = next((item for item in assurance["capabilities"] if item["id"] == capability_id), None)
+    if capability is None:
+        raise EngineeringError("Engineering assurance capability or cell is invalid.")
+    status = reduce_assurance_status(assurance, capability_id, cell_id, observations, as_of)
+    if (
+        not capability["required_roles"]
+        or status["deployment"] != "present"
+        or status["verification"] != "passed"
+        or status["acceptance"] != "pending"
+    ):
+        return {"status": "unknown", "capability_status": status}
+    return {
+        "schema": "engineering.assurance-feedback.v1",
+        "status": "requested",
+        "capability_id": capability_id,
+        "cell_id": cell_id,
+        "roles": sorted(capability["required_roles"]),
+        "reason": "declared_role_acceptance_missing",
+        "capability_status": status,
+    }
+
+
+def assurance_reaction(status: object) -> dict:
+    if not isinstance(status, dict) or status.get("schema") != "engineering.capability-status.v1":
+        raise EngineeringError("Engineering capability status is invalid.")
+    summary = status.get("summary")
+    if summary not in {"fully_live", "partially_live", "not_live", "unknown"}:
+        raise EngineeringError("Engineering capability status is invalid.")
+    if summary == "fully_live":
+        return {"status": "none"}
+    action = (
+        "owner_decision" if summary == "not_live"
+        else "await_feedback" if status.get("acceptance") == "pending"
+        else "recheck_evidence"
+    )
+    identity = {
+        "capability_id": status.get("capability_id"),
+        "cell_id": status.get("cell_id"),
+        "summary": summary,
+        "action": action,
+    }
+    return {"status": "pending", "action": action, "dedupe_key": _json_digest(identity)}
+
+
+def _assurance_overlay_path(root: Path) -> Path:
+    return _project_controller_dir(root) / "assurance-overlay.json"
+
+
+def _load_assurance_overlay(root: Path) -> list[dict]:
+    path = _assurance_overlay_path(root)
+    if not path.is_file():
+        return []
+    _verify_owner_private(path, directory=False)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering assurance overlay is invalid.") from error
+    if not isinstance(payload, dict) or set(payload) != {"schema", "observations"} or payload.get("schema") != "engineering.assurance-overlay.v1":
+        raise EngineeringError("Engineering assurance overlay is invalid.")
+    return payload["observations"]
+
+
+def assurance_status(root: Path, capability_id: str, cell_id: str, as_of: str | None = None) -> dict:
+    project_root = resolve_project_root(str(root))
+    declared = load_project_config(project_root).get("assurance")
+    if declared is None:
+        return {"schema": "engineering.capability-status.v1", "summary": "unknown", "reason": "assurance_not_declared"}
+    return reduce_assurance_status(
+        declared,
+        capability_id,
+        cell_id,
+        _load_assurance_overlay(project_root),
+        as_of or _utc_now(),
+    )
+
+
+def build_execution_context(
+    preparation: object, *, assertions: object = (), forbidden_ids: object = ()
+) -> dict:
+    if not isinstance(preparation, dict) or preparation.get("schema") != "engineering.prepare.v1":
+        raise EngineeringError("Engineering preparation context is invalid.")
+    project = preparation.get("project")
+    authorization = preparation.get("authorization")
+    context = preparation.get("context")
+    if not isinstance(project, dict) or not isinstance(authorization, dict) or not isinstance(context, list):
+        raise EngineeringError("Engineering preparation context is invalid.")
+    if not isinstance(forbidden_ids, (set, list, tuple)) or any(not isinstance(item, str) for item in forbidden_ids):
+        raise EngineeringError("Engineering execution context exclusions are invalid.")
+    forbidden = sorted(set(forbidden_ids))
+    selected = [
+        {"id": _assurance_id(item.get("id"), "context identifier"), "provenance": item.get("provenance")}
+        for item in context
+        if isinstance(item, dict) and item.get("provenance") in EXACT_PROVENANCE and item.get("id") not in forbidden
+    ]
+    if any(item["provenance"] not in EXACT_PROVENANCE for item in selected):
+        raise EngineeringError("Engineering execution context provenance is invalid.")
+    selected = list({item["id"]: item for item in selected}.values())[:128]
+    if not isinstance(assertions, (list, tuple)) or len(assertions) > 32:
+        raise EngineeringError("Engineering execution context assertions are invalid.")
+    selected_ids = {item["id"] for item in selected}
+    normalized_assertions = []
+    for item in assertions:
+        if not isinstance(item, dict) or set(item) != {"id", "text"} or item["id"] not in selected_ids:
+            raise EngineeringError("Engineering execution context assertions are invalid.")
+        text = item["text"]
+        if not isinstance(text, str) or not text or len(text) > 256:
+            raise EngineeringError("Engineering execution context assertions are invalid.")
+        normalized_assertions.append({"id": item["id"], "text": _redact_credentials(text)})
+    scope = authorization.get("scope")
+    if not isinstance(scope, list) or any(not isinstance(item, str) for item in scope):
+        raise EngineeringError("Engineering execution context scope is invalid.")
+    bundle = {
+        "schema": EXECUTION_CONTEXT_SCHEMA,
+        "run_id": _assurance_id(preparation.get("run_id"), "run"),
+        "project": {"root_digest": project.get("root_digest"), "commit": project.get("commit")},
+        "scope": list(scope),
+        "context": selected,
+        "assertions": normalized_assertions,
+        "forbidden_ids": forbidden,
+    }
+    if not isinstance(bundle["project"]["root_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", bundle["project"]["root_digest"]) or not isinstance(bundle["project"]["commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", bundle["project"]["commit"]):
+        raise EngineeringError("Engineering execution context project is invalid.")
+    return {**bundle, "digest": _json_digest(bundle)}
+
+
+def validate_execution_context(bundle: object, preparation: object, *, runner_enforces_boundary: bool) -> dict:
+    if not isinstance(bundle, dict) or set(bundle) != {
+        "schema", "run_id", "project", "scope", "context", "assertions", "forbidden_ids", "digest"
+    } or bundle.get("schema") != EXECUTION_CONTEXT_SCHEMA:
+        raise EngineeringError("Engineering execution context is invalid.")
+    unsigned = {key: value for key, value in bundle.items() if key != "digest"}
+    if bundle.get("digest") != _json_digest(unsigned):
+        raise EngineeringError("Engineering execution context digest is invalid.")
+    expected = build_execution_context(
+        preparation,
+        assertions=bundle["assertions"],
+        forbidden_ids=set(bundle["forbidden_ids"]),
+    )
+    if expected != bundle:
+        raise EngineeringError("Engineering execution context scope or provenance changed.")
+    if not isinstance(runner_enforces_boundary, bool):
+        raise EngineeringError("Engineering runner boundary mode is invalid.")
+    return {"schema": EXECUTION_CONTEXT_SCHEMA, "mode": "enforced" if runner_enforces_boundary else "advisory", "bundle": bundle}
+
+
+def validate_task_check_authority(authority: object, claims: object) -> dict:
+    if not isinstance(authority, dict) or set(authority) != {"schema", "task_id", "commands_digest", "effects"}:
+        raise EngineeringError("Engineering routine check authority is invalid.")
+    if authority.get("schema") != TASK_AUTHORITY_SCHEMA or not isinstance(claims, dict):
+        raise EngineeringError("Engineering routine check authority is invalid.")
+    task_id = _assurance_id(authority.get("task_id"), "task authority")
+    digest = authority.get("commands_digest")
+    effects = authority.get("effects")
+    if (
+        not isinstance(digest, str)
+        or digest != claims.get("commands_digest")
+        or claims.get("inline_code") is not False
+        or claims.get("shell_free") is not True
+        or not isinstance(effects, dict)
+        or set(effects) != TASK_CHECK_EFFECTS
+        or any(value is not False for value in effects.values())
+    ):
+        raise EngineeringError("Engineering routine check authority is invalid.")
+    return {"schema": TASK_AUTHORITY_SCHEMA, "task_id": task_id, "commands_digest": digest}
 
 
 def _validate_practice(practice: object) -> dict:
@@ -8606,6 +9473,25 @@ def _install_hooks_authorized(
     }
 
 
+def _expected_cli_blocker(error: EngineeringError) -> dict | None:
+    text = str(error)
+    routes = {
+        "manifest_not_tracked": "authorize_engineering_setup",
+        "Default branch identity is ambiguous.": "resolve_default_branch",
+        "Graphify is missing from the selected Python interpreter.": "authorize_supported_graphify_setup",
+        "graphify_adapter_incompatible": "select_supported_graphify",
+    }
+    remediation = routes.get(text)
+    if remediation is None:
+        return None
+    return {
+        "schema": "engineering.error.v1",
+        "status": "blocked",
+        "reason": text if text == "manifest_not_tracked" else re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_"),
+        "remediation": remediation,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="engineering")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -8638,6 +9524,10 @@ def main() -> int:
     rebuild_parser.add_argument("root")
     rebuild_parser.add_argument("--commit", required=True)
     rebuild_parser.add_argument("--graphify-python", default=sys.executable)
+    map_parser = commands.add_parser("map")
+    map_parser.add_argument("root", nargs="?", default=".")
+    map_parser.add_argument("--no-open", action="store_true")
+    map_parser.add_argument("--focus")
     ci_parser = commands.add_parser("ci-gate")
     ci_parser.add_argument("root")
     hook_parser = commands.add_parser("hook")
@@ -8663,7 +9553,9 @@ def main() -> int:
     prepare_parser = commands.add_parser("prepare")
     prepare_parser.add_argument("root")
     prepare_parser.add_argument("intent")
-    prepare_parser.add_argument("--scope-json", required=True)
+    prepare_scope = prepare_parser.add_mutually_exclusive_group(required=True)
+    prepare_scope.add_argument("--scope-json")
+    prepare_scope.add_argument("--scope-file")
     prepare_parser.add_argument("--override", choices=sorted(AUTONOMY_LEVELS))
     complete_parser = commands.add_parser("complete")
     complete_parser.add_argument("root")
@@ -8671,6 +9563,11 @@ def main() -> int:
     approve_checks_parser = commands.add_parser("approve-checks")
     approve_checks_parser.add_argument("root")
     approve_checks_parser.add_argument("--allow-inline-code", action="store_true")
+    assurance_parser = commands.add_parser("assurance-status")
+    assurance_parser.add_argument("root")
+    assurance_parser.add_argument("capability_id")
+    assurance_parser.add_argument("cell_id")
+    assurance_parser.add_argument("--as-of")
     autonomy_parser = commands.add_parser("autonomy")
     autonomy_parser.add_argument("level", choices=sorted(AUTONOMY_LEVELS))
     autonomy_parser.add_argument("root", nargs="?", default=".")
@@ -8755,6 +9652,29 @@ def main() -> int:
                     raise EngineeringError("Maintenance accepts exactly one project root.")
                 root = resolve_project_root(arguments.target)
                 result = run_maintenance(root, arguments.area)
+        elif arguments.command in {"map", "prepare", "setup"}:
+            advisory = pre_repository_advisory(arguments.root)
+            if advisory is not None:
+                if arguments.command == "map":
+                    result = {
+                        "schema": "engineering.map.v1",
+                        "status": "unavailable",
+                        "reason": "canonical_map_unavailable_until_local_version_control_exists",
+                        "advisory": advisory,
+                    }
+                elif arguments.command == "prepare":
+                    result = {
+                        "schema": "engineering.prepare.v1",
+                        "readiness": "advisory",
+                        "project": advisory,
+                        "context": [],
+                        "blockers": [],
+                    }
+                else:
+                    result = pre_repository_setup_preview(advisory)
+                print(json.dumps(result))
+                return 1 if arguments.command == "setup" else 0
+            root = resolve_project_root(arguments.root)
         elif not arguments.command.startswith("learning-"):
             root = resolve_project_root(arguments.root)
         if arguments.command.startswith("learning-"):
@@ -8777,12 +9697,20 @@ def main() -> int:
             )
         elif arguments.command == "approve-checks":
             result = approve_checks(root, allow_inline_code=arguments.allow_inline_code)
+        elif arguments.command == "assurance-status":
+            result = assurance_status(root, arguments.capability_id, arguments.cell_id, arguments.as_of)
         elif arguments.command == "complete":
             result = complete(root, arguments.run_id, [])
         elif arguments.command == "prepare":
             try:
-                scope = json.loads(arguments.scope_json)
-            except json.JSONDecodeError as error:
+                if arguments.scope_file is not None:
+                    source = sys.stdin.read() if arguments.scope_file == "-" else Path(arguments.scope_file).read_text(encoding="utf-8")
+                else:
+                    source = arguments.scope_json
+                if not isinstance(source, str) or len(source.encode("utf-8")) > 64 * 1024:
+                    raise ValueError
+                scope = json.loads(source)
+            except (OSError, ValueError, json.JSONDecodeError) as error:
                 raise EngineeringError("Preparation scope JSON is invalid.") from error
             result = prepare(root, arguments.intent, scope, arguments.override)
             if result["readiness"] == "blocked":
@@ -8801,10 +9729,21 @@ def main() -> int:
         elif arguments.command == "rebuild":
             path = rebuild(root, arguments.commit, arguments.graphify_python)
             result = {"checkpoint": str(path)}
+        elif arguments.command == "map":
+            result = render_map(
+                root, open_output=not arguments.no_open, focus=arguments.focus
+            )
         elif arguments.command == "hook":
             result = handle_hook(
                 arguments.event, root, arguments.graphify_python
             )
+            if result.get("freshness") == "stale":
+                print(
+                    "Engineering: checkpoint pending "
+                    f"({result.get('reason', 'unknown')}); run a foreground rebuild when ready.",
+                    file=sys.stderr,
+                )
+            return 0
         elif arguments.command == "install-hooks":
             result = legacy_setup_forwarder(
                 root, arguments.graphify_python, arguments.command
@@ -8843,6 +9782,11 @@ def main() -> int:
                     arguments.command, checkpoint, getattr(arguments, "identifier", None)
                 )
     except (OSError, subprocess.SubprocessError, TraceabilityError, ValueError) as error:
+        if isinstance(error, EngineeringError):
+            payload = _expected_cli_blocker(error)
+            if payload is not None:
+                print(json.dumps(payload))
+                return 2
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result))

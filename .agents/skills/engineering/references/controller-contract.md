@@ -31,6 +31,16 @@ checkpoint evidence.
 Preserve existing hooks. Altering live project hooks requires separate explicit
 authorization. Ordinary task authorization is insufficient.
 
+Graph construction, traversal, and map rendering are deterministic and
+code-only: the pinned Graphify `update` path, its reviewed incremental adapter,
+and local BFS/DFS/path/explain operations. Engineering never invokes
+`graphify extract`, provider-backed labeling, or an LLM backend, and removes
+provider credential variables from Graphify subprocess environments. A query
+budget limits returned context, not provider/API spend. This does not constrain
+the host agent's normal reasoning: when prose is needed it may read the bounded
+redacted execution-context slice under task authority, without adding it to the
+canonical Graphify graph.
+
 The common-directory dispatcher identifies a project from the invoking
 worktree's Git INDEX. It activates only when exactly one tracked
 `engineering-traceability.json` or `engineering.json` exists. With neither
@@ -49,6 +59,14 @@ string; post-merge fails closed with `invalid_manifest` when it is missing or
 invalid and uses only the value returned by that validation.
 
 ## Project and toolchain discovery
+
+For one explicit folder with no local Git repository, Engineering returns the
+read-only `not_version_controlled` advisory state. It may inspect local files
+and instructions but creates no graph, store, commit, remote, or publication.
+`engineering map` reports that a canonical map awaits local version control.
+Setup previews one digest-bound local `git init` plus controls action; applying
+that remains separate project-controls authority and preserves every file.
+Folders containing nested repositories are refused as ambiguous workspaces.
 
 Resolve one exact Git root, branch, commit, Git common directory, and configured
 default branch before reading or publishing evidence. Adopt an existing
@@ -70,8 +88,8 @@ argv is explicitly configured.
 
 Graphify is exactly version `0.9.5` from
 `https://github.com/safishamsi/graphify`, commit
-`d89ec68af95e0cad801b56d88df383991e659823`, with `update`, `query`, `path`,
-and `explain`. Setup requires an explicit absolute Python interpreter outside
+`d89ec68af95e0cad801b56d88df383991e659823`, with `update`, `path`, and
+`explain`. Setup requires an explicit absolute Python interpreter outside
 the project and rejects linked/reparse executables. Its path, executable digest,
 and version are part of the plan. A missing installation may only be proposed
 for that interpreter as:
@@ -152,6 +170,26 @@ All linked worktrees in one clone use
 local caches. Git-tracked overlay inputs produce a stable fingerprint so a
 fetched correction clears shared drift only after the receiving clone rebuilds
 and validates the exact commit.
+
+Before graph-derived work, the controller makes a read-only bootstrap
+assessment. It reports unmanaged repositories as advisory/Unknown; a greenfield
+repository without an eligible commit as `waiting_for_first_commit`; and a
+managed repository as current only when one canonical default-branch checkpoint
+has matching Graphify pin, exact commit, overlay version, input digest, graph
+digest, and integrity evidence. Construction first verifies the already selected
+Graphify runner. Missing or incompatible Graphify is one actionable blocker; it
+never falls back to another graph generator. Installing or upgrading it remains
+separate setup authority.
+
+With setup authority, a missing or stale canonical checkpoint is rebuilt from
+the exact local default-branch ref, with Graphify and overlay atomically
+published and read back together. An active feature receives its own isolated
+checkpoint only after that canonical baseline. Feature records are never merged
+into canonical: commits already ancestral to default are historical, absent
+branches archive locally, and invalid/orphaned records are quarantined as
+Unknown. Nothing is automatically deleted. A first construction or broad
+reconciliation reports its bounded local scope and affected controller
+catalogue; it does not mutate source, branches, or remotes.
 
 An exact commit and Graphify-pin hit performs no Graphify update. Otherwise the
 controller copies the nearest compatible local ancestor into atomic staging,
@@ -314,18 +352,17 @@ deduplicated in deterministic first-ID order while retaining the strongest
 provenance (`direct`, `derived`, `inferred`, then `ambiguous`). Inferred and
 ambiguous context may guide navigation but cannot satisfy readiness.
 
-The pin-verified Graphify query contract is its bounded `NODE` text output. The
-controller accepts no alternate output format, maps labels back to IDs in the
-parsed base graph, and returns a typed internal outcome: `success`, `empty`,
-`unavailable`, or `invalid`. Unknown IDs and malformed text are invalid;
-timeout, missing Graphify, and non-zero exit are unavailable. Invalid or
-unavailable query evidence blocks as `missing_required_source`, unless the exact
-task contract sets `deterministic_only_approved` to true; that bounded boolean
-is retained in authorization. This waiver applies only to unavailable or
-invalid query evidence and never replaces sufficient exact context or impact.
-Successful empty output is distinct from failure and still requires sufficient
-exact evidence for readiness, regardless of intent wording. Query-selected IDs
-join explicit IDs for exact-neighbour and impact checks. Contract approval
+The controller selects bounded matching IDs from the pinned parsed base graph;
+it does not invoke `graphify query`, an LLM, or a provider backend. It returns
+`success`, `empty`, `unavailable`, or `invalid`. Unknown IDs and malformed data
+are invalid; a missing or unreadable checkpoint is unavailable. Invalid or
+unavailable context blocks as `missing_required_source` unless an exact
+`engineering.task-authority.v1` independently validates the unchanged safe
+local task. The legacy `deterministic_only_approved` input remains parseable
+for compatibility but grants no waiver. This exception never replaces
+sufficient exact context or impact. Successful empty output is distinct from
+failure and still requires sufficient exact evidence for readiness, regardless
+of intent wording. Selected IDs join explicit IDs for exact-neighbour and impact checks. Contract approval
 evaluates the full validated bidirectional
 exact-context closure, including upstream contracts. Exact-context provenance
 is carried across the full path; any derived edge makes that path derived, and
@@ -355,15 +392,54 @@ output, arbitrary query IDs, or connector payloads. Credential-shaped intent is
 redacted before use or retention; credential-shaped scope and forbidden entries
 are rejected.
 
-For every applicable task response, include these headings in order even when
-the work is blocked: **Engineering preparation**, **Readiness**, **Impact**, and
-**Engineering completion**. Preparation identifies project, authorized scope,
-instructions, and project-native toolchain. Readiness is `ready`, `ready with
-advisories`, or `blocked`. Impact names known affected contracts, artifacts,
-callers, and tests; when inspection is unavailable it says impact is unverified.
-Completion reports completed checks/evidence or checks required after
-authorization. Do not invent a stack or present an unverified assumption as
+Final handoff defaults to one-sentence **Outcome**, then **Now** and **Next**;
+include **Blocked** only for a genuine blocker. Preparation, readiness, impact,
+completion evidence, and technical caveats are optional **Details**, used only
+when a decision, troubleshooting, or audit needs them. Routine commentary does
+not repeat controller headings. Preparation still identifies project,
+authorized scope, instructions, and project-native toolchain; readiness is
+`ready`, `ready with advisories`, or `blocked`; impact names known affected
+contracts, artifacts, callers, and tests; completion reports checks and
+retained evidence. Do not invent a stack or present an unverified assumption as
 fact.
+
+## Capability assurance and execution context
+
+Capability Assurance is a project-local, untracked controller overlay. Its
+manifest records only stable capability identities, deployment cells,
+obligations, and bounded adapter contracts; observations remain bound to an
+exact capability, release, interface, cell, validity interval, and applicable
+role. The reducer reports independent lifecycle, deployment, availability,
+verification, acceptance, confidence, freshness, and derived live status.
+Absent adapters or evidence produce `unknown`; a severe incident or other
+contradiction remains visible and blocks a fully-live result.
+
+The controller may emit a harness recommendation only where a declared
+obligation, an observed missing or contradictory evidence item, and a
+project-neutral remediation class are all present. Catalogued detector packs
+cover only their named classes. Otherwise the answer is `unknown`.
+
+`engineering.execution-context.v1` is derived only from a preparation result.
+It binds the run, root digest, commit, scope, exact direct/derived context,
+bounded redacted assertions, explicit forbidden IDs, and a canonical digest.
+Validation rejects malformed, stale, scope-expanded, digest-mismatched, or
+provenance-expanded bundles before dispatch. A runner that cannot keep other
+graph-derived sources away from the worker receives an `advisory` result, not
+an enforced-isolation claim.
+
+## Routine local-check authority
+
+`approve-checks` remains the compatibility and higher-risk path. An explicitly
+authorized engineering task may instead supply `engineering.task-authority.v1`
+with one task identity, the exact discovered command digest, and a complete
+false classification for network, connector, publication, deployment,
+live-environment, and destructive effects. The controller independently
+requires project-declared argv, no credentials, no inline interpreter code,
+and no shell execution. It revalidates the same authority and argv digest at
+completion. Missing or malformed authority, any changed command, unknown or
+positive effect, inline code, shell, or credential data fails closed. The
+preparation record retains only the bounded authority and command identities;
+ordinary user prose is never an approval substitute.
 
 ## Completion contract
 
