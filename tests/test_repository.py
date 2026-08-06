@@ -260,9 +260,17 @@ class RepositoryContractTests(unittest.TestCase):
                 linked.symlink_to(external, target_is_directory=True)
             except OSError as error:
                 self.skipTest(f"directory symlink unavailable: {error}")
+            stale = external / "stale.txt"
+            stale.write_text("generated\n", encoding="utf-8")
             receipt = destination / ".git" / "engineering-public-export.json"
             receipt.write_text(
-                json.dumps({"files": ["redirect/stale.txt"]}), encoding="utf-8"
+                json.dumps(
+                    {
+                        "schema": "engineering.public-export-receipt.v2",
+                        "files": {"redirect/stale.txt": module._file_digest(stale)},
+                    }
+                ),
+                encoding="utf-8",
             )
             with self.assertRaises(module.ExportError):
                 module.export_tree(ROOT, destination)
