@@ -4,7 +4,7 @@
 
 **Goal:** Establish the reviewed Engineering v2 baseline in its standalone repository, then add a safe Promote-and-apply learning loop and a working sanitized public export.
 
-**Architecture:** Preserve the existing single-file controller and contribution lifecycle. Add a bounded declarative practice payload, one transactional applied-practice ledger under the existing Engineering home, and thin CLI/skill projections. Keep source improvement proposal-only and produce the public mirror from a corporate-only allowlist into an independent repository history.
+**Architecture:** Preserve the existing single-file controller and contribution lifecycle. Add a bounded declarative practice payload, one transactional applied-practice ledger under the existing Engineering home, and thin CLI/skill projections. Keep source improvement proposal-only and produce the sanitized distribution from a canonical allowlist into an independent repository history.
 
 **Tech Stack:** Python 3.12 standard library, `unittest`, Git, Graphify 0.9.5 at `d89ec68af95e0cad801b56d88df383991e659823`, Markdown, JSON, GitHub Actions.
 
@@ -105,7 +105,7 @@ receipt containing the source commit and SHA-256 for each imported file.
 Create minimal human-readable instructions and ignore rules for Python caches,
 local test state, generated graph checkpoints, controller state, and export
 staging. The sensitive-data scanner must inspect every tracked file and reject
-personal paths, emails, private IDs, secret-shaped values, and forbidden names.
+user-specific paths, emails, private IDs, secret-shaped values, and forbidden names.
 
 - [ ] **Step 5: Run the standalone and inherited v2 gates**
 
@@ -335,7 +335,7 @@ Construct deliberately secret-shaped test inputs from harmless fragments at
 runtime so GitHub secret scanning sees no credential-shaped tracked literal
 while the controller tests still exercise rejection.
 
-- [ ] **Step 3: Implement the corporate-only exporter**
+- [ ] **Step 3: Implement the canonical-source exporter**
 
 The exporter validates source/destination boundaries, rejects reparse links and
 unlisted files, preserves destination Git metadata, removes stale previously
@@ -396,7 +396,7 @@ Address any material finding test-first and rerun affected/full gates.
 
 - [ ] **Step 4: Verify destination readiness**
 
-Confirm exact authenticated identities, internal/public visibility, empty or
+Confirm exact authenticated identities, destination visibility, empty or
 history-compatible destinations, approved licence, CI availability, and push
 rights. Fail closed on any mismatch.
 

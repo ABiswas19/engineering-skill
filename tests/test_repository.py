@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 
@@ -143,11 +144,15 @@ class RepositoryContractTests(unittest.TestCase):
             result = module.export_tree(ROOT, destination)
 
             self.assertTrue(marker.is_file())
+            receipt = json.loads(
+                (destination / ".git" / "engineering-public-export.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual("engineering.public-export-receipt.v2", receipt["schema"])
             self.assertTrue(result["publication_ready"])
             self.assertEqual([], result["blockers"])
-            self.assertFalse((destination / "release" / "public-export.json").exists())
             self.assertFalse((destination / "release" / "migration-receipt.json").exists())
-            self.assertFalse((destination / "tools" / "export_public.py").exists())
             expected = set(
                 json.loads((ROOT / "release" / "public-export.json").read_text(encoding="utf-8"))["files"]
             )
@@ -157,6 +162,180 @@ class RepositoryContractTests(unittest.TestCase):
                 if path.is_file() and ".git" not in path.parts
             }
             self.assertEqual(expected, actual)
+            for relative in expected:
+                self.assertEqual(
+                    (ROOT / relative).read_bytes(),
+                    (destination / relative).read_bytes(),
+                    relative,
+                )
+            required_generic_payload = {
+                ".agents/skills/engineering/SKILL.md",
+                ".agents/skills/engineering/scripts/engineering",
+                ".agents/skills/engineering/scripts/engineering.cmd",
+                ".agents/skills/engineering/scripts/engineering.py",
+                ".agents/skills/engineering/tests/test_engineering.py",
+                ".github/workflows/security.yml",
+                "README.md",
+                "release/public-export.json",
+                "tests/test_repository.py",
+                "tools/export_public.py",
+            }
+            self.assertLessEqual(required_generic_payload, actual)
+            workflow = (destination / ".github/workflows/security.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("ubuntu-latest", workflow)
+            self.assertIn("windows-latest", workflow)
+            self.assertNotIn("self-hosted", workflow)
+
+    def test_public_export_cannot_delete_an_absolute_retained_path(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            destination = base / "public"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            sentinel = base / "outside.txt"
+            sentinel.write_text("keep\n", encoding="utf-8")
+            receipt = destination / ".git" / "engineering-public-export.json"
+            receipt.write_text(
+                json.dumps({"files": [str(sentinel)]}), encoding="utf-8"
+            )
+            module.export_tree(ROOT, destination)
+            self.assertEqual("keep\n", sentinel.read_text(encoding="utf-8"))
+
+    def test_public_export_preserves_unverified_or_modified_relative_files(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "public"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            retained = destination / "retained.txt"
+            retained.write_text("keep\n", encoding="utf-8")
+            receipt = destination / ".git" / "engineering-public-export.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": "engineering.public-export-receipt.v2",
+                        "files": {"retained.txt": "sha256:" + "0" * 64},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            module.export_tree(ROOT, destination)
+            self.assertEqual("keep\n", retained.read_text(encoding="utf-8"))
+
+    def test_public_export_rejects_a_linked_destination_parent(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            destination = base / "public"
+            external = base / "external"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            external.mkdir()
+            linked = destination / "redirect"
+            try:
+                linked.symlink_to(external, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlink unavailable: {error}")
+            receipt = destination / ".git" / "engineering-public-export.json"
+            receipt.write_text(
+                json.dumps({"files": ["redirect/stale.txt"]}), encoding="utf-8"
+            )
+            with self.assertRaises(module.ExportError):
+                module.export_tree(ROOT, destination)
+
+    def test_public_export_rejects_a_broken_leaf_link(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            destination = base / "public"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            target = destination / "README.md"
+            try:
+                target.symlink_to(base / "missing.txt")
+            except OSError as error:
+                self.skipTest(f"file symlink unavailable: {error}")
+            with self.assertRaises(module.ExportError):
+                module.export_tree(ROOT, destination)
+
+    def test_public_export_rejects_a_hard_linked_leaf(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            destination = base / "public"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            external = base / "outside.txt"
+            external.write_text("keep\n", encoding="utf-8")
+            os.link(external, destination / "README.md")
+            with self.assertRaises(module.ExportError):
+                module.export_tree(ROOT, destination)
+            self.assertEqual("keep\n", external.read_text(encoding="utf-8"))
+
+    def test_public_export_rejects_a_hard_linked_receipt(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            destination = base / "public"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            external = base / "outside.json"
+            external.write_text(
+                json.dumps({"schema": "engineering.public-export-receipt.v2", "files": {}}),
+                encoding="utf-8",
+            )
+            os.link(external, destination / ".git" / "engineering-public-export.json")
+            with self.assertRaises(module.ExportError):
+                module.export_tree(ROOT, destination)
+            self.assertEqual(
+                {"schema": "engineering.public-export-receipt.v2", "files": {}},
+                json.loads(external.read_text(encoding="utf-8")),
+            )
 
 
 if __name__ == "__main__":

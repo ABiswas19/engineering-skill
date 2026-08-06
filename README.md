@@ -51,8 +51,12 @@ controller never silently call an LLM; host usage depends on the task.
 
 Ask Codex or Claude to use Engineering for the current project. For routine
 local inspection, run `engineering --help`, then use `engineering map`,
-`status`, `coverage`, `trace`, `impact`, `assurance-status`, `autonomy`, or
-`maintain status` as appropriate. On Windows, installation adds its one managed
+`engineering status <root>`, `engineering coverage <root>`,
+`engineering trace <root> <id>`, `engineering impact <root> <id>`,
+`engineering assurance-status <root> <capability> <cell>`,
+`engineering retrospect <root>`, or `engineering maintain status` as
+appropriate. `engineering autonomy <level> [root]` changes the saved level; it
+is not an inspection command. On Windows, installation adds its one managed
 command directory to the user PATH; open a new terminal after first install.
 
 Setup approval, `prepare`/`complete`, hooks, checkpoint/rebuild, and the
@@ -83,6 +87,14 @@ Decisions remain project-owned. Engineering indexes them but never infers
 approval or implementation from code, tests, or graph edges. Local/private
 evidence stays outside Git, and no live state changes automatically.
 
+Version 2.2.2 also adds `engineering retrospect`: a read-only audit over the
+finite manifest, ledger, declared overlay sources, and checkpoint. The first
+call returns a digest-bound preview of sources, matrix scope, work, permissions,
+outputs, and optional host-LLM cost; rerun with `--preview-digest` to audit. It
+reports evidence classifications, declared matrix cells, and ledger/overlay drift. Optional host
+LLM reconciliation receives only that bounded source list and remains advisory;
+the controller never invokes an LLM or writes remediation.
+
 ## Scale and limits
 
 | Context | Evidence today |
@@ -92,7 +104,7 @@ evidence stays outside Git, and no live state changes automatically.
 | Enterprise | Capability/topology reducers have cell and boundary fixtures, but this is not an enterprise platform claim. No centralized HA service, distributed operational store, SSO/RBAC authority, telemetry platform, scheduler, cross-project live aggregator, or large-enterprise field validation ships in 2.2. |
 
 Very large monorepos, many concurrent users or machines, long-duration
-operational evidence, and real corporate topology/adapters remain untested or
+operational evidence, and real enterprise topology/adapters remain untested or
 partially tested. The surrounding harness services above are roadmap/deferred
 work, not shipped dependencies.
 

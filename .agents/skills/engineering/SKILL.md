@@ -7,18 +7,15 @@ description: Use when a non-trivial software task needs setup, planning, impleme
 
 ## What Engineering does
 
-Engineering makes an engineering change understandable and verifiable from the
-request through completion. It adapts to the project that exists: its
-instructions, decisions, contracts, toolchain, tests, and approval boundaries.
-It applies to setup, mid-flight work, implementation, debugging, review,
-verification, impact analysis, and maintenance. Skip it for conversation,
+Engineering makes a change understandable and verifiable from request through
+completion. It adapts to existing instructions, decisions, contracts,
+toolchain, tests, and approval boundaries. Skip it for conversation,
 translation, formatting, or simple inspection.
 
 It prepares applicable work and completes its evidence automatically.
 Engineering completion runs automatically before claiming non-trivial work is
-ready. The controller commands are diagnostics and CI interfaces, not normal
-user steps. Use `engineering map`; installation publishes it through a managed
-launcher directory (open a new terminal after installation).
+ready. Controller commands are diagnostics and CI interfaces. Use
+`engineering map`; installation publishes it through a managed launcher.
 See
 `references/controller-contract.md` for exact commands and stored receipts.
 
@@ -30,12 +27,10 @@ checks. Before a graph-derived claim, it assesses the repository and the
 canonical default-branch checkpoint. Installation alone does not create a
 graph.
 
-A managed repository with missing or stale evidence builds the pinned Graphify
-graph and overlay together at one exact default-branch commit, then validates
-them. Missing or incompatible Graphify is a blocker; Engineering never invents
-another generator. An active feature keeps isolated local evidence. A merged,
-deleted, orphaned, or corrupt feature record is historical, archived, or
-Unknown; it is never silently merged into the canonical graph or deleted.
+A managed repository with missing or stale evidence builds and validates the
+pinned Graphify graph and overlay at one exact default-branch commit. Missing
+or incompatible Graphify blocks graph claims. Feature evidence stays isolated;
+merged, deleted, orphaned, or corrupt records become historical or Unknown.
 
 Same-machine worktrees share the Git-common local checkpoint catalogue.
 Separate machines recreate their own evidence. A cold start builds, an
@@ -75,6 +70,10 @@ An explicitly authorized task may run only its unchanged, declared, local,
 deterministic, shell-free, credential-reduced checks without a second ceremony.
 Changed, inline, networked, connector, live, or consequential checks remain
 separately gated.
+
+Use `engineering retrospect` only for an explicitly bounded mid-flight audit.
+Its first call is a digest-bound preview; execution is read-only over declared
+evidence. Host LLM reconciliation stays bounded and advisory until recorded.
 
 ## Completion and maintenance
 

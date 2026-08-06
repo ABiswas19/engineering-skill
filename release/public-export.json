@@ -1,0 +1,29 @@
+{
+  "schema": "engineering.public-export.v1",
+  "files": [
+    ".agents/skills/engineering/SKILL.md",
+    ".agents/skills/engineering/agents/openai.yaml",
+    ".agents/skills/engineering/manifest.json",
+    ".agents/skills/engineering/references/controller-contract.md",
+    ".agents/skills/engineering/scripts/engineering",
+    ".agents/skills/engineering/scripts/engineering.cmd",
+    ".agents/skills/engineering/scripts/engineering.py",
+    ".agents/skills/engineering/tests/scenarios.json",
+    ".agents/skills/engineering/tests/test_engineering.py",
+    ".github/workflows/security.yml",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "docs/plans/engineering-applied-learning.md",
+    "docs/specs/engineering-applied-learning-design.md",
+    "docs/specs/engineering-capability-assurance-design.md",
+    "release/public-export.json",
+    "tests/__init__.py",
+    "tests/test_repository.py",
+    "tools/check_sensitive.py",
+    "tools/export_public.py"
+  ]
+}

@@ -105,10 +105,11 @@ an unpinned branch, different source, different interpreter, or project-local
 installation target.
 
 `engineering setup <root>` returns `engineering.setup.v1` and does not mutate
-the project. Its `project_plan_digest` binds the exact v2/adopted controls,
-managed `AGENTS.md` and `CLAUDE.md` blocks, `/graphify-out/` ignore addition,
-and preservation-aware hook installation, including exact destinations, prior
-bytes, expected bytes, digests, and modes. Approval is a separate `engineering
+the project. Its displayed preview is compact: relative paths, digests,
+existence, and hook scope only. Its `project_plan_digest` internally binds the
+exact v2/adopted controls, managed `AGENTS.md` and `CLAUDE.md` blocks,
+`/graphify-out/` ignore addition, preservation-aware hook installation, prior
+bytes, expected bytes, modes, and selected interpreter identity. Approval is a separate `engineering
 approve-setup` operation with explicit scopes, not values accepted by `setup`.
 It creates a one-use HMAC attestation bound to immutable Git root lineage, the
 complete current plan, exact interpreter identity, and pinned argv. When
@@ -357,7 +358,7 @@ it does not invoke `graphify query`, an LLM, or a provider backend. It returns
 `success`, `empty`, `unavailable`, or `invalid`. Unknown IDs and malformed data
 are invalid; a missing or unreadable checkpoint is unavailable. Invalid or
 unavailable context blocks as `missing_required_source` unless an exact
-`engineering.task-authority.v1` independently validates the unchanged safe
+controller-signed `engineering.task-authority.v2` independently validates the unchanged safe
 local task. The legacy `deterministic_only_approved` input remains parseable
 for compatibility but grants no waiver. This exception never replaces
 sufficient exact context or impact. Successful empty output is distinct from
@@ -382,7 +383,9 @@ conditions are `remote_freshness_unknown`,
 Dirty paths outside the authorization envelope are conflicting authority;
 dirty paths already inside the envelope do not independently block. An affected
 public contract, including a directly selected contract origin, remains blocked
-until `contract_change_approved` is explicitly true for the task.
+until an approved stable decision ID is recorded in the authoritative project
+ledger and supplied as `contract_approval_id`. A caller boolean, including the
+legacy `contract_change_approved`, never clears this gate.
 
 Preparation writes one atomic `preparation.json` below
 `<git-common-dir>/engineering-graphs/runs/<run-id>/`. Linked worktrees reuse this
@@ -430,7 +433,7 @@ an enforced-isolation claim.
 ## Routine local-check authority
 
 `approve-checks` remains the compatibility and higher-risk path. An explicitly
-authorized engineering task may instead supply `engineering.task-authority.v1`
+authorized host may issue a controller-signed `engineering.task-authority.v2`
 with one task identity, the exact discovered command digest, and a complete
 false classification for network, connector, publication, deployment,
 live-environment, and destructive effects. The controller independently
@@ -439,7 +442,28 @@ and no shell execution. It revalidates the same authority and argv digest at
 completion. Missing or malformed authority, any changed command, unknown or
 positive effect, inline code, shell, or credential data fails closed. The
 preparation record retains only the bounded authority and command identities;
-ordinary user prose is never an approval substitute.
+ordinary user prose is never an approval substitute. Version 1 unsigned
+envelopes are rejected rather than silently upgraded.
+
+The signed envelope is short-lived bearer evidence for one repository commit;
+the host must keep it within the authorized task. Cross-session identity and
+role verification remain an external host/identity-service responsibility, not
+an authority claim made by Engineering.
+
+## Read-only retrospective
+
+`engineering retrospect <root>` first returns a digest-bound preview naming the
+finite sources, semantic-matrix axes and scope, deterministic work, permissions,
+outputs, and optional bounded host-LLM cost. Repeating it with
+`--preview-digest <digest>` inventories only the project evidence declared by
+the manifest, authoritative ledger, overlay nodes, and optional semantic
+matrices. It reports current, missing, stale, contradictory, orphaned, deferred,
+excluded, and Unknown evidence with a remediation proposal. It makes no graph
+build, controller write, LLM/provider call, or project change. An
+optional `--llm-reconcile` result is only a bounded source-list packet for the
+host; any host inference remains advisory until the project owner records it.
+Undocumented intent remains Unknown, and only declared required cells in the
+requested scope can block a later impacted change.
 
 ## Completion contract
 
