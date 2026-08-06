@@ -1,9 +1,10 @@
 # Engineering Capability Assurance Design
 
-**Status:** Approved direction; independent written-spec review passed;
-implementation plan pending.
+**Status:** Engineering 2.2.1 implemented and verified; approved 2.2.2
+retrospective and operability follow-up implemented locally, subject to exact
+review; delivery remains separately authorized.
 
-**Version target:** Engineering 2.2 after the verified 2.1 baseline.
+**Version target:** Engineering 2.2.2 after the verified 2.2.1 baseline.
 
 ## Outcome
 
@@ -347,9 +348,22 @@ Implementation requires failing tests first for at least:
 
 ## Implementation boundary
 
-This document authorizes no implementation, installation, connector, scheduler,
-feedback request, deployment, or live-project change. After written-spec review,
-the next governed step is a separate implementation plan based on the verified
-Engineering 2.1 default branch. That plan must define and version the bounded
-cross-project summary schema before either the Skill exporter or a surrounding
-harness consumes it.
+Engineering 2.2.2 adds a digest-bound preview-first, read-only retrospective
+over a declared finite evidence universe. It deterministically inventories
+declared requirements, decisions, contracts, routes, schemas, code, tests,
+verification evidence, and semantic matrices as current, missing, stale,
+contradictory, orphaned, deferred, excluded, or Unknown; bounded host-LLM
+reconciliation remains advisory. Scoped
+audits cannot report unrelated requirement or decision findings. Contract
+approval binds only to the selected authoritative ledger entry, and task-check
+authority remains controller-signed.
+
+The paired personal distribution retains the complete generic runtime,
+launchers, Graphify contract, tests, documentation, exporter, atomic install
+payload, and portable hosted CI as byte-identical allowlisted source. Only
+source-specific identity or policy coupling, credentials/configuration, migration
+receipts, and private evidence are excluded.
+
+This local candidate does not authorize publication, installation, project
+adoption, remediation writes, connectors, scheduling, deployment, or populated
+evidence changes. Those remain separate governed actions.

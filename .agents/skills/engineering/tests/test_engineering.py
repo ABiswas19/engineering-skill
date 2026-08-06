@@ -79,6 +79,15 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
 
         self.assertEqual(str(Path(sys.executable).resolve()), identity["path"])
 
+    @unittest.skipUnless(os.name == "nt", "Windows ACL transport only")
+    def test_windows_owner_private_directory_is_idempotent_for_task_approval(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = Path(temporary) / "controller"
+            controller.mkdir()
+            engineering._windows_owner_private(controller, enforce=True)
+            engineering._windows_owner_private(controller, enforce=True)
+            engineering._verify_owner_private(controller, directory=True)
+
 
 class SkillShapeTests(unittest.TestCase):
     def test_skill_is_engineering_and_human_readable(self):
@@ -553,20 +562,13 @@ class Task2ContractTests(unittest.TestCase):
         fake = self.write_fake_graphify()
         with patch.dict(os.environ, {"PYTHONPATH": str(fake)}, clear=False):
             module.rebuild(root, commit, sys.executable)
-        claims = module._check_capability_claims(root, checks)
-        authority = {
-            "schema": "engineering.task-authority.v1",
-            "task_id": "task-authorized-check",
-            "commands_digest": claims["commands_digest"],
-            "effects": {
-                "network": False,
-                "connector": False,
-                "publication": False,
-                "deployment": False,
-                "live_environment": False,
-                "destructive": False,
-            },
-        }
+        controller = module._project_controller_dir(root)
+        controller.mkdir(parents=True)
+        key = controller / "attestation.key"
+        key.write_text("1" * 64 + "\n", encoding="ascii")
+        module._enforce_owner_private(controller)
+        module._enforce_owner_private(key)
+        authority = module.issue_task_check_authority(root, "task-authorized-check")
         prepared = module.prepare(
             root,
             "change REQ-1",
@@ -1594,20 +1596,13 @@ class Task2ContractTests(unittest.TestCase):
         module = self.module()
         root, _ = self.prepared_repo("prepare-deterministic-only")
         unavailable = {"status": "unavailable", "context": [], "reason": "query_timeout"}
-        claims = module._check_capability_claims(root, module.discover_checks(root))
-        authority = {
-            "schema": "engineering.task-authority.v1",
-            "task_id": "deterministic-context-recovery",
-            "commands_digest": claims["commands_digest"],
-            "effects": {
-                "network": False,
-                "connector": False,
-                "publication": False,
-                "deployment": False,
-                "live_environment": False,
-                "destructive": False,
-            },
-        }
+        controller = module._project_controller_dir(root)
+        controller.mkdir(parents=True)
+        key = controller / "attestation.key"
+        key.write_text("1" * 64 + "\n", encoding="ascii")
+        module._enforce_owner_private(controller)
+        module._enforce_owner_private(key)
+        authority = module.issue_task_check_authority(root, "deterministic-context-recovery")
 
         with patch.object(module, "_graphify_query_context", return_value=unavailable):
             blocked = module.prepare(
@@ -1689,7 +1684,7 @@ class Task2ContractTests(unittest.TestCase):
                 module.prepare(root, "change contract", {**base_scope, **alias}, None)
                 for alias in aliases
             ]
-            approved = module.prepare(
+            forged = module.prepare(
                 root,
                 "change contract",
                 {**base_scope, "contract_change_approved": True},
@@ -1698,8 +1693,8 @@ class Task2ContractTests(unittest.TestCase):
 
         for result in blocked:
             self.assertIn("public contract change lacks explicit approval", result["blockers"])
-        self.assertNotIn("public contract change lacks explicit approval", approved["blockers"])
-        self.assertTrue(any(item["id"] == "design.md" for item in approved["impact"]))
+        self.assertIn("public contract change lacks explicit approval", forged["blockers"])
+        self.assertTrue(any(item["id"] == "design.md" for item in forged["impact"]))
 
     def test_upstream_contract_in_exact_context_requires_approval(self):
         module = self.module()
@@ -1723,7 +1718,7 @@ class Task2ContractTests(unittest.TestCase):
             module, "_graphify_query_context", return_value=empty
         ):
             blocked = module.prepare(root, "change CODE-1", base_scope, None)
-            approved = module.prepare(
+            forged = module.prepare(
                 root,
                 "change CODE-1",
                 {**base_scope, "contract_change_approved": True},
@@ -1735,10 +1730,120 @@ class Task2ContractTests(unittest.TestCase):
             {"id": "CONTRACT-1", "provenance": "derived"}, blocked["context"]
         )
         self.assertIn(contract_blocker, blocked["blockers"])
-        self.assertEqual(
-            [item for item in blocked["blockers"] if item != contract_blocker],
-            approved["blockers"],
+        self.assertIn(contract_blocker, forged["blockers"])
+
+    def test_contract_approval_requires_an_approved_ledger_entry_not_a_boolean(self):
+        module = self.module()
+        root, _ = self.prepared_repo("ledger-contract-approval")
+        manifest = module.load_project_config(root)
+        with patch.object(module, "_ledger_decisions", return_value={"PROJECT-DEC-1": 1}), patch.object(
+            module,
+            "_text_at",
+            return_value=(
+                "## PROJECT-DEC-1 - Contract\n\n"
+                "Status: Approved\n\n"
+                "## PROJECT-DEC-2 - Other\nStatus: Not approved\n"
+            ),
+        ):
+            self.assertTrue(
+                module._contract_change_approved(
+                    root, module.git(root, "rev-parse", "HEAD"), manifest,
+                    {"contract_approval_id": "PROJECT-DEC-1"},
+                )
+            )
+        self.assertFalse(
+            module._contract_change_approved(
+                root, module.git(root, "rev-parse", "HEAD"), manifest,
+                {"contract_change_approved": True},
+            )
         )
+        with patch.object(module, "_ledger_decisions", return_value={"PROJECT-DEC-1": 1}), patch.object(
+            module,
+            "_text_at",
+            return_value="## PROJECT-DEC-1 - Contract\nStatus: Not approved\n",
+        ):
+            self.assertFalse(
+                module._contract_change_approved(
+                    root, module.git(root, "rev-parse", "HEAD"), manifest,
+                    {"contract_approval_id": "PROJECT-DEC-1"},
+                )
+            )
+        relationship_text = (
+            "## PROJECT-DEC-1 - First\nStatus: Approved\n"
+            "Supersedes: PROJECT-DEC-2\n\n"
+            "## PROJECT-DEC-2 - Second\nStatus: Not approved\n"
+        )
+        with patch.object(module, "_text_at", return_value=relationship_text):
+            decisions = module._ledger_decisions(root, "WORKTREE", manifest)
+            self.assertEqual({"PROJECT-DEC-1": 1, "PROJECT-DEC-2": 5}, decisions)
+            self.assertFalse(
+                module._contract_change_approved(
+                    root, "WORKTREE", manifest,
+                    {"contract_approval_id": "PROJECT-DEC-2"},
+                )
+            )
+        table_text = (
+            "| ID | Date | Status | Decision |\n"
+            "|---|---|---|---|\n"
+            "| PROJECT-DEC-3 | 2026-08-04 | approved | Third |\n"
+        )
+        with patch.object(module, "_text_at", return_value=table_text):
+            self.assertTrue(
+                module._contract_change_approved(
+                    root, "WORKTREE", manifest,
+                    {"contract_approval_id": "PROJECT-DEC-3"},
+                )
+            )
+        misleading_table = (
+            "| ID | Status | Approved by |\n"
+            "|---|---|---|\n"
+            "| PROJECT-DEC-4 | Not approved | Approved |\n"
+        )
+        with patch.object(module, "_text_at", return_value=misleading_table):
+            self.assertFalse(
+                module._contract_change_approved(
+                    root, "WORKTREE", manifest,
+                    {"contract_approval_id": "PROJECT-DEC-4"},
+                )
+            )
+        deceptive_table = (
+            "| ID | Status | Note |\n"
+            "|---|---|---|\n"
+            "| PROJECT-DEC-0 | Approved | status |\n"
+            "| PROJECT-DEC-4 | Not approved | Approved |\n"
+        )
+        with patch.object(module, "_text_at", return_value=deceptive_table):
+            self.assertFalse(
+                module._contract_change_approved(
+                    root, "WORKTREE", manifest,
+                    {"contract_approval_id": "PROJECT-DEC-4"},
+                )
+            )
+        conflicting_heading = (
+            "## PROJECT-DEC-4 - Conflicting status\n"
+            "Status: Not approved\n"
+            "Status: Approved\n"
+        )
+        with patch.object(module, "_text_at", return_value=conflicting_heading):
+            self.assertFalse(
+                module._contract_change_approved(
+                    root, "WORKTREE", manifest,
+                    {"contract_approval_id": "PROJECT-DEC-4"},
+                )
+            )
+        conflicting_duplicate = (
+            "| ID | Status |\n"
+            "|---|---|\n"
+            "| PROJECT-DEC-5 | Not approved |\n\n"
+            "## PROJECT-DEC-5 - Conflicting duplicate\n"
+            "Status: Approved\n"
+        )
+        with patch.object(module, "_text_at", return_value=conflicting_duplicate):
+            with self.assertRaisesRegex(module.EngineeringError, "reuses a stable ID"):
+                module._contract_change_approved(
+                    root, "WORKTREE", manifest,
+                    {"contract_approval_id": "PROJECT-DEC-5"},
+                )
 
     def test_impact_provenance_tracks_each_path_and_keeps_strongest(self):
         module = self.module()
@@ -4370,6 +4475,12 @@ class Task3AmendedContractTests(unittest.TestCase):
         before = self.git(root, "worktree", "list", "--porcelain")
         def remove_fixture(_root, worktree, _deadline):
             shutil.rmtree(worktree)
+            self.git(_root, "worktree", "prune")
+            return True, "clean", None
+
+        def remove_staging_fixture(paths, _deadline):
+            for path in paths:
+                shutil.rmtree(path)
             return True, "clean", None
 
         with (
@@ -4389,6 +4500,11 @@ class Task3AmendedContractTests(unittest.TestCase):
                 "_bounded_worktree_remove",
                 side_effect=remove_fixture,
             ),
+            patch.object(
+                module,
+                "_bounded_rmtree_many",
+                side_effect=remove_staging_fixture,
+            ),
             patch.object(module.os, "killpg", return_value=None, create=True),
         ):
             result = module.dispatch_hook(
@@ -4397,6 +4513,7 @@ class Task3AmendedContractTests(unittest.TestCase):
                 graphify_python=sys.executable,
                 hook_budget_seconds=10,
                 cleanup_timeout_seconds=5,
+                identity_clock=lambda: 0.0,
             )
         self.assertEqual("hook_budget_exceeded", result["reason"])
         self.assertTrue(result["worker_process_tree_terminated"])
@@ -4463,6 +4580,7 @@ class Task3AmendedContractTests(unittest.TestCase):
 
         def remove_fixture(_root, worktree, _deadline):
             shutil.rmtree(worktree)
+            self.git(_root, "worktree", "prune")
             return True, "clean", None
 
         with (
@@ -4488,6 +4606,7 @@ class Task3AmendedContractTests(unittest.TestCase):
                 graphify_python=sys.executable,
                 hook_budget_seconds=10,
                 cleanup_timeout_seconds=5,
+                identity_clock=lambda: 0.0,
             )
 
         self.assertFalse(result["worker_process_tree_terminated"])
@@ -6206,7 +6325,12 @@ class Task6ContractTests(unittest.TestCase):
         self.commit_file(root, "docs/design.md", "# Changed meaning\n")
 
         with patch.dict(os.environ, environment, clear=False):
-            hook = module.dispatch_hook(root, "post-commit", graphify_python=sys.executable)
+            hook = module.dispatch_hook(
+                root,
+                "post-commit",
+                graphify_python=sys.executable,
+                cleanup_timeout_seconds=30,
+            )
 
         legacy = root / "graphify-out"
         legacy.mkdir()
@@ -7339,12 +7463,8 @@ class Task7ContractTests(unittest.TestCase):
             ["graphify_install", "project_controls"],
             result["approvals_required"],
         )
-        self.assertEqual(
-            module._governed_graphify_install_argv(
-                result["graphify"]["interpreter"]
-            ),
-            result["graphify"]["install_argv"],
-        )
+        self.assertEqual("<selected-python>", result["graphify"]["install_command"][0])
+        self.assertTrue(result["graphify"]["interpreter_sha256"].startswith("sha256:"))
         self.assertIn("missing", result["graphify"]["reason"].lower())
         self.assertIn(
             "hook installation as one bundle",
@@ -7353,6 +7473,20 @@ class Task7ContractTests(unittest.TestCase):
         self.assertFalse(result["writes_applied"])
         self.assertEqual(before, module._working_state_identity(root))
         self.assertFalse((root / "engineering.json").exists())
+
+    def test_setup_preview_is_compact_but_its_digest_still_binds_the_full_plan(self):
+        module = self.module()
+        root = self.init_repo("compact-setup-preview")
+        with patch.object(module, "verify_graphify", side_effect=module.EngineeringError("missing")):
+            result, claims = module._setup_preview(root, sys.executable)
+        rendered = json.dumps(result)
+        self.assertNotIn("bytes_hex", rendered)
+        self.assertNotIn('"content"', rendered)
+        self.assertNotIn(str(root), rendered)
+        self.assertNotIn(sys.executable, rendered)
+        self.assertIn("documents", result["project_plan"])
+        self.assertTrue(result["project_plan_digest"].startswith("sha256:"))
+        self.assertEqual(result["project_plan_digest"], claims["project_plan_digest"])
 
     def test_setup_requires_all_current_approvals_before_any_write(self):
         module = self.module()
@@ -7418,6 +7552,7 @@ class Task7ContractTests(unittest.TestCase):
             patch.object(module, "_run_governed_graphify_install", side_effect=install) as runner,
         ):
             preview = module.setup(root, sys.executable)
+            internal, _ = module._setup_preview(root, sys.executable)
             module.approve_setup(
                 root,
                 sys.executable,
@@ -7430,8 +7565,8 @@ class Task7ContractTests(unittest.TestCase):
         self.assertEqual("controls_written_pending_commit", result["readiness"])
         self.assertTrue(result["writes_applied"])
         runner.assert_called_once_with(
-            preview["graphify"]["install_argv"],
-            preview["graphify"]["interpreter"],
+            internal["graphify"]["install_argv"],
+            internal["graphify"]["interpreter"],
         )
         self.assertTrue((root / "engineering.json").is_file())
         self.assertIn("engineering-managed-start", (root / "AGENTS.md").read_text())
@@ -8340,7 +8475,8 @@ class Task7ContractTests(unittest.TestCase):
         missing = module.EngineeringError("Graphify is missing")
         with patch.object(module, "verify_graphify", side_effect=missing):
             preview = module.setup(root, sys.executable)
-        interpreter = preview["graphify"]["interpreter"]
+            internal, _ = module._setup_preview(root, sys.executable)
+        interpreter = internal["graphify"]["interpreter"]
         self.assertEqual(str(Path(sys.executable).resolve()), interpreter["path"])
         self.assertRegex(interpreter["sha256"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(
@@ -8352,8 +8488,10 @@ class Task7ContractTests(unittest.TestCase):
                 "git+https://github.com/safishamsi/graphify.git"
                 "@d89ec68af95e0cad801b56d88df383991e659823",
             ],
-            preview["graphify"]["install_argv"],
+            internal["graphify"]["install_argv"],
         )
+        self.assertNotIn("interpreter", preview["graphify"])
+        self.assertEqual(interpreter["sha256"], preview["graphify"]["interpreter_sha256"])
 
     def test_legacy_mutation_commands_are_read_only_setup_forwarders(self):
         module = self.module()
@@ -8749,6 +8887,183 @@ class Task7ContractTests(unittest.TestCase):
         self.assertNotIn("command", proposal)
 
 
+    def test_retrospective_is_read_only_and_returns_declared_evidence_findings(self):
+        module = self.module()
+        root, _ = self.prepared_repo("retrospective")
+        before = module._working_state_identity(root)
+        preview = module.retrospective_preview(root)
+        self.assertTrue(preview["finite_universe"])
+        self.assertEqual(0, preview["llm"]["controller_calls"])
+        self.assertFalse(preview["permissions"]["project_writes"])
+        with self.assertRaisesRegex(module.EngineeringError, "preview"):
+            module.retrospective(root)
+        result = module.retrospective(root, preview_digest=preview["preview_digest"])
+        self.assertEqual("engineering.retrospective.v1", result["schema"])
+        self.assertTrue(result["read_only"])
+        self.assertTrue(result["finite_universe"])
+        for remediation in result["remediation"]:
+            self.assertIn("finding_id", remediation)
+            self.assertIn("classification", remediation)
+            self.assertIsInstance(remediation["evidence_refs"], list)
+        self.assertEqual(before, module._working_state_identity(root))
+
+    def test_retrospective_scope_excludes_unrelated_requirement_findings(self):
+        module = self.module()
+        root, _ = self.prepared_repo("retrospective-scope")
+        checkpoint = module._load_checkpoint(root, module.git(root, "rev-parse", "HEAD"))
+        requirements = [node for node in checkpoint["nodes"] if node["type"] == "requirement"]
+        self.assertTrue(requirements)
+        selected = requirements[0]["source"]["path"]
+        unrelated = {
+            item["requirement"]
+            for item in module.coverage(checkpoint)
+            if item["requirement"] != requirements[0]["id"]
+        }
+        preview = module.retrospective_preview(root, scope=[selected])
+        result = module.retrospective(
+            root, scope=[selected], preview_digest=preview["preview_digest"]
+        )
+        reported = {
+            item.get("requirement")
+            for item in result["findings"]
+            if item.get("requirement")
+        }
+        self.assertTrue(reported.isdisjoint(unrelated))
+
+    def test_retrospective_scope_excludes_unrelated_decision_drift(self):
+        module = self.module()
+        root, _ = self.prepared_repo("retrospective-decision-scope")
+        config = module.load_project_config(root)
+        links_path = root / module._project_paths(root)[1]
+        scope = [config["inputs"][0]]
+        with patch.object(module, "_ledger_decisions", return_value={"OTHER-DEC-1": 1}):
+            preview = module.retrospective_preview(root, scope=scope)
+            result = module.retrospective(
+                root, scope=scope, preview_digest=preview["preview_digest"]
+            )
+        self.assertFalse(
+            any("decision" in item for item in result["findings"]),
+            (links_path, result),
+        )
+
+    def test_retrospective_scope_includes_declared_node_source(self):
+        module = self.module()
+        root, _ = self.prepared_repo("retrospective-declared-source")
+        checkpoint = module._load_checkpoint(root, module.git(root, "rev-parse", "HEAD"))
+        selected = next(
+            node["source"]["path"]
+            for node in checkpoint["nodes"]
+            if node["type"] == "requirement"
+        )
+        preview = module.retrospective_preview(root, scope=[selected])
+        result = module.retrospective(
+            root, scope=[selected], preview_digest=preview["preview_digest"]
+        )
+        self.assertEqual([selected], result["finite_universe"])
+        self.assertTrue(any(item["type"] == "requirement" for item in result["inventory"]))
+
+    def test_retrospective_preview_includes_matrix_impacted_through_node_source(self):
+        module = self.module()
+        root, _ = self.prepared_repo("retrospective-matrix-preview")
+        manifest = module.load_project_config(root)
+        checkpoint = module._load_checkpoint(root, module.git(root, "rev-parse", "HEAD"))
+        referenced = next(
+            node for node in checkpoint["nodes"] if node["type"] == "code_symbol"
+        )
+        test_id = next(node["id"] for node in checkpoint["nodes"] if node["type"] == "test")
+        matrix = {
+            "source": manifest["inputs"][0],
+            "items": [{
+                "id": "matrix-item",
+                "owner": "owner",
+                "implementation": referenced["id"],
+                "positive": test_id,
+                "negative": test_id,
+            }],
+        }
+        manifest["semantic_matrices"] = [matrix]
+        with patch.object(
+            module, "_json_at", side_effect=[manifest, {"nodes": checkpoint["nodes"]}]
+        ):
+            preview = module.retrospective_preview(
+                root, scope=[referenced["source"]["path"]]
+            )
+        self.assertEqual(matrix["source"], preview["semantic_matrices"][0]["source"])
+
+    def test_retrospective_inventory_classifies_only_declared_evidence(self):
+        module = self.module()
+        nodes = [
+            {
+                "id": "CONTRACT-1",
+                "type": "contract",
+                "source": {"path": "design.md", "line": 1},
+                "retrospective_state": "contradictory",
+            },
+            {
+                "id": "REQ-1",
+                "type": "requirement",
+                "source": {"path": "design.md", "line": 2},
+            },
+            {
+                "id": "CODE-1",
+                "type": "code_symbol",
+                "source": {"path": "src/app.py", "line": 1},
+            },
+            {
+                "id": "OUTSIDE",
+                "type": "contract",
+                "source": {"path": "other.md", "line": 1},
+            },
+            {
+                "id": "ROUTE-1",
+                "type": "route",
+                "source": {"path": "routes.md", "line": 1},
+                "retrospective_state": "stale",
+            },
+            {
+                "id": "SCHEMA-1",
+                "type": "schema",
+                "source": {"path": "schemas.md", "line": 1},
+            },
+        ]
+        checkpoint = {
+            "nodes": nodes,
+            "edges": [
+                {
+                    "id": "EDGE-1",
+                    "from": "REQ-1",
+                    "to": "CODE-1",
+                    "provenance": "missing",
+                }
+            ],
+        }
+        inventory = module._retrospective_inventory(
+            {"baseline": {"accepted": True}},
+            checkpoint,
+            {"design.md", "src/app.py", "routes.md", "schemas.md"},
+        )
+        self.assertEqual(
+            {
+                "CONTRACT-1": "contradictory",
+                "REQ-1": "missing",
+                "CODE-1": "missing",
+                "ROUTE-1": "stale",
+                "SCHEMA-1": "orphaned",
+            },
+            {item["id"]: item["classification"] for item in inventory},
+        )
+
+    def test_retrospective_unmanaged_project_is_advisory_without_writes(self):
+        module = self.module()
+        root = self.init_repo("retrospective-unmanaged")
+        before = module._working_state_identity(root)
+        preview = module.retrospective_preview(root)
+        result = module.retrospective(root, preview_digest=preview.get("preview_digest"))
+        self.assertEqual("advisory", result["state"])
+        self.assertEqual("manifest_not_tracked", result["findings"][0]["reason"])
+        self.assertEqual(before, module._working_state_identity(root))
+
+
 class CapabilityAssuranceContractTests(unittest.TestCase):
     def module(self):
         if engineering is None:
@@ -8992,8 +9307,10 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
         checks = [[sys.executable, "-m", "unittest", "--help"]]
         claims = claims_for(checks)
         authority = {
-            "schema": "engineering.task-authority.v1",
+            "schema": "engineering.task-authority.v2",
             "task_id": "task-local-checks",
+            "repository_id": claims["repository_id"],
+            "commit": "a" * 40,
             "commands_digest": claims["commands_digest"],
             "effects": {
                 "network": False,
@@ -9003,28 +9320,56 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
                 "live_environment": False,
                 "destructive": False,
             },
+            "issued_at": "2026-08-04T10:00:00+00:00",
+            "valid_until": "2026-08-04T11:00:00+00:00",
         }
-        accepted = module.validate_task_check_authority(authority, claims)
+        key = b"1" * 32
+        authority["signature"] = module._task_authority_signature(key, authority)
+        project = Mock(root=Path("."), commit="a" * 40)
+        clock = Mock(wraps=module.datetime)
+        clock.now.return_value = module.datetime.fromisoformat("2026-08-04T10:30:00+00:00")
+        with patch.object(module, "_controller_key", return_value=key), patch.object(
+            module, "resolve_project", return_value=project
+        ), patch.object(module, "datetime", clock):
+            accepted = module.validate_task_check_authority(Path("."), authority, claims)
         self.assertEqual("task-local-checks", accepted["task_id"])
         self.assertEqual(claims["commands_digest"], accepted["commands_digest"])
         for changed in (
             {**authority, "commands_digest": "sha256:" + "2" * 64},
             {**authority, "effects": {**authority["effects"], "network": True}},
         ):
-            with self.subTest(changed=changed), self.assertRaisesRegex(
+            with self.subTest(changed=changed), patch.object(module, "_controller_key", return_value=key), patch.object(
+                module, "resolve_project", return_value=project
+            ), patch.object(module, "datetime", clock), self.assertRaisesRegex(
                 module.EngineeringError, "authority"
             ):
-                module.validate_task_check_authority(changed, claims)
+                module.validate_task_check_authority(Path("."), changed, claims)
         inline = claims_for([[sys.executable, "-c", "print(1)"]])
-        with self.assertRaisesRegex(module.EngineeringError, "authority"):
+        with patch.object(module, "resolve_project", return_value=project), patch.object(
+            module, "datetime", clock
+        ), self.assertRaisesRegex(module.EngineeringError, "authority"):
             module.validate_task_check_authority(
-                {**authority, "commands_digest": inline["commands_digest"]}, inline
+                Path("."), {**authority, "commands_digest": inline["commands_digest"]}, inline
             )
         shell = claims_for([["bash", "check.sh"]])
-        with self.assertRaisesRegex(module.EngineeringError, "authority"):
+        with patch.object(module, "resolve_project", return_value=project), patch.object(
+            module, "datetime", clock
+        ), self.assertRaisesRegex(module.EngineeringError, "authority"):
             module.validate_task_check_authority(
-                {**authority, "commands_digest": shell["commands_digest"]}, shell
+                Path("."), {**authority, "commands_digest": shell["commands_digest"]}, shell
             )
+        expired = {**authority, "valid_until": "2026-08-04T10:20:00+00:00"}
+        expired["signature"] = module._task_authority_signature(key, expired)
+        with patch.object(module, "resolve_project", return_value=project), patch.object(
+            module, "datetime", clock
+        ), self.assertRaisesRegex(module.EngineeringError, "authority"):
+            module.validate_task_check_authority(Path("."), expired, claims)
+        with patch.object(
+            module, "resolve_project", return_value=Mock(root=Path("."), commit="b" * 40)
+        ), patch.object(module, "datetime", clock), self.assertRaisesRegex(
+            module.EngineeringError, "authority"
+        ):
+            module.validate_task_check_authority(Path("."), authority, claims)
 
     def test_prepare_cli_accepts_scope_file_and_stdin_without_shell_quoting(self):
         module = self.module()
@@ -9059,6 +9404,26 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
         self.assertEqual(
             {"schema": "engineering.error.v1", "status": "blocked", "reason": "manifest_not_tracked", "remediation": "authorize_engineering_setup"},
             json.loads(output.getvalue()),
+        )
+
+    def test_checkpoint_unavailable_cli_is_structured_not_a_raw_error(self):
+        module = self.module()
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            patch.object(sys, "argv", ["engineering", "map", ".", "--no-open"]),
+            patch.object(module, "resolve_project_root", return_value=Path(".")),
+            patch.object(
+                module,
+                "render_map",
+                side_effect=module.EngineeringError("Expected one commit-bound checkpoint for abc."),
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(2, module.main())
+        self.assertEqual("", errors.getvalue())
+        self.assertEqual(
+            "canonical_checkpoint_unavailable", json.loads(output.getvalue())["reason"]
         )
 
     def test_default_branch_uses_local_remote_metadata_after_direct_head(self):
