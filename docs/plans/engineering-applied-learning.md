@@ -4,7 +4,7 @@
 
 **Goal:** Establish the reviewed Engineering v2 baseline in its standalone repository, then add a safe Promote-and-apply learning loop and a working sanitized public export.
 
-**Architecture:** Preserve the existing single-file controller and contribution lifecycle. Add a bounded declarative practice payload, one transactional applied-practice ledger under the existing Engineering home, and thin CLI/skill projections. Keep source improvement proposal-only and produce the public mirror from a corporate-only allowlist into an independent repository history.
+**Architecture:** Preserve the existing single-file controller and contribution lifecycle. Add a bounded declarative practice payload, one transactional applied-practice ledger under the existing Engineering home, and thin CLI/skill projections. Keep source improvement proposal-only and produce the sanitized distribution from a canonical allowlist into an independent repository history.
 
 **Tech Stack:** Python 3.12 standard library, `unittest`, Git, Graphify 0.9.5 at `d89ec68af95e0cad801b56d88df383991e659823`, Markdown, JSON, GitHub Actions.
 
@@ -38,7 +38,7 @@
 .github/workflows/security.yml     Generic cross-platform checks
 docs/specs/engineering-applied-learning-design.md
 docs/plans/engineering-applied-learning.md
-release/public-export.json         Corporate-only export allowlist
+release/public-export.json         Canonical public export allowlist
 tests/test_repository.py           Standalone/public-tree contracts
 tools/check_sensitive.py           Generic full-tree scanner
 tools/export_public.py             Allowlisted independent-tree exporter
@@ -51,7 +51,7 @@ SECURITY.md
 
 ### Task 1: Establish the standalone reviewed v2 baseline
 
-**Dependency:** Exact reviewed Engineering source checkpoint `c48e86084e873f97160be3492d205696b3860529` is available read-only.
+**Dependency:** The reviewed Engineering source baseline is available read-only.
 
 **Completion signal:** The standalone source contains only the seven intended skill files, generic repository controls, no forbidden names or generated state, and the existing v2 test suite passes unchanged.
 
@@ -105,7 +105,7 @@ receipt containing the source commit and SHA-256 for each imported file.
 Create minimal human-readable instructions and ignore rules for Python caches,
 local test state, generated graph checkpoints, controller state, and export
 staging. The sensitive-data scanner must inspect every tracked file and reject
-personal paths, emails, private IDs, secret-shaped values, and forbidden names.
+user-specific paths, emails, private IDs, secret-shaped values, and forbidden names.
 
 - [ ] **Step 5: Run the standalone and inherited v2 gates**
 
@@ -335,7 +335,7 @@ Construct deliberately secret-shaped test inputs from harmless fragments at
 runtime so GitHub secret scanning sees no credential-shaped tracked literal
 while the controller tests still exercise rejection.
 
-- [ ] **Step 3: Implement the corporate-only exporter**
+- [ ] **Step 3: Implement the canonical-source exporter**
 
 The exporter validates source/destination boundaries, rejects reparse links and
 unlisted files, preserves destination Git metadata, removes stale previously
@@ -363,7 +363,7 @@ feat: add safe Engineering public distribution
 
 **Dependency:** Tasks 1–5 are clean and committed locally.
 
-**Completion signal:** Every design requirement maps to source and an exact passing test; the complete diff has an independent read-only Opus PASS; both destination trees are ready but no unapproved publication or installation occurs.
+**Completion signal:** Every design requirement maps to source and an exact passing test; the complete diff has an independent read-only exact-diff PASS; both destination trees are ready but no unapproved publication or installation occurs.
 
 **Files:**
 - Modify: `docs/plans/engineering-applied-learning.md` only for checked evidence
@@ -389,14 +389,14 @@ Run the same applicable gates in the generated public candidate tree.
 
 - [ ] **Step 3: Run independent exact-diff review**
 
-Use Opus as the read-only checker. Bind the review to the first standalone
+Use the repository's independent read-only checker. Bind the review to the first standalone
 baseline commit and include the complete implementation diff, approved design,
 plan, tests, security evidence, public-export evidence, and completion receipt.
 Address any material finding test-first and rerun affected/full gates.
 
 - [ ] **Step 4: Verify destination readiness**
 
-Confirm exact authenticated identities, internal/public visibility, empty or
+Confirm exact authenticated identities, destination visibility, empty or
 history-compatible destinations, approved licence, CI availability, and push
 rights. Fail closed on any mismatch.
 

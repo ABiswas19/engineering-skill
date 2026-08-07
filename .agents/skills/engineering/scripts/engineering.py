@@ -38,7 +38,7 @@ DEFAULT_CONTEXT_TOKEN_BUDGET = 1000
 DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS = 30.0
 ASSURANCE_SCHEMA = "engineering.capability-assurance.v1"
 EXECUTION_CONTEXT_SCHEMA = "engineering.execution-context.v1"
-TASK_AUTHORITY_SCHEMA = "engineering.task-authority.v1"
+TASK_AUTHORITY_SCHEMA = "engineering.task-authority.v2"
 ASSURANCE_EVIDENCE_KINDS = {
     "implementation",
     "deployment",
@@ -73,6 +73,8 @@ NODE_TYPES = {
     "requirement",
     "decision",
     "specification",
+    "route",
+    "schema",
     "plan_task",
     "contract",
     "code_symbol",
@@ -742,14 +744,28 @@ def _ledger_decisions(root: Path, commit: str, manifest: dict) -> dict[str, int]
     """Read stable IDs only; approval and implementation remain ledger-owned claims."""
     path = decision_ledger_path(root, manifest)
     text = _text_at(root, commit, path)
-    decisions: dict[str, int] = {}
+    headings: dict[str, int] = {}
+    table_rows: dict[str, int] = {}
     for line_number, line in enumerate(text.splitlines(), start=1):
-        found = re.findall(r"\b[A-Z][A-Z0-9_-]*-DEC-\d+\b", line)
-        for identifier in found:
-            if identifier in decisions:
+        heading = re.match(
+            r"^#{1,6}\s+([A-Z][A-Z0-9_-]*-DEC-\d+)\b", line
+        )
+        row = re.match(
+            r"^\s*\|\s*([A-Z][A-Z0-9_-]*-DEC-\d+)\s*\|", line
+        )
+        if heading:
+            identifier = heading.group(1)
+            if identifier in headings:
                 raise EngineeringError("Engineering decision ledger reuses a stable ID.")
-            decisions[identifier] = line_number
-    return decisions
+            headings[identifier] = line_number
+        elif row:
+            identifier = row.group(1)
+            if identifier in table_rows:
+                raise EngineeringError("Engineering decision ledger reuses a stable ID.")
+            table_rows[identifier] = line_number
+    if headings.keys() & table_rows.keys():
+        raise EngineeringError("Engineering decision ledger reuses a stable ID.")
+    return {**table_rows, **headings}
 
 
 def _scaffold_payload(root: Path, mode: str, graphify_version: str) -> dict[Path, str]:
@@ -1059,6 +1075,55 @@ def _setup_project_plan(
     return plan, documents
 
 
+def _setup_plan_summary(plan: dict) -> dict:
+    """Keep approval previews compact; the digest still binds the full plan."""
+    return {
+        "schema": plan["schema"],
+        "documents": [
+            {
+                "path": item["path"],
+                "sha256": item["sha256"],
+                "exists": item["expected_pre_state"]["exists"],
+            }
+            for item in plan["documents"]
+        ],
+        "hook_installation": {
+            key: plan["hook_installation"][key]
+            for key in ("required", "events", "preserves_existing", "existing")
+        },
+        "approval_scope": plan["approval_scope"],
+    }
+
+
+def _setup_public_projection(result: dict, claims: dict) -> dict:
+    graphify = result["graphify"]
+    return {
+        "schema": result["schema"],
+        "project": {"identity": claims["repository_id"]},
+        "readiness": result["readiness"],
+        "approvals_required": result["approvals_required"],
+        "project_plan": result["project_plan"],
+        "project_plan_digest": result["project_plan_digest"],
+        "graphify": {
+            "required": graphify["required"],
+            "reason": graphify["reason"],
+            "repository": graphify["repository"],
+            "commit": graphify["commit"],
+            "version": graphify["version"],
+            "shell": False,
+            "interpreter_sha256": graphify["interpreter"]["sha256"],
+            "install_command": (
+                ["<selected-python>", *graphify["install_argv"][1:]]
+                if graphify["required"]
+                else []
+            ),
+        },
+        "graphify_plan_digest": result["graphify_plan_digest"],
+        "writes_applied": result["writes_applied"],
+        "approval_operation": result["approval_operation"],
+    }
+
+
 def _transactional_project_documents(
     root: Path,
     documents: list[tuple[Path, bytes]],
@@ -1202,7 +1267,7 @@ def _setup_preview(root: Path, graphify_python: str) -> tuple[dict, dict]:
         "readiness": "ready" if not required else "proposal",
         "project_root": str(project_root),
         "approvals_required": required,
-        "project_plan": project_plan,
+        "project_plan": _setup_plan_summary(project_plan),
         "project_plan_digest": project_plan_digest,
         "graphify": graphify_plan,
         "graphify_plan_digest": graphify_plan_digest,
@@ -1321,9 +1386,9 @@ def setup(root: Path, graphify_python: str) -> dict:
     project_root = resolve_project_root(str(root))
     result, claims = _setup_preview(project_root, graphify_python)
     if not result["approvals_required"]:
-        return {**result, **_setup_readiness(project_root, graphify_python)}
+        return {**_setup_public_projection(result, claims), **_setup_readiness(project_root, graphify_python)}
     if _matching_setup_attestation(project_root, claims) is None:
-        return result
+        return _setup_public_projection(result, claims)
 
     operation = _begin_completion(
         project_root,
@@ -1405,7 +1470,7 @@ def setup(root: Path, graphify_python: str) -> dict:
         _end_completion(project_root, operation)
 
     return {
-        **result,
+        **_setup_public_projection(result, claims),
         "readiness": "controls_written_pending_commit",
         "writes_applied": True,
         "graphify_installed": graphify_installed,
@@ -1419,9 +1484,9 @@ def setup(root: Path, graphify_python: str) -> dict:
 def legacy_setup_forwarder(root: Path, graphify_python: str, command: str) -> dict:
     if command not in {"bootstrap", "reconstruct", "install-hooks"}:
         raise EngineeringError("Engineering legacy setup command is unsupported.")
-    preview, _ = _setup_preview(resolve_project_root(str(root)), graphify_python)
+    preview, claims = _setup_preview(resolve_project_root(str(root)), graphify_python)
     return {
-        **preview,
+        **_setup_public_projection(preview, claims),
         "readiness": "proposal" if preview["approvals_required"] else "ready",
         "compatibility_command": command,
         "forwarded_to": "setup",
@@ -1490,16 +1555,7 @@ def _semantic_matrix_issues(manifest: dict, nodes: list[dict], scope: set[str]) 
         items = matrix.get("items")
         if not isinstance(items, list) or not items:
             raise EngineeringError("Engineering semantic matrix items are invalid.")
-        references = [value for item in items if isinstance(item, dict) for value in (
-            item.get("implementation"), item.get("positive"), item.get("negative"))]
-        impacted = matrix["source"].replace("\\", "/") in scope or any(
-            isinstance(identifier, str)
-            and identifier in by_id
-            and isinstance(by_id[identifier].get("source"), dict)
-            and by_id[identifier]["source"].get("path", "").replace("\\", "/") in scope
-            for identifier in references
-        )
-        if not impacted:
+        if not _semantic_matrix_impacted(matrix, by_id, scope):
             continue
         for item in items:
             if not isinstance(item, dict) or not isinstance(item.get("id"), str):
@@ -1519,6 +1575,22 @@ def _semantic_matrix_issues(manifest: dict, nodes: list[dict], scope: set[str]) 
             ):
                 issues.append(item["id"])
     return sorted(set(issues))
+
+
+def _semantic_matrix_impacted(matrix: dict, by_id: dict[str, dict], scope: set[str]) -> bool:
+    references = [
+        value
+        for item in matrix.get("items", [])
+        if isinstance(item, dict)
+        for value in (item.get("implementation"), item.get("positive"), item.get("negative"))
+    ]
+    return matrix["source"].replace("\\", "/") in scope or any(
+        isinstance(identifier, str)
+        and identifier in by_id
+        and isinstance(by_id[identifier].get("source"), dict)
+        and by_id[identifier]["source"].get("path", "").replace("\\", "/") in scope
+        for identifier in references
+    )
 
 
 def _validate_overlay(
@@ -1563,6 +1635,15 @@ def _validate_overlay(
             raise TraceabilityError(f"Invalid or duplicate stable identifier: {identifier}")
         if node.get("type") not in NODE_TYPES or not isinstance(node.get("title"), str):
             raise TraceabilityError(f"Invalid node schema: {identifier}")
+        if node.get("retrospective_state") not in {
+            None,
+            "contradictory",
+            "deferred",
+            "excluded",
+            "stale",
+            "unknown",
+        }:
+            raise TraceabilityError(f"Invalid node retrospective state: {identifier}")
         path, line = _source(node, identifier)
         input_paths.add(path)
         sources.append((identifier, path, line))
@@ -4239,13 +4320,22 @@ def _reachable(checkpoint: dict, start: str, *, reverse: bool = False, exact: bo
     return result
 
 
-def coverage(checkpoint: dict) -> list[dict]:
+def coverage(checkpoint: dict, *, source_paths: set[str] | None = None) -> list[dict]:
     nodes = {node["id"]: node for node in checkpoint["nodes"]}
     design_types = {"decision", "specification", "plan_task", "contract"}
     verification_types = {"test", "evaluation", "verification_receipt"}
     result = []
     for requirement in sorted(
-        (node for node in checkpoint["nodes"] if node["type"] == "requirement"),
+        (
+            node
+            for node in checkpoint["nodes"]
+            if node["type"] == "requirement"
+            and (
+                source_paths is None
+                or node.get("source", {}).get("path", "").replace("\\", "/")
+                in source_paths
+            )
+        ),
         key=lambda node: node["id"],
     ):
         reachable = [nodes[item] for item in _engineering_path(checkpoint, requirement["id"])]
@@ -4260,6 +4350,275 @@ def coverage(checkpoint: dict) -> list[dict]:
             {"requirement": requirement["id"], "covered": not missing, "missing": missing}
         )
     return result
+
+
+def _retrospective_inventory(
+    manifest: dict, checkpoint: dict, universe: set[str]
+) -> list[dict]:
+    """Classify only declared, source-resolvable evidence; never infer intent."""
+    tracked_types = {
+        "requirement",
+        "decision",
+        "specification",
+        "route",
+        "schema",
+        "contract",
+        "code_symbol",
+        "test",
+        "evaluation",
+        "verification_receipt",
+    }
+    edges_by_node: dict[str, list[dict]] = {}
+    for edge in checkpoint["edges"]:
+        edges_by_node.setdefault(edge["from"], []).append(edge)
+        if isinstance(edge.get("to"), str):
+            edges_by_node.setdefault(edge["to"], []).append(edge)
+    baseline_unknown = manifest.get("baseline", {}).get("accepted") is False
+    result = []
+    for node in sorted(checkpoint["nodes"], key=lambda item: item["id"]):
+        source = node.get("source", {})
+        path = source.get("path", "").replace("\\", "/")
+        if node.get("type") not in tracked_types or path not in universe:
+            continue
+        edges = edges_by_node.get(node["id"], [])
+        explicit = node.get("retrospective_state")
+        if explicit in {"contradictory", "deferred", "excluded", "stale", "unknown"}:
+            classification = explicit
+        elif any(edge.get("provenance") == "missing" for edge in edges):
+            classification = "missing"
+        elif not edges:
+            classification = "orphaned"
+        elif baseline_unknown or any(edge.get("provenance") == "inferred" for edge in edges):
+            classification = "unknown"
+        else:
+            classification = "current"
+        result.append(
+            {
+                "id": node["id"],
+                "type": node["type"],
+                "source": path,
+                "classification": classification,
+            }
+        )
+    return result
+
+
+def _retrospective_universe(
+    manifest: dict, selected: str, nodes: list[dict]
+) -> list[str]:
+    inputs = manifest.get("inputs", [])
+    if not isinstance(inputs, list) or any(not isinstance(path, str) for path in inputs):
+        raise EngineeringError("Engineering retrospective inputs are invalid.")
+    universe = {selected, decision_ledger_path(Path("."), manifest)}
+    universe.update(path.replace("\\", "/") for path in inputs)
+    universe.update(
+        matrix["source"].replace("\\", "/")
+        for matrix in manifest.get("semantic_matrices", [])
+        if isinstance(matrix, dict) and isinstance(matrix.get("source"), str)
+    )
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            raise EngineeringError("Engineering retrospective overlay is invalid.")
+        path, _ = _source(node, node["id"])
+        if Path(path).is_absolute() or ".." in Path(path).parts:
+            raise EngineeringError("Engineering retrospective source is invalid.")
+        universe.add(path)
+    return sorted(universe)
+
+
+def retrospective_preview(
+    root: Path, *, scope: list[str] | None = None, llm_reconcile: bool = False
+) -> dict:
+    """Describe the exact read-only audit before any checkpoint inventory runs."""
+    project_root = resolve_project_root(str(root))
+    commit = git(project_root, "rev-parse", "HEAD")
+    selected = _tracked_manifest_name(project_root)
+    if selected is None:
+        return {
+            "schema": "engineering.retrospective-preview.v1",
+            "state": "advisory",
+            "read_only": True,
+            "finite_universe": [],
+            "reason": "manifest_not_tracked",
+        }
+    manifest = _json_at(project_root, commit, selected)
+    links_path = _project_paths_for_manifest(selected)[1]
+    links = _json_at(project_root, commit, links_path)
+    nodes = links.get("nodes", [])
+    if not isinstance(nodes, list):
+        raise EngineeringError("Engineering retrospective overlay is invalid.")
+    requested = [] if scope is None else list(dict.fromkeys(scope))
+    if any(
+        not isinstance(path, str)
+        or not path
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+        for path in requested
+    ):
+        raise EngineeringError("Engineering retrospective scope must stay inside the project.")
+    declared = _retrospective_universe(manifest, selected, nodes)
+    unknown = sorted(set(requested) - set(declared))
+    if unknown:
+        raise EngineeringError("Engineering retrospective scope is not declared by the project.")
+    universe = sorted(requested) if requested else declared
+    by_id = {node["id"]: node for node in nodes}
+    matrices = [
+        {
+            "source": matrix["source"].replace("\\", "/"),
+            "axes": ["owner_or_state", "implementation", "positive", "negative"],
+            "items": len(matrix.get("items", [])) if isinstance(matrix.get("items", []), list) else 0,
+        }
+        for matrix in manifest.get("semantic_matrices", [])
+        if isinstance(matrix, dict)
+        and isinstance(matrix.get("source"), str)
+        and (not requested or _semantic_matrix_impacted(matrix, by_id, set(universe)))
+    ]
+    preview = {
+        "schema": "engineering.retrospective-preview.v1",
+        "state": "preview",
+        "read_only": True,
+        "commit": commit,
+        "finite_universe": universe,
+        "semantic_matrices": matrices,
+        "deterministic_work": [
+            "validate_current_checkpoint",
+            "classify_declared_evidence",
+            "compare_requirement_and_decision_coverage",
+            "propose_remediation_only",
+        ],
+        "llm": {
+            "requested": bool(llm_reconcile),
+            "controller_calls": 0,
+            "host_cost": "bounded_by_selected_sources_and_host_model" if llm_reconcile else "none",
+        },
+        "permissions": {"project_reads": True, "project_writes": False, "external_access": False},
+        "outputs": ["evidence_classifications", "coverage_findings", "remediation_plan"],
+    }
+    preview["preview_digest"] = "sha256:" + hashlib.sha256(_canonical_json(preview)).hexdigest()
+    return preview
+
+
+def retrospective(
+    root: Path,
+    *,
+    scope: list[str] | None = None,
+    llm_reconcile: bool = False,
+    preview_digest: str | None = None,
+) -> dict:
+    """Read only the declared engineering evidence universe; never invokes an LLM."""
+    preview = retrospective_preview(root, scope=scope, llm_reconcile=llm_reconcile)
+    if preview.get("preview_digest") != preview_digest:
+        raise EngineeringError("Engineering retrospective preview is required.")
+    project_root = resolve_project_root(str(root))
+    commit = git(project_root, "rev-parse", "HEAD")
+    selected = _tracked_manifest_name(project_root)
+    if selected is None:
+        return {
+            "schema": "engineering.retrospective.v1",
+            "state": "advisory",
+            "read_only": True,
+            "finite_universe": [],
+            "findings": [{"classification": "unknown", "reason": "manifest_not_tracked"}],
+            "remediation": [{"action": "adopt_engineering", "requires_authority": True}],
+            "llm_reconciliation": {"status": "not_available_in_controller"},
+        }
+    manifest = _json_at(project_root, commit, selected)
+    requested = [] if scope is None else list(dict.fromkeys(scope))
+    if any(
+        not isinstance(path, str) or not path or Path(path).is_absolute() or ".." in Path(path).parts
+        for path in requested
+    ):
+        raise EngineeringError("Engineering retrospective scope must stay inside the project.")
+    universe = list(preview["finite_universe"])
+    readiness = check_merge_readiness(project_root)
+    if not readiness["ready"]:
+        return {
+            "schema": "engineering.retrospective.v1",
+            "state": "advisory",
+            "read_only": True,
+            "commit": commit,
+            "finite_universe": universe,
+            "findings": [{"classification": "unknown", "reason": readiness["reason"]}],
+            "remediation": [{"action": "recover_canonical_checkpoint", "requires_authority": True}],
+            "llm_reconciliation": {"status": "not_available_in_controller"},
+        }
+    checkpoint = _load_checkpoint(project_root, commit)
+    nodes = {node["id"]: node for node in checkpoint["nodes"]}
+    inventory = _retrospective_inventory(manifest, checkpoint, set(universe))
+    findings = [
+        {"classification": "uncovered", "requirement": item["requirement"], "missing": item["missing"]}
+        for item in coverage(checkpoint, source_paths=set(universe) if requested else None)
+        if not item["covered"]
+    ]
+    matrix_scope = set(requested) if requested else {
+        matrix["source"].replace("\\", "/")
+        for matrix in manifest.get("semantic_matrices", [])
+        if isinstance(matrix, dict) and isinstance(matrix.get("source"), str)
+    }
+    findings.extend(
+        {"classification": "uncovered_semantic_matrix_cell", "id": identifier}
+        for identifier in _semantic_matrix_issues(manifest, checkpoint["nodes"], matrix_scope)
+    )
+    ledger = _ledger_decisions(project_root, commit, manifest)
+    overlay = {identifier for identifier, node in nodes.items() if node.get("type") == "decision"}
+    if decision_ledger_path(project_root, manifest) in universe:
+        findings.extend(
+            {"classification": "missing_from_overlay", "decision": identifier}
+            for identifier in sorted(set(ledger) - overlay)
+        )
+        findings.extend(
+            {"classification": "orphaned_overlay_decision", "decision": identifier}
+            for identifier in sorted(overlay - set(ledger))
+        )
+    findings.extend(
+        {key: value for key, value in item.items() if key != "source"}
+        for item in inventory
+        if item["classification"] != "current"
+        and not (
+            item["type"] == "requirement"
+            and any(
+                finding.get("requirement") == item["id"]
+                for finding in findings
+            )
+        )
+    )
+    for finding in findings:
+        identity = {
+            key: finding[key]
+            for key in ("classification", "requirement", "id", "decision", "reason")
+            if key in finding
+        }
+        finding["finding_id"] = "finding-" + hashlib.sha256(_canonical_json(identity)).hexdigest()[:16]
+    return {
+        "schema": "engineering.retrospective.v1",
+        "state": "review_required" if findings else "advisory",
+        "read_only": True,
+        "commit": commit,
+        "finite_universe": universe,
+        "inventory": inventory,
+        "findings": findings,
+        "remediation": [
+            {
+                "action": "reconcile_declared_evidence",
+                "finding_id": finding["finding_id"],
+                "classification": finding["classification"],
+                "evidence_refs": [
+                    str(finding[key])
+                    for key in ("requirement", "id", "decision", "reason")
+                    if key in finding
+                ],
+                "requires_authority": True,
+            }
+            for finding in findings
+        ],
+        "llm_reconciliation": {
+            "status": "advisory_packet_only" if llm_reconcile else "not_requested",
+            "sources": universe if llm_reconcile else [],
+            "note": "Any host inference is advisory until the project owner records it."
+            if llm_reconcile
+            else None,
+        },
+    }
 
 
 def _engineering_path(checkpoint: dict, start: str) -> list[str]:
@@ -4409,6 +4768,9 @@ def _scope_envelope(scope: dict) -> dict[str, object]:
     # Compatibility only: task authority, not this caller-supplied flag, permits
     # degraded deterministic work when graph context is unavailable.
     result["legacy_deterministic_only_approved"] = deterministic_only
+    approval = scope.get("contract_approval_id")
+    if approval is not None:
+        result["contract_approval_id"] = _assurance_id(approval, "contract approval")
     if "task_authority" in scope:
         if not isinstance(scope["task_authority"], dict):
             raise EngineeringError("Preparation task authority must be an object.")
@@ -5173,8 +5535,51 @@ def run_maintenance(root: Path, area: str | None = None) -> dict:
         _end_completion(project_root, operation)
 
 
-def _contract_change_approved(scope: dict) -> bool:
-    return scope.get("contract_change_approved") is True
+def _contract_change_approved(root: Path, commit: str, manifest: dict, scope: dict) -> bool:
+    """A caller boolean never approves a persisted contract; its ledger remains authority."""
+    approval = scope.get("contract_approval_id")
+    if not isinstance(approval, str):
+        return False
+    decisions = _ledger_decisions(root, commit, manifest)
+    line = decisions.get(approval)
+    if line is None:
+        return False
+    ledger = _text_at(root, commit, decision_ledger_path(root, manifest)).splitlines()
+    selected = ledger[line - 1]
+    if selected.lstrip().startswith("|"):
+        cells = [cell.strip().strip("*") for cell in selected.strip().strip("|").split("|")]
+        block_start = line - 1
+        while block_start > 0 and ledger[block_start - 1].lstrip().startswith("|"):
+            block_start -= 1
+        block = ledger[block_start:]
+        if len(block) < 2:
+            return False
+        headers = [cell.strip().strip("*").casefold() for cell in block[0].strip().strip("|").split("|")]
+        separator = [cell.strip() for cell in block[1].strip().strip("|").split("|")]
+        if len(separator) != len(headers) or any(
+            re.fullmatch(r":?-{3,}:?", cell) is None for cell in separator
+        ) or headers.count("status") != 1:
+            return False
+        status_index = headers.index("status")
+        return (
+            cells[0] == approval
+            and status_index < len(cells)
+            and cells[status_index].casefold() == "approved"
+        )
+    entry = ledger[line - 1 :]
+    for index, candidate in enumerate(entry[1:], start=1):
+        if re.match(r"^#{1,6}\s+[A-Z][A-Z0-9_-]*-DEC-\d+\b", candidate):
+            entry = entry[:index]
+            break
+    status = re.compile(
+        r"(?i)^\s*(?:[-*]\s*)?(?:\*\*)?status(?:\*\*)?\s*:\s*(.*?)\s*$"
+    )
+    values = [
+        match.group(1).rstrip(".").strip().casefold()
+        for candidate in entry
+        if (match := status.fullmatch(candidate))
+    ]
+    return values == ["approved"]
 
 
 def _recover_initial_checkpoint(project: ProjectIdentity) -> dict:
@@ -5213,7 +5618,7 @@ def _unmanaged_preparation(root: Path, intent: str, scope: dict, override: str |
     ]
     if checks and "task_authority" in authorization:
         check_authority = validate_task_check_authority(
-            authorization["task_authority"], _check_capability_claims(project_root, checks)
+            project_root, authorization["task_authority"], _check_capability_claims(project_root, checks)
         )
     elif checks:
         advisories.append("Project-native check authority remains outside Engineering until controls are adopted.")
@@ -5295,7 +5700,7 @@ def prepare(
     task_check_authority = None
     if "task_authority" in authorization:
         task_check_authority = validate_task_check_authority(
-            authorization["task_authority"],
+            project.root, authorization["task_authority"],
             _check_capability_claims(project.root, required_checks),
         )
     if query_outcome["status"] in {"unavailable", "invalid"} and task_check_authority is None:
@@ -5341,7 +5746,7 @@ def prepare(
     dirty = _dirty_paths(project.root)
     if any(path not in authorization["scope"] for path in dirty):
         blocker_codes.append("conflicting_authority")
-    if contract_impact and not _contract_change_approved(scope):
+    if contract_impact and not _contract_change_approved(project.root, project.commit, config, scope):
         blocker_codes.append("unapproved_contract_change")
     if any(
         re.search(rf"\b{re.escape(action)}\b", bounded_intent, re.IGNORECASE)
@@ -5882,7 +6287,7 @@ def _end_completion(root: Path, record: dict) -> None:
     current = _read_operation(root, record["operation_id"])
     current.update(phase="orphaned", worker_process_tree_dead=True)
     _write_operation(current)
-    result = cleanup_hook_operation(root, current["operation_id"], timeout_seconds=10)
+    result = cleanup_hook_operation(root, current["operation_id"], timeout_seconds=30)
     if not result["completed"]:
         raise EngineeringError(f"Engineering completion cleanup failed: {result['reason']}")
 
@@ -6145,7 +6550,7 @@ def complete(root: Path, run_id: str, receipts: list[dict]) -> dict:
             claims = _check_capability_claims(project.root, required)
             task_authority = authorization.get("task_authority")
             if task_authority is not None:
-                validated_authority = validate_task_check_authority(task_authority, claims)
+                validated_authority = validate_task_check_authority(project.root, task_authority, claims)
                 if preparation.get("check_authority") != validated_authority:
                     raise EngineeringError("Engineering task check authority changed after preparation.")
             else:
@@ -6568,8 +6973,24 @@ $ErrorActionPreference = 'Stop'
 $enforce = $enforceFlag -eq '1'
 $directory = $directoryFlag -eq '1'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-if ($enforce) {
-    $acl = Get-Acl -LiteralPath $path
+$acl = Get-Acl -LiteralPath $path
+$ownerSid = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate(
+    [System.Security.Principal.SecurityIdentifier]
+).Value
+$expectedInheritance = if ($directory) { 'ContainerInherit, ObjectInherit' } else { 'None' }
+$privateAccess = @($acl.Access | Where-Object {
+    $entrySid = $_.IdentityReference.Translate(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    ($entrySid -eq $sid.Value -or $entrySid -eq 'S-1-5-18') -and
+        $_.AccessControlType.ToString() -eq 'Allow' -and
+        -not $_.IsInherited -and
+        $_.InheritanceFlags.ToString() -eq $expectedInheritance -and
+        $_.PropagationFlags.ToString() -eq 'None'
+})
+$alreadyPrivate = $acl.AreAccessRulesProtected -and $ownerSid -eq $sid.Value -and
+    $privateAccess.Count -gt 0 -and $privateAccess.Count -eq @($acl.Access).Count
+if ($enforce -and -not $alreadyPrivate) {
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
     if ($directory) {
@@ -6588,9 +7009,16 @@ if ($enforce) {
             [System.Security.AccessControl.AccessControlType]::Allow
         )
     }
-    $acl.SetOwner($sid)
+    $ownerSid = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    if ($ownerSid -ne $sid.Value) { $acl.SetOwner($sid) }
     $acl.AddAccessRule($rule)
-    Set-Acl -LiteralPath $path -AclObject $acl
+    if ($directory) {
+        [System.IO.DirectoryInfo]::new($path).SetAccessControl($acl)
+    } else {
+        [System.IO.FileInfo]::new($path).SetAccessControl($acl)
+    }
 }
 $verified = Get-Acl -LiteralPath $path
 $entries = @($verified.Access | ForEach-Object {
@@ -7095,17 +7523,74 @@ def validate_execution_context(bundle: object, preparation: object, *, runner_en
     return {"schema": EXECUTION_CONTEXT_SCHEMA, "mode": "enforced" if runner_enforces_boundary else "advisory", "bundle": bundle}
 
 
-def validate_task_check_authority(authority: object, claims: object) -> dict:
-    if not isinstance(authority, dict) or set(authority) != {"schema", "task_id", "commands_digest", "effects"}:
+def _task_authority_signature(key: bytes, authority: dict) -> str:
+    material = {
+        name: authority[name]
+        for name in (
+            "schema",
+            "task_id",
+            "repository_id",
+            "commit",
+            "commands_digest",
+            "effects",
+            "issued_at",
+            "valid_until",
+        )
+    }
+    return "hmac-sha256:" + hmac.new(key, _canonical_json(material), hashlib.sha256).hexdigest()
+
+
+def issue_task_check_authority(root: Path, task_id: str) -> dict:
+    """The trusted host calls this after task approval; the CLI never invents it."""
+    project = resolve_project(root)
+    claims = _check_capability_claims(project.root, discover_checks(project.root))
+    issued = datetime.now(timezone.utc)
+    authority = {
+        "schema": TASK_AUTHORITY_SCHEMA,
+        "task_id": _assurance_id(task_id, "task authority"),
+        "repository_id": claims["repository_id"],
+        "commit": project.commit,
+        "commands_digest": claims["commands_digest"],
+        "effects": {name: False for name in sorted(TASK_CHECK_EFFECTS)},
+        "issued_at": issued.isoformat(),
+        "valid_until": (issued + timedelta(hours=1)).isoformat(),
+    }
+    key = _controller_key(_project_controller_dir(project.root), required=True)
+    assert key is not None
+    authority["signature"] = _task_authority_signature(key, authority)
+    return authority
+
+
+def validate_task_check_authority(root: Path, authority: object, claims: object) -> dict:
+    if not isinstance(authority, dict) or set(authority) != {
+        "schema",
+        "task_id",
+        "repository_id",
+        "commit",
+        "commands_digest",
+        "effects",
+        "issued_at",
+        "valid_until",
+        "signature",
+    }:
         raise EngineeringError("Engineering routine check authority is invalid.")
     if authority.get("schema") != TASK_AUTHORITY_SCHEMA or not isinstance(claims, dict):
         raise EngineeringError("Engineering routine check authority is invalid.")
     task_id = _assurance_id(authority.get("task_id"), "task authority")
+    project = resolve_project(root)
     digest = authority.get("commands_digest")
     effects = authority.get("effects")
+    issued = _assurance_timestamp(authority.get("issued_at"))
+    valid_until = _assurance_timestamp(authority.get("valid_until"))
+    now = datetime.now(timezone.utc)
     if (
         not isinstance(digest, str)
         or digest != claims.get("commands_digest")
+        or authority.get("repository_id") != claims.get("repository_id")
+        or authority.get("commit") != project.commit
+        or valid_until < now
+        or issued > now + timedelta(minutes=5)
+        or valid_until - issued > timedelta(hours=1)
         or claims.get("inline_code") is not False
         or claims.get("shell_free") is not True
         or not isinstance(effects, dict)
@@ -7113,7 +7598,18 @@ def validate_task_check_authority(authority: object, claims: object) -> dict:
         or any(value is not False for value in effects.values())
     ):
         raise EngineeringError("Engineering routine check authority is invalid.")
-    return {"schema": TASK_AUTHORITY_SCHEMA, "task_id": task_id, "commands_digest": digest}
+    key = _controller_key(_project_controller_dir(project.root), required=True)
+    assert key is not None
+    if not hmac.compare_digest(str(authority["signature"]), _task_authority_signature(key, authority)):
+        raise EngineeringError("Engineering routine check authority is invalid.")
+    return {
+        "schema": TASK_AUTHORITY_SCHEMA,
+        "task_id": task_id,
+        "repository_id": authority["repository_id"],
+        "commit": authority["commit"],
+        "commands_digest": digest,
+        "valid_until": authority["valid_until"],
+    }
 
 
 def _validate_practice(practice: object) -> dict:
@@ -9606,6 +10102,13 @@ def _install_hooks_authorized(
 
 def _expected_cli_blocker(error: EngineeringError) -> dict | None:
     text = str(error)
+    if text.startswith(("Expected one commit-bound checkpoint", "Invalid checkpoint", "Checkpoint is not bound")):
+        return {
+            "schema": "engineering.error.v1",
+            "status": "unavailable",
+            "reason": "canonical_checkpoint_unavailable",
+            "remediation": "recover_or_rebuild_the_exact_canonical_checkpoint_under_setup_authority",
+        }
     routes = {
         "manifest_not_tracked": "authorize_engineering_setup",
         "Default branch identity is ambiguous.": "resolve_default_branch",
@@ -9659,6 +10162,11 @@ def main() -> int:
     map_parser.add_argument("root", nargs="?", default=".")
     map_parser.add_argument("--no-open", action="store_true")
     map_parser.add_argument("--focus")
+    retrospective_parser = commands.add_parser("retrospect")
+    retrospective_parser.add_argument("root", nargs="?", default=".")
+    retrospective_parser.add_argument("--scope", action="append")
+    retrospective_parser.add_argument("--llm-reconcile", action="store_true")
+    retrospective_parser.add_argument("--preview-digest")
     ci_parser = commands.add_parser("ci-gate")
     ci_parser.add_argument("root")
     hook_parser = commands.add_parser("hook")
@@ -9783,7 +10291,7 @@ def main() -> int:
                     raise EngineeringError("Maintenance accepts exactly one project root.")
                 root = resolve_project_root(arguments.target)
                 result = run_maintenance(root, arguments.area)
-        elif arguments.command in {"map", "prepare", "setup"}:
+        elif arguments.command in {"map", "prepare", "setup", "retrospect"}:
             advisory = pre_repository_advisory(arguments.root)
             if advisory is not None:
                 if arguments.command == "map":
@@ -9800,6 +10308,16 @@ def main() -> int:
                         "project": advisory,
                         "context": [],
                         "blockers": [],
+                    }
+                elif arguments.command == "retrospect":
+                    result = {
+                        "schema": "engineering.retrospective.v1",
+                        "state": "advisory",
+                        "read_only": True,
+                        "finite_universe": [],
+                        "findings": [{"classification": "unknown", "reason": "not_version_controlled"}],
+                        "remediation": [{"action": "initialize_local_git_and_adopt_engineering", "requires_authority": True}],
+                        "llm_reconciliation": {"status": "not_available_in_controller"},
                     }
                 else:
                     result = pre_repository_setup_preview(advisory)
@@ -9864,6 +10382,18 @@ def main() -> int:
             result = render_map(
                 root, open_output=not arguments.no_open, focus=arguments.focus
             )
+        elif arguments.command == "retrospect":
+            if arguments.preview_digest is None:
+                result = retrospective_preview(
+                    root, scope=arguments.scope, llm_reconcile=arguments.llm_reconcile
+                )
+            else:
+                result = retrospective(
+                    root,
+                    scope=arguments.scope,
+                    llm_reconcile=arguments.llm_reconcile,
+                    preview_digest=arguments.preview_digest,
+                )
         elif arguments.command == "hook":
             result = handle_hook(
                 arguments.event, root, arguments.graphify_python

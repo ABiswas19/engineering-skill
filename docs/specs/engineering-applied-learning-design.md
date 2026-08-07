@@ -101,7 +101,7 @@ release, and installation governance remains required.
 ## Standalone distribution
 
 The canonical repository contains generic skill source, synthetic tests,
-human-readable documentation, and corporate-only release controls. A separate
+human-readable documentation, and canonical-source release controls. A separate
 public mirror is regenerated through an allowlisted export and independent Git
 history.
 
