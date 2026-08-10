@@ -395,6 +395,22 @@ output, arbitrary query IDs, or connector payloads. Credential-shaped intent is
 redacted before use or retention; credential-shaped scope and forbidden entries
 are rejected.
 
+When an orchestrator is carrying a user-feedback seed into a consequential
+handoff, its authorization envelope includes a bounded `scope_handoff` with
+`seed_evidence`, `reconstructed_scope`, `architect_scope`, `result_scope`, a
+`result_artifacts` set, a `decision_id` and its exact `decision_digest`, plus a
+controller-issued signed `approval_id`. The controller requires the seed to be represented in the
+reconstructed scope, the reconstructed and architect scopes to match, and the
+reported result scope and observed changed-artifact set to match that immutable
+approved scope. It revalidates the commit-bound attestation during preparation
+and completion; missing
+approval, self-attested scope, unreconstructed seed evidence, and narrow or
+incomplete results fail closed. The envelope never treats a symptom-only
+caller scope as complete authority.
+`approve-scope` is the explicit host-facing operation that creates this
+commit-bound attestation; a handoff completion supplies `--result-scope`, and
+the retained completion manifest records that exact result for replay.
+
 Final handoff defaults to one-sentence **Outcome**, then **Now** and **Next**;
 include **Blocked** only for a genuine blocker. Preparation, readiness, impact,
 completion evidence, and technical caveats are optional **Details**, used only
@@ -449,6 +465,65 @@ The signed envelope is short-lived bearer evidence for one repository commit;
 the host must keep it within the authorized task. Cross-session identity and
 role verification remain an external host/identity-service responsibility, not
 an authority claim made by Engineering.
+
+## Persisted scoped business authority
+
+Approval presence is distinct from whether the host should request approval
+again. After the trusted host observes approval through its native boundary,
+the host adapter signs the exact normalized binding with an external SSH
+signing key. The corresponding allowed signer must be pinned in the governed
+repository's committed `.engineering-host-approvers` file; the private key is
+never available to Engineering. Engineering exposes no approval-minting API.
+`persist_scoped_authority` verifies the `engineering-authority` SSH signature
+against the approver file at `HEAD`, rejects arbitrary or locally minted
+references, and stores
+one controller-signed `engineering.scoped-authority.v1` record only from that
+retained attestation under the
+Git-common project controller. It binds immutable repository lineage,
+authority epoch, target, action class, normalized scope, safeguards, approval
+reference, native approval requirements, issue time, and expiry. Turn, retry, callback, and bounded-repair
+metadata are deliberately excluded from that binding, so unchanged work
+retains authority without repeated prompts.
+
+`resolve_scoped_authority` is read-only and returns separate
+`business_authority_present`, `request_business_approval`, and
+`native_approval_required` facts. Missing, revoked, consumed, expired, or
+changed repository, epoch, target, action, scope, or safeguards returns
+`request_required`. Full Access and sandbox mode are reported technical
+permissions only; neither creates business authority. Exact business authority
+with a native destructive, native connector, credential, or system prompt
+returns `pending_native_approval`. Engineering never satisfies, suppresses, or
+bypasses that host-native prompt. Requirements are signed into the authority,
+and destructive, connector, credential, and system action classes impose their
+matching native requirement even when a caller omits it.
+
+Revocation and consumption are explicit signed terminal transitions. Exact
+transition replay is idempotent; a conflicting terminal transition fails
+closed. Expiry is evaluated from the signed deadline. Delegation preserves the
+parent and approval references and can only narrow scope and expiry while
+retaining repository, epoch, target, action, and safeguards. It cannot broaden
+or refresh authority. A descendant also becomes unavailable when any retained
+ancestor is revoked, consumed, or expired.
+
+All approval, persistence, delegation, transition, and audit mutations use the
+shared Git-common repository operation lock. Cardinality limits are checked
+before publication, so concurrent writers cannot lose state and a final append
+cannot create a ledger that the next read rejects.
+
+`record_authority_audit` appends signed evidence binding an authority ID,
+exact artifact SHA-256, auditor reference, verdict, and observation time.
+The artifact-authority-auditor tuple is the event identity; a changed verdict
+or observation time for that tuple is a conflict, not another retained event.
+Acceptance of an exact artifact is evidence only: it does not create, expand,
+consume, revoke, or renew authority. Codex and Claude use this same canonical
+contract while retaining their native tools, context, permissions, autonomy,
+concurrency, and approval mechanisms.
+
+When a bounded writer exhausts its repair epoch, the host records
+`PAUSED_AWAITING_CENTRAL_ADJUDICATION`. This is neither a new approval request
+nor automatic retirement. Central adjudication may continue only the same
+artifact/version/target/owner under an authority whose exact binding and epoch
+remain valid; any changed binding follows the ordinary re-request rule.
 
 ## Read-only retrospective
 
@@ -578,6 +653,18 @@ ancestor of or equal to the published commit, using argv-only `merge-base
 pending. The controller retains bounded completion history; failed or unrelated
 items are neither retried nor rank-downgraded.
 
+Historical or advisory traceability debt remains visible and does not block an
+unrelated delivery. A native orchestrator may launch disjoint maintenance
+lanes in parallel; this controller keeps each shared-ledger mutation and every
+overlapping writer serialized under the existing repository operation lock.
+Preparation treats queued work as advisory
+unless it is an unsafe checkpoint identity/integrity repair, explicitly required
+current-contract evidence, or an artifact on the selected graph/release impact
+path. Strict authoritative-ledger and deterministic-overlay parity remains a
+blocking gate for graph-dependent acceptance. This policy reuses native task
+events and the existing evaluation ledger; it adds no scheduler, poller, or
+second state machine.
+
 ## Invariant safeguards
 
 No autonomy level authorizes publication, merge, deployment, release,
@@ -650,6 +737,99 @@ For compatibility, an HMAC-valid legacy check attestation missing only
 `allow_inline_code` matches an otherwise exact non-inline claim as effective
 false. It never matches an inline claim and the controller does not silently
 rewrite it.
+
+## Native delivery policy and evaluation
+
+Engineering is a lightweight policy overlay on host-native task semantics,
+including Codex and Claude. The orchestrator is the default entry, creates a
+dependency-aware native task DAG, uses beneficial parallelism without an artificial concurrency
+limit, and assigns exactly one writer per shared mutable resource. Direct
+implementer-designer feedback emits observable state. Material scope,
+interface, risk, approval, evidence-invalidation, disagreement, integration,
+or acceptance changes reach the orchestrator. Reviewers and auditors are
+read-only; an auditor that edits creates a new candidate requiring independent
+review. The orchestrator alone independently accepts, rejects, or blocks the
+exact integrated artifact.
+
+User input and feedback are seed evidence, not presumed complete scope. Before
+specialist dispatch, the orchestrator reconstructs the full available decision
+ledger, approved intent, dependencies, sibling and adjacent flows, and bounded
+workspace state. When material risk or domain impact warrants it,
+architecture/design and SME tasks investigate adjacent omissions and root
+causes and map both seed and adjacent findings to acceptance. Dispatch that
+investigation first; only its architect-approved scope goes to the implementer.
+Reject symptom-only or narrow handoffs rather than letting implementers
+self-scope from the latest request. Exact-artifact acceptance independently
+rejects narrow, incomplete, or proxy-only results even when the seed symptom
+passes.
+
+A parent does not report a lane as active, complete, or awaiting approval
+until its orchestrator has consumed and reconciled every native child terminal
+event. Reconciliation records the terminal exact-artifact identity, acceptance
+state, current gate, and next action; it is a native-event contract, not a
+poller, scheduler, or additional state machine.
+
+Automated, build, technical, and visual checks are necessary evidence, never
+capability or product acceptance on their own. Every delivery independently
+records technical correctness, domain/semantic correctness, and end-to-end
+functional outcome acceptance through the actual consumer interface/environment and
+representative data. The proportionate interface can be a CLI, API, file, or
+other real consumer; no UI walkthrough is required where no UI exists. Missing
+representative data or outcome evidence is `unknown` and fails the acceptance
+gate. A passed technical or visual proxy never substitutes for an accepted
+outcome; proxy-pass/outcome-fail and audit-false-positive signals retain that
+failure for trends. An accepted outcome retains bounded outcome and
+representative-data evidence identities, and an audit false-positive signal
+requires completed audit coverage.
+
+Model selection remains caller- or native-platform-owned. Every evaluation may
+record requested and actual model facts plus a truthful fallback reason, but
+this distributable contract prescribes no provider, model family, reasoning
+level, or task topology. Unavailable models do not reduce native capabilities
+or block a viable native fallback. Material decision review asks whether the
+concept should exist and whether doing nothing is better, including for
+security, approval, persisted-contract, architecture, and operating-model
+choices.
+Consequential lanes may carry an independent embedded auditor.
+
+Use the narrowest technical or functional SME when specialist knowledge could
+materially change design, definition of done, domain rules, process states,
+terminology, ownership, KPIs, exceptions, or acceptance. Functional SMEs may
+use current primary public sources for external facts. Their output separates
+facts, assumptions, citations, and Unknowns and never invents organization-
+specific facts. A skipped trigger or unavailable metric records a bounded
+`not_applicable` reason.
+
+`engineering delivery-eval <root> <completion-id> --input-file <path|->`
+validates the referenced terminal completion and exact integrated artifact,
+then atomically appends one signed, bounded owner-private
+`engineering.delivery-evaluation.v1` record. `engineering delivery-trends
+[--window N]` deterministically returns `engineering.delivery-trends.v1` over
+comparable records without an LLM or project write. Evaluation includes
+task/DoD/artifact/verdict identity;
+trigger, requested/actual/fallback model, dependencies, duration, peak
+parallelism, critical path, coordination, terminal reconciliation identity and
+latency, unconsumed-terminal-event signal, feedback, invalidated evidence,
+auditor coverage, rework, escaped defects, false blockers, missed escalation,
+intervention, independent technical/domain/outcome acceptance states, actual
+operating interface, representative-data state, derived acceptance gate,
+bounded outcome/data evidence identities, proxy-pass/outcome-fail, audit
+false-positive rate, trends, and non-applicable reasons. The owner-private
+ledger retains the newest 365 records within 1 MiB;
+deterministic sequence ordering selects only the latest task/DoD cohort, and
+fewer than two comparable records return `insufficient_sample`.
+The terminal reconciliation digest must equal the controller-validated
+completion digest, and outcome/representative-data evidence digests must match
+output digests from that completion's validated check receipts. Unbound claims
+are rejected; missing evidence remains `unknown` and fails the acceptance gate.
+Older records without the reconciliation digest remain readable as historical
+ledger entries, but new evaluations use the bound contract and never upgrade a
+historical claim into current acceptance. Delivery trends exclude those legacy
+rows from verified-current cohorts and report their bounded count separately.
+Recommendations remain local to the user's harness and cannot mutate upstream
+skill source or bypass the applied-learning lifecycle.
+No LangGraph runtime is permitted without a demonstrated native-task gap and
+separate dependency and architecture approval.
 
 ## Contribution quarantine and installation
 
@@ -736,3 +916,26 @@ bundle and receipt are retained;
 `rollback_install(home)` swaps only those known-good versions and regenerates
 the thin Claude and v1 compatibility loaders. No shell command is constructed
 from source or home values.
+
+Install, upgrade, replay, and rollback preserve owner-private applied-practice
+state, contribution queues, attestations, keys, delivery evaluations, and every
+project's graph/checkpoint state. They replace only the validated canonical and
+prior bundles, generic loaders, managed launchers, and receipts inside the
+transaction; none activates projects, hooks, connectors, schedules, or data.
+
+On Windows, registry and process environment mutation is allowed only for a
+new installation whose resolved `home` is the active operating-system user's
+home. That installation idempotently registers only
+`<engineering-home>\.agents\bin` in the current user's `HKCU\Environment\Path`
+and current process `PATH`. An install to `ENGINEERING_USER_HOME`, any other
+temporary or custom home, an exact replay, an upgrade, and rollback must never
+write HKCU or change current process `PATH`. The
+`host_environment_pollution` regression uses mocked `winreg`: active-home first
+install performs the one managed write, while custom/test-home install, replay,
+upgrade, and rollback perform zero registry writes and leave process `PATH`
+byte-for-byte unchanged.
+
+Version 2.2.3 prevents new arbitrary test-home PATH pollution. It does not
+search for or delete historical arbitrary entries, because ownership cannot be
+proved safely. An active-home first install may require a new terminal even
+after current-process registration.

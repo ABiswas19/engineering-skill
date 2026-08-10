@@ -7,92 +7,95 @@ description: Use when a non-trivial software task needs setup, planning, impleme
 
 ## What Engineering does
 
-Engineering makes a change understandable and verifiable from request through
-completion. It adapts to existing instructions, decisions, contracts,
-toolchain, tests, and approval boundaries. Skip it for conversation,
-translation, formatting, or simple inspection.
+Engineering makes changes verifiable from request through completion, adapting
+to instructions, decisions, contracts, tests, toolchain, and approval
+boundaries. Skip conversation, translation, formatting, or inspection.
 
-It prepares applicable work and completes its evidence automatically.
+Orchestrator is default entry and independently accepts or rejects the exact
+integrated artifact. Engineering overlays, never replaces, native Codex and
+Claude task semantics, tools, context, permissions, autonomy, and concurrency. It uses
+a native dependency DAG, beneficial parallelism, one writer/resource,
+observable implementer-designer feedback, and optional consequential auditors.
+
+Treat user feedback as seed evidence. Before dispatch, reconstruct the decision
+ledger, approved intent, dependencies, sibling flows, and bounded workspace.
+For material risk/domain impact, architecture/design or the narrowest SME
+investigates adjacent omissions, maps findings to acceptance, and gives the
+implementer architect-approved scope. Reject narrow handoffs; final acceptance
+independently rejects incomplete or proxy-only results.
+
+Model selection remains the caller or native platform's policy; when delivery
+evaluation is used, record requested, actual, and fallback model facts without
+prescribing a provider, model family, reasoning level, or task topology.
+Decision review challenges existence and inaction. Research separates facts,
+assumptions, citations, and Unknowns and never invents organization-specific facts.
+
 Engineering completion runs automatically before claiming non-trivial work is
-ready. Controller commands are diagnostics and CI interfaces. Use
-`engineering map`; installation publishes it through a managed launcher.
-See
-`references/controller-contract.md` for exact commands and stored receipts.
+ready and records evidence for applicable work. Controller commands are
+diagnostics and CI interfaces.
+Use `engineering map`; see `references/controller-contract.md` for protocols.
 
 ## Graph and context
 
-Engineering is local-first. Graphify supplies the base graph and the
-deterministic Engineering overlay supplies verified links, decisions, and
-checks. Before a graph-derived claim, it assesses the repository and the
-canonical default-branch checkpoint. Installation alone does not create a
-graph.
-
-A managed repository with missing or stale evidence builds and validates the
-pinned Graphify graph and overlay at one exact default-branch commit. Missing
-or incompatible Graphify blocks graph claims. Feature evidence stays isolated;
-merged, deleted, orphaned, or corrupt records become historical or Unknown.
-
+Engineering is local-first. Graphify supplies the base graph; the deterministic
+Engineering overlay supplies verified links, decisions, and checks. Claims use
+the canonical default-branch checkpoint. Missing or incompatible Graphify
+blocks graph claims; stale or conflicting evidence remains Unknown.
 Same-machine worktrees share the Git-common local checkpoint catalogue.
-Separate machines recreate their own evidence. A cold start builds, an
-incremental change updates affected material, and an exact cache hit reuses the
-validated checkpoint. Enterprise graph sharing is an inactive opt-in, never an
-automatic network mode.
-
-Engineering passes a governed worker only a bounded execution-context bundle:
-the permitted scope, exact identity, relevant stable IDs, and redacted
-assertions. It excludes raw source bodies, credentials, forbidden, and
-irrelevant context. If the runner cannot enforce that boundary, the bundle is
-advisory rather than falsely isolated.
+Separate machines recreate their own evidence. Enterprise graph sharing is an
+inactive opt-in. A cold start builds, an incremental change updates affected
+material, and a cache hit reuses validated evidence.
 
 ## Setup and autonomy
 
-For an unmanaged project, ordinary work remains advisory with traceability
-Unknown; Engineering recommends the smallest adoption action and writes
-nothing. Setup is always a preview first. It may add project controls and
-preserve existing instructions and hooks only after explicit setup authority.
-Installing or upgrading Graphify is a separate approval. A first eligible
-commit establishes the canonical checkpoint; a greenfield project otherwise
-waits for that commit.
+For an unmanaged project, work remains advisory with traceability Unknown and
+writes nothing. Setup is always a preview first and requires explicit setup
+authority; it preserves instructions and hooks. Installing or upgrading Graphify is a
+separate approval. The first eligible commit establishes the canonical
+checkpoint.
 
 Autonomy is Guided, Collaborative (default), or Steward. Guided asks before
-project changes. Collaborative handles routine in-scope work and queues
-unrelated maintenance. Steward can process safe queued work once in a
-foreground run. None is a scheduler or permission to make consequential
-changes. A one-off maintenance run does not change the saved autonomy level.
+project changes; Collaborative handles routine in-scope work; Steward may also
+process safe queued work once. None schedules or authorizes consequential work;
+a one-off run does not change the saved autonomy level.
 
 ## What always needs approval
 
-Approval is still required for setup/project controls, Graphify installation,
-dependency or architecture changes, publication, merge, deployment, release,
-production or destructive actions, security/privacy/credential/financial
-decisions, public or persisted contract changes, and ambiguous authority.
-An explicitly authorized task may run only its unchanged, declared, local,
-deterministic, shell-free, credential-reduced checks without a second ceremony.
-Changed, inline, networked, connector, live, or consequential checks remain
-separately gated.
+Treat approval presence and a decision to request approval again as separate. Exact
+authority persists across unchanged turns, retries, callbacks, and bounded
+repair epochs. Re-request only when it is missing, revoked, consumed, expired,
+or its project, target, action, scope, safeguards, or epoch changes. Full Access
+is technical permission, never business authority. Native destructive and
+connector approvals remain mandatory. Setup, Graphify, architecture,
+publication, merge, deployment, release, production, security, privacy,
+credentials, finance, persisted contracts, and ambiguity stay gated. Exhausted
+workers freeze as `PAUSED_AWAITING_CENTRAL_ADJUDICATION`; they do not re-ask or
+retire automatically.
 
-Use `engineering retrospect` only for an explicitly bounded mid-flight audit.
-Its first call is a digest-bound preview; execution is read-only over declared
-evidence. Host LLM reconciliation stays bounded and advisory until recorded.
+`engineering retrospect` is bounded and read-only; host reconciliation stays
+advisory until recorded.
 
 ## Completion and maintenance
 
-Capability status is evidence-based: missing, stale, conflicting, or
-role-incomplete evidence remains Unknown. A passing test does not erase a
-material incident. Completion compares predicted and actual impact, records
-required check evidence, and offers at most a bounded reusable learning.
+Missing, stale, conflicting, or role-incomplete evidence stays Unknown; tests
+do not erase incidents. Completion compares predicted/actual impact, records check
+evidence, and offers at most bounded reusable learning.
 
-Maintenance is one foreground pass over a local queue. It repairs only what
-can be mechanically verified and leaves consequential or ambiguous items for
-review. It does not run in the background.
+Maintenance is one foreground pass over a local queue and does not run in the
+background; it repairs only mechanically verified work. Historical/advisory traceability debt remains
+visible without blocking unrelated work. An orchestrator may dispatch
+disjoint maintenance lanes in parallel, while each shared-ledger mutation and
+overlapping writer serializes under the existing lock. Preparation blocks
+for checkpoint identity/integrity, required current-contract evidence, or
+dependent graph/release acceptance.
 
-Reusable learning starts project-local and quarantined. It becomes shared only
-after evidence from a second project and explicit approval to `Promote and apply`. The
-skill is loaded by Codex and Claude; installation never copies
-project evidence or changes projects. Its location is
-`~/.agents/skills/engineering/`.
-Installation is atomic and retains one known-good rollback.
-Promote means apply; the installed base skill never rewrites itself.
+Reusable learning starts project-local and quarantined; sharing needs a second
+project and explicit approval to `Promote and apply`. Promote means apply. User
+recommendations stay in
+their harness and never silently modify upstream skill. Installation at
+`~/.agents/skills/engineering/` is atomic, preserves overlays and one known-good
+rollback, never rewrites itself, and never copies project evidence. No LangGraph runtime is added without a
+demonstrated native-task gap.
 
 Default handoff is compact:
 

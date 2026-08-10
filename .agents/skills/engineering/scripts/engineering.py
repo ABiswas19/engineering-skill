@@ -13,7 +13,7 @@ import html
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PosixPath, PurePosixPath
 import re
 import signal
 import shutil
@@ -39,6 +39,13 @@ DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS = 30.0
 ASSURANCE_SCHEMA = "engineering.capability-assurance.v1"
 EXECUTION_CONTEXT_SCHEMA = "engineering.execution-context.v1"
 TASK_AUTHORITY_SCHEMA = "engineering.task-authority.v2"
+SCOPED_AUTHORITY_SCHEMA = "engineering.scoped-authority.v1"
+AUTHORITY_LEDGER_SCHEMA = "engineering.authority-ledger.v1"
+AUTHORITY_RESOLUTION_SCHEMA = "engineering.authority-resolution.v1"
+AUTHORITY_AUDIT_SCHEMA = "engineering.authority-audit.v1"
+NATIVE_APPROVAL_REQUIREMENTS = {"connector", "credential", "destructive", "system"}
+MAX_SCOPED_AUTHORITIES = 256
+MAX_AUTHORITY_AUDITS = 512
 ASSURANCE_EVIDENCE_KINDS = {
     "implementation",
     "deployment",
@@ -766,6 +773,27 @@ def _ledger_decisions(root: Path, commit: str, manifest: dict) -> dict[str, int]
     if headings.keys() & table_rows.keys():
         raise EngineeringError("Engineering decision ledger reuses a stable ID.")
     return {**table_rows, **headings}
+
+
+def _decision_artifact_digest(
+    root: Path, commit: str, manifest: dict, decision_id: str
+) -> str:
+    """Bind a scope approval to one exact, tracked decision-ledger line."""
+    line_number = _ledger_decisions(root, commit, manifest).get(decision_id)
+    if line_number is None:
+        raise EngineeringError("Engineering scope approval decision is not in the authoritative ledger.")
+    path = decision_ledger_path(root, manifest)
+    lines = _text_at(root, commit, path).splitlines()
+    if not 1 <= line_number <= len(lines):
+        raise EngineeringError("Engineering scope approval decision artifact is invalid.")
+    return _json_digest(
+        {
+            "commit": commit,
+            "path": path,
+            "line": line_number,
+            "text": lines[line_number - 1],
+        }
+    )
 
 
 def _scaffold_payload(root: Path, mode: str, graphify_version: str) -> dict[Path, str]:
@@ -4742,6 +4770,97 @@ def _contains_credential(value: str) -> bool:
     return _redact_credentials(value) != value
 
 
+def _scope_handoff(value: object, *, require_approval: bool = True) -> dict[str, object]:
+    """Validate the bounded scope contract carried from investigation to delivery."""
+    base_keys = {
+        "seed_evidence",
+        "reconstructed_scope",
+        "architect_scope",
+        "result_scope",
+        "result_artifacts",
+    }
+    approval_keys = {"approval_id", "decision_id", "decision_digest"}
+    required = base_keys | approval_keys if require_approval else base_keys
+    if not isinstance(value, dict) or set(value) != required:
+        raise EngineeringError("Preparation scope handoff is invalid.")
+    normalized: dict[str, object] = {}
+    for key in ("seed_evidence", "reconstructed_scope", "architect_scope", "result_scope"):
+        items = value[key]
+        if (
+            not isinstance(items, list)
+            or not items
+            or len(items) > 256
+            or any(not isinstance(item, str) for item in items)
+        ):
+            raise EngineeringError("Preparation scope handoff is invalid.")
+        try:
+            identifiers = [_assurance_id(item, f"scope handoff {key}") for item in items]
+        except EngineeringError as error:
+            raise EngineeringError("Preparation scope handoff is invalid.") from error
+        if len(set(identifiers)) != len(identifiers):
+            raise EngineeringError("Preparation scope handoff is invalid.")
+        normalized[key] = sorted(identifiers)
+    artifacts = value["result_artifacts"]
+    if (
+        not isinstance(artifacts, list)
+        or not artifacts
+        or len(artifacts) > 256
+        or any(not isinstance(item, str) or not item for item in artifacts)
+        or any(Path(item).is_absolute() or ".." in Path(item).parts for item in artifacts)
+        or any(_contains_credential(item) for item in artifacts)
+    ):
+        raise EngineeringError("Preparation scope handoff result artifacts are invalid.")
+    normalized_artifacts = [item.replace("\\", "/") for item in artifacts]
+    if len(set(normalized_artifacts)) != len(normalized_artifacts):
+        raise EngineeringError("Preparation scope handoff result artifacts are invalid.")
+    normalized["result_artifacts"] = sorted(normalized_artifacts)
+    seed = set(normalized["seed_evidence"])
+    reconstructed = set(normalized["reconstructed_scope"])
+    architect = set(normalized["architect_scope"])
+    result = set(normalized["result_scope"])
+    if not seed.issubset(reconstructed):
+        raise EngineeringError("Preparation scope handoff did not reconstruct seed evidence.")
+    if reconstructed != architect:
+        raise EngineeringError("Preparation scope handoff is not architect-approved.")
+    if result != architect:
+        raise EngineeringError("Preparation scope handoff is narrow or incomplete.")
+    if require_approval:
+        approval_id = value["approval_id"]
+        if (
+            not isinstance(approval_id, str)
+            or not re.fullmatch(r"attestation-[0-9a-f]{32}", approval_id)
+        ):
+            raise EngineeringError("Preparation scope handoff approval is invalid.")
+        try:
+            normalized["decision_id"] = _assurance_id(
+                value["decision_id"], "scope handoff decision"
+            )
+        except EngineeringError as error:
+            raise EngineeringError("Preparation scope handoff decision is invalid.") from error
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value["decision_digest"])):
+            raise EngineeringError("Preparation scope handoff decision digest is invalid.")
+        normalized["approval_id"] = approval_id
+        normalized["decision_digest"] = value["decision_digest"]
+    return normalized
+
+
+def _scope_result(value: object) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > 256
+        or any(not isinstance(item, str) for item in value)
+    ):
+        raise EngineeringError("Engineering completion result scope is invalid.")
+    try:
+        identifiers = [_assurance_id(item, "completion result scope") for item in value]
+    except EngineeringError as error:
+        raise EngineeringError("Engineering completion result scope is invalid.") from error
+    if len(set(identifiers)) != len(identifiers):
+        raise EngineeringError("Engineering completion result scope is invalid.")
+    return sorted(identifiers)
+
+
 def _scope_envelope(scope: dict) -> dict[str, object]:
     if not isinstance(scope, dict):
         raise EngineeringError("Preparation scope must be an object.")
@@ -4775,6 +4894,8 @@ def _scope_envelope(scope: dict) -> dict[str, object]:
         if not isinstance(scope["task_authority"], dict):
             raise EngineeringError("Preparation task authority must be an object.")
         result["task_authority"] = scope["task_authority"]
+    if "scope_handoff" in scope:
+        result["scope_handoff"] = _scope_handoff(scope["scope_handoff"])
     return result
 
 
@@ -4959,6 +5080,34 @@ def _dirty_paths(root: Path) -> list[str]:
 
 def _maintenance_pending(root: Path) -> bool:
     return bool(_load_maintenance(root)["items"])
+
+
+def _maintenance_blocks_preparation(
+    item: dict, *, required_sources: set[str], impact: list[dict]
+) -> bool:
+    """Return whether queued maintenance can invalidate this graph-dependent run.
+
+    Queued work is normally advisory: the repository operation lock already
+    serializes writers, and a queued artifact is not by itself conflicting
+    authority. Only an unsafe checkpoint repair, explicitly required current
+    contract evidence, or an artifact on the selected graph/release impact
+    path can block preparation.
+    """
+    if item.get("safe"):
+        return False
+    artifact = item.get("artifact")
+    if not isinstance(artifact, str):
+        return False
+    artifact = artifact.replace("\\", "/")
+    if item.get("kind") == "checkpoint_stale" and artifact == "checkpoint":
+        return True
+    if artifact in required_sources:
+        return True
+    return artifact in {
+        entry.get("id")
+        for entry in impact
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
 
 
 def _maintenance_path(root: Path) -> Path:
@@ -5607,6 +5756,10 @@ def _unmanaged_preparation(root: Path, intent: str, scope: dict, override: str |
     """Give adoptable projects a no-write readiness result, never a fake run."""
     project_root = resolve_project_root(str(root))
     authorization = _scope_envelope(scope)
+    if "scope_handoff" in authorization:
+        raise EngineeringError(
+            "Preparation scope handoff requires an adopted project decision ledger."
+        )
     autonomy = override or DEFAULT_AUTONOMY
     if autonomy not in AUTONOMY_LEVELS:
         raise EngineeringError(f"Invalid Engineering autonomy: {autonomy}")
@@ -5649,6 +5802,10 @@ def prepare(
     bounded_intent = _bounded_intent(intent)
     authorization = _scope_envelope(scope)
     config = load_project_config(project.root)
+    if "scope_handoff" in authorization:
+        _validate_scope_handoff_authority(
+            project.root, project.commit, config, authorization["scope_handoff"]
+        )
     saved_autonomy = get_autonomy(project.root)
     autonomy = override or saved_autonomy
     if autonomy not in AUTONOMY_LEVELS:
@@ -5731,6 +5888,15 @@ def prepare(
         for path in required_sources
     ):
         blocker_codes.append("missing_required_source")
+    required_source_paths = (
+        {
+            path.replace("\\", "/")
+            for path in required_sources
+            if isinstance(path, str)
+        }
+        if isinstance(required_sources, list)
+        else set()
+    )
     exact_node_ids = {
         endpoint
         for edge in _exact_edges(checkpoint)
@@ -5786,7 +5952,11 @@ def prepare(
     if maintenance is not None and maintenance["counts"]["pending"]:
         advisory_codes.append("unrelated_maintenance")
         if any(
-            not item["safe"] and item["artifact"] in authorization["scope"]
+            _maintenance_blocks_preparation(
+                item,
+                required_sources=required_source_paths,
+                impact=impact,
+            )
             for item in maintenance["items"]
         ):
             blocker_codes.append("conflicting_authority")
@@ -6008,6 +6178,78 @@ def approve_checks(root: Path, *, allow_inline_code: bool = False) -> dict:
         }
     finally:
         _end_completion(project.root, operation)
+
+
+def _scope_handoff_claims(
+    root: Path, commit: str, manifest: dict, handoff: dict
+) -> dict:
+    normalized = _scope_handoff(handoff)
+    decision_digest = _decision_artifact_digest(
+        root, commit, manifest, normalized["decision_id"]
+    )
+    if normalized["decision_digest"] != decision_digest:
+        raise EngineeringError("Engineering scope approval decision artifact changed.")
+    return {
+        "repository_id": _project_contribution_digest(root),
+        "commit": commit,
+        "decision_id": normalized["decision_id"],
+        "decision_digest": normalized["decision_digest"],
+        "seed_evidence": normalized["seed_evidence"],
+        "reconstructed_scope": normalized["reconstructed_scope"],
+        "architect_scope": normalized["architect_scope"],
+        "result_scope": normalized["result_scope"],
+        "result_artifacts": normalized["result_artifacts"],
+    }
+
+
+def approve_scope_handoff(root: Path, decision_id: str, handoff: dict) -> dict:
+    """Issue one signed, commit-bound approval for a reconstructed scope handoff."""
+    project = resolve_project(Path(root))
+    manifest = load_project_config(project.root)
+    decision_id = _assurance_id(decision_id, "scope handoff decision")
+    normalized = _scope_handoff(handoff, require_approval=False)
+    decision_digest = _decision_artifact_digest(
+        project.root, project.commit, manifest, decision_id
+    )
+    approved = {
+        **normalized,
+        "decision_id": decision_id,
+        "decision_digest": decision_digest,
+    }
+    claims = _scope_handoff_claims(project.root, project.commit, manifest, {
+        **approved,
+        "approval_id": "attestation-" + "0" * 32,
+    })
+    operation = _begin_completion(
+        project.root,
+        "approve-scope-" + decision_digest.removeprefix("sha256:")[:12],
+    )
+    try:
+        controller = _project_controller_dir(project.root)
+        registry, attestation, new_key = _append_attestation(
+            controller, "scope_handoff", claims
+        )
+        _transactional_json_documents(
+            [(_attestation_path(controller), registry)],
+            [(_controller_key_path(controller), new_key)] if new_key else None,
+        )
+        approved["approval_id"] = attestation["id"]
+        return {"scope_handoff": approved, "approval_id": attestation["id"]}
+    finally:
+        _end_completion(project.root, operation)
+
+
+def _validate_scope_handoff_authority(
+    root: Path, commit: str, manifest: dict, handoff: object
+) -> dict:
+    normalized = _scope_handoff(handoff)
+    claims = _scope_handoff_claims(root, commit, manifest, normalized)
+    attestation = _require_attestation(
+        _project_controller_dir(root), "scope_handoff", claims
+    )
+    if attestation["id"] != normalized["approval_id"]:
+        raise EngineeringError("Engineering scope approval attestation is mismatched.")
+    return normalized
 
 
 def _check_environment() -> dict[str, str]:
@@ -6372,6 +6614,8 @@ def _completion_payload(
     dirty: bool,
     checks: list[dict],
     maintenance_ids: list[str],
+    scope_result: list[str] | None = None,
+    scope_result_artifacts: list[str] | None = None,
 ) -> dict:
     predicted_paths = {item["id"] for item in preparation["impact"]}
     safe_additional = [
@@ -6419,10 +6663,20 @@ def _completion_payload(
         payload["applied_practices"] = preparation["completion_applied_practices"]
     if preparation.get("completion_practice_status") is not None:
         payload["practice_status"] = preparation["completion_practice_status"]
+    if scope_result is not None:
+        payload["scope_result"] = scope_result
+    if scope_result_artifacts is not None:
+        payload["scope_result_artifacts"] = scope_result_artifacts
     return payload
 
 
-def complete(root: Path, run_id: str, receipts: list[dict]) -> dict:
+def complete(
+    root: Path,
+    run_id: str,
+    receipts: list[dict],
+    *,
+    result_scope: list[str] | None = None,
+) -> dict:
     if receipts != []:
         raise EngineeringError("Engineering caller-supplied check receipts are not accepted.")
     project = resolve_project(Path(root))
@@ -6456,6 +6710,33 @@ def complete(root: Path, run_id: str, receipts: list[dict]) -> dict:
             "dirty_tree_digest": initial_state["digest"] if dirty else None,
         }
         authorization = preparation["authorization"]
+        scope_handoff = authorization.get("scope_handoff")
+        scope_result = _scope_result(result_scope) if result_scope is not None else None
+        scope_result_artifacts = None
+        if scope_handoff is not None:
+            _validate_scope_handoff_authority(
+                project.root,
+                preparation["project"]["commit"],
+                load_project_config(project.root),
+                scope_handoff,
+            )
+            if scope_result is None and not manifest_path.is_file():
+                raise EngineeringError(
+                    "Engineering completion requires an actual scope result for the approved handoff."
+                )
+            if scope_result is not None and scope_result != scope_handoff["architect_scope"]:
+                raise EngineeringError(
+                    "Engineering completion result scope is narrow or outside the approved scope."
+                )
+            scope_result_artifacts = sorted(
+                path.replace("\\", "/") for path in changed
+            )
+            if scope_result_artifacts != scope_handoff["result_artifacts"]:
+                raise EngineeringError(
+                    "Engineering completion result artifacts are incomplete or outside the approved scope."
+                )
+        elif scope_result is not None:
+            raise EngineeringError("Engineering completion result scope has no approved handoff.")
         scope = set(authorization["scope"])
         safe_additional = [
             path
@@ -6505,6 +6786,12 @@ def complete(root: Path, run_id: str, receipts: list[dict]) -> dict:
                 raise EngineeringError(
                     "Engineering completion replay conflicts with current tree."
                 )
+            if scope_handoff is not None and scope_result is None:
+                scope_result = _scope_result(retained.get("scope_result"))
+                if scope_result != scope_handoff["architect_scope"]:
+                    raise EngineeringError(
+                        "Engineering completion manifest has a mismatched scope result."
+                    )
             expected = _completion_payload(
                 preparation,
                 changed,
@@ -6513,6 +6800,8 @@ def complete(root: Path, run_id: str, receipts: list[dict]) -> dict:
                 dirty,
                 retained["checks"],
                 maintenance_ids,
+                scope_result,
+                scope_result_artifacts,
             )
             if retained != expected:
                 raise EngineeringError("Engineering completion manifest is invalid.")
@@ -6575,6 +6864,8 @@ def complete(root: Path, run_id: str, receipts: list[dict]) -> dict:
             dirty,
             checks,
             maintenance_ids,
+            scope_result,
+            scope_result_artifacts,
         )
         if _working_state_identity(project.root) != initial_state:
             raise EngineeringError("Engineering working state changed before publication.")
@@ -6919,7 +7210,7 @@ def _is_reparse_point(path: Path) -> bool:
 
 def _engineering_user_home() -> Path:
     configured = os.environ.get("ENGINEERING_USER_HOME")
-    home = Path(configured).expanduser() if configured else Path.home()
+    home = _expand_install_path(configured) if configured else Path.home()
     if not home.is_absolute():
         raise EngineeringError("Engineering user home must be absolute.")
     if str(home).startswith("\\\\"):
@@ -7125,10 +7416,17 @@ def _verify_owner_private(path: Path, *, directory: bool) -> None:
     _windows_owner_private(path, enforce=False)
 
 
+def _enforce_install_private(path: Path) -> None:
+    """Keep POSIX test doubles from invoking Windows ACL behavior."""
+    if os.name == "nt" and sys.platform != "win32":
+        return
+    _enforce_owner_private(path)
+
+
 def _private_atomic_bytes(path: Path, content: bytes) -> None:
     _reject_reparse_ancestors(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _enforce_owner_private(path.parent)
+    _enforce_install_private(path.parent)
     _reject_reparse_ancestors(path)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -7137,7 +7435,7 @@ def _private_atomic_bytes(path: Path, content: bytes) -> None:
             target.write(content)
             target.flush()
             os.fsync(target.fileno())
-        _enforce_owner_private(temporary)
+        _enforce_install_private(temporary)
         os.replace(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -7612,6 +7910,646 @@ def validate_task_check_authority(root: Path, authority: object, claims: object)
     }
 
 
+def _scoped_authority_path(root: Path) -> Path:
+    path = _project_controller_dir(root) / "authority-ledger.json"
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _scoped_authority_values(
+    value: object, field: str, *, paths: bool = False, allow_empty: bool = False
+) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or (not value and not allow_empty)
+        or len(value) > 256
+        or any(not isinstance(item, str) or not item or len(item) > 512 for item in value)
+    ):
+        raise EngineeringError(f"Engineering scoped authority {field} is invalid.")
+    normalized = []
+    for item in value:
+        if _contains_credential(item):
+            raise EngineeringError(f"Engineering scoped authority {field} is invalid.")
+        candidate = item.replace("\\", "/") if paths else _assurance_id(item, field)
+        if paths and (Path(candidate).is_absolute() or ".." in Path(candidate).parts):
+            raise EngineeringError(f"Engineering scoped authority {field} is invalid.")
+        normalized.append(candidate)
+    return sorted(set(normalized))
+
+
+def _scoped_authority_binding(root: Path, binding: object) -> dict:
+    expected = {
+        "authority_epoch",
+        "target",
+        "action_class",
+        "scope",
+        "safeguards",
+        "native_requirements",
+        "issued_at",
+        "expires_at",
+    }
+    if not isinstance(binding, dict) or set(binding) != expected:
+        raise EngineeringError("Engineering scoped authority binding is invalid.")
+    issued = _assurance_timestamp(binding.get("issued_at"))
+    expires = _assurance_timestamp(binding.get("expires_at"))
+    now = datetime.now(timezone.utc)
+    if (
+        issued > now + timedelta(minutes=5)
+        or expires <= issued
+        or expires - issued > timedelta(days=30)
+    ):
+        raise EngineeringError("Engineering scoped authority lifetime is invalid.")
+    native = _scoped_authority_values(
+        binding.get("native_requirements"), "native requirements", allow_empty=True
+    )
+    action_class = _assurance_id(binding.get("action_class"), "authority action class")
+    if action_class in NATIVE_APPROVAL_REQUIREMENTS:
+        native = sorted(set(native) | {action_class})
+    if any(item not in NATIVE_APPROVAL_REQUIREMENTS for item in native):
+        raise EngineeringError("Engineering scoped authority native requirements are invalid.")
+    return {
+        "repository_id": _project_contribution_digest(resolve_project_root(str(root))),
+        "authority_epoch": _assurance_id(binding.get("authority_epoch"), "authority epoch"),
+        "target": _assurance_id(binding.get("target"), "authority target"),
+        "action_class": action_class,
+        "scope": _scoped_authority_values(binding.get("scope"), "scope", paths=True),
+        "safeguards": _scoped_authority_values(binding.get("safeguards"), "safeguards"),
+        "native_requirements": native,
+        "issued_at": issued.isoformat(),
+        "expires_at": expires.isoformat(),
+    }
+
+
+def _scoped_authority_signature(key: bytes, record: dict) -> str:
+    material = {name: record[name] for name in record if name != "signature"}
+    return "hmac-sha256:" + hmac.new(
+        key, _canonical_json(material), hashlib.sha256
+    ).hexdigest()
+
+
+def _authority_audit_signature(key: bytes, event: dict) -> str:
+    material = {name: event[name] for name in event if name != "signature"}
+    return "hmac-sha256:" + hmac.new(
+        key, _canonical_json(material), hashlib.sha256
+    ).hexdigest()
+
+
+def _load_scoped_authorities(root: Path) -> dict:
+    path = _scoped_authority_path(root)
+    if not path.exists():
+        return {"schema": AUTHORITY_LEDGER_SCHEMA, "authorities": [], "audits": []}
+    controller = path.parent
+    key = _controller_key(controller, required=True)
+    assert key is not None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering scoped authority ledger is invalid.") from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "authorities", "audits"}
+        or payload.get("schema") != AUTHORITY_LEDGER_SCHEMA
+        or not isinstance(payload.get("authorities"), list)
+        or not isinstance(payload.get("audits"), list)
+        or len(payload["authorities"]) > MAX_SCOPED_AUTHORITIES
+        or len(payload["audits"]) > MAX_AUTHORITY_AUDITS
+    ):
+        raise EngineeringError("Engineering scoped authority ledger is invalid.")
+    authority_ids: set[str] = set()
+    authority_fields = {
+        "schema",
+        "authority_id",
+        "repository_id",
+        "authority_epoch",
+        "target",
+        "action_class",
+        "scope",
+        "safeguards",
+        "native_requirements",
+        "approval_reference",
+        "parent_authority_id",
+        "issued_at",
+        "expires_at",
+        "status",
+        "transitioned_at",
+        "signature",
+    }
+    for record in payload["authorities"]:
+        if (
+            not isinstance(record, dict)
+            or set(record) != authority_fields
+            or record.get("schema") != SCOPED_AUTHORITY_SCHEMA
+            or not re.fullmatch(r"authority-[0-9a-f]{32}", str(record.get("authority_id", "")))
+            or record["authority_id"] in authority_ids
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(record.get("repository_id", "")))
+            or record.get("status") not in {"active", "revoked", "consumed"}
+            or (record.get("status") == "active") != (record.get("transitioned_at") is None)
+            or not hmac.compare_digest(
+                str(record.get("signature", "")), _scoped_authority_signature(key, record)
+            )
+        ):
+            raise EngineeringError("Engineering scoped authority ledger is invalid.")
+        try:
+            _assurance_id(record["authority_epoch"], "authority epoch")
+            _assurance_id(record["target"], "authority target")
+            _assurance_id(record["action_class"], "authority action class")
+            _assurance_id(record["approval_reference"], "authority approval reference")
+            native = _scoped_authority_values(
+                record["native_requirements"], "native requirements", allow_empty=True
+            )
+            _scoped_authority_values(record["scope"], "scope", paths=True)
+            _scoped_authority_values(record["safeguards"], "safeguards")
+            issued = _assurance_timestamp(record["issued_at"])
+            expires = _assurance_timestamp(record["expires_at"])
+            transitioned = (
+                _assurance_timestamp(record["transitioned_at"])
+                if record["transitioned_at"] is not None
+                else None
+            )
+        except EngineeringError as error:
+            raise EngineeringError("Engineering scoped authority ledger is invalid.") from error
+        if native != record["native_requirements"] or any(
+            item not in NATIVE_APPROVAL_REQUIREMENTS for item in native
+        ) or expires <= issued or expires - issued > timedelta(days=30) or (
+            transitioned is not None and transitioned < issued
+        ):
+            raise EngineeringError("Engineering scoped authority ledger is invalid.")
+        parent = record.get("parent_authority_id")
+        if parent is not None and not re.fullmatch(r"authority-[0-9a-f]{32}", str(parent)):
+            raise EngineeringError("Engineering scoped authority ledger is invalid.")
+        authority_ids.add(record["authority_id"])
+    audit_ids: set[str] = set()
+    audit_fields = {
+        "schema",
+        "event_id",
+        "authority_id",
+        "artifact_digest",
+        "auditor_ref",
+        "verdict",
+        "observed_at",
+        "signature",
+    }
+    for event in payload["audits"]:
+        if (
+            not isinstance(event, dict)
+            or set(event) != audit_fields
+            or event.get("schema") != AUTHORITY_AUDIT_SCHEMA
+            or not re.fullmatch(r"audit-[0-9a-f]{32}", str(event.get("event_id", "")))
+            or event["event_id"] in audit_ids
+            or event.get("authority_id") not in authority_ids
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(event.get("artifact_digest", "")))
+            or event.get("verdict") not in {"accepted", "rejected"}
+            or not hmac.compare_digest(
+                str(event.get("signature", "")), _authority_audit_signature(key, event)
+            )
+        ):
+            raise EngineeringError("Engineering scoped authority ledger is invalid.")
+        _assurance_id(event.get("auditor_ref"), "authority auditor reference")
+        _assurance_timestamp(event.get("observed_at"))
+        audit_ids.add(event["event_id"])
+    if any(
+        record["parent_authority_id"] is not None
+        and record["parent_authority_id"] not in authority_ids
+        for record in payload["authorities"]
+    ):
+        raise EngineeringError("Engineering scoped authority ledger is invalid.")
+    return payload
+
+
+def _publish_scoped_authorities(root: Path, ledger: dict, key_bytes: bytes | None) -> None:
+    path = _scoped_authority_path(root)
+    controller = path.parent
+    if (
+        len(ledger.get("authorities", [])) > MAX_SCOPED_AUTHORITIES
+        or len(ledger.get("audits", [])) > MAX_AUTHORITY_AUDITS
+        or len(json.dumps(ledger).encode("utf-8")) > 1024 * 1024
+    ):
+        raise EngineeringError("Engineering scoped authority ledger exceeds its bounded size.")
+    controller.mkdir(parents=True, exist_ok=True)
+    _enforce_owner_private(controller)
+    encoded_key = key_bytes.hex().encode("ascii") + b"\n" if key_bytes is not None else None
+    _transactional_json_documents(
+        [(path, ledger)],
+        [(_controller_key_path(controller), encoded_key)] if encoded_key is not None else None,
+    )
+
+
+def _begin_authority_mutation(root: Path, kind: str) -> dict:
+    """Acquire the shared repository lock without performing unrelated graph recovery."""
+    operation = register_hook_operation(root)
+    record = _read_operation(root, operation["operation_id"])
+    record["kind"] = kind
+    _write_operation(record)
+    deadline = time.monotonic() + 2.0
+    while not _acquire_repository_lock(record):
+        if time.monotonic() >= deadline:
+            _discard_unlocked_operation(root, record["operation_id"])
+            raise EngineeringError("Engineering scoped authority repository lock timed out.")
+        time.sleep(0.01)
+    return _read_operation(root, record["operation_id"])
+
+
+def _verify_host_authority_approval(root: Path, normalized: dict, approval: object) -> str:
+    required = {"schema", "approver", "claims", "signature"}
+    if (
+        not isinstance(approval, dict)
+        or set(approval) != required
+        or approval.get("schema") != "engineering.host-authority-approval.v1"
+        or approval.get("claims") != normalized
+        or not isinstance(approval.get("signature"), str)
+        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(approval["signature"]) > 16384
+    ):
+        raise EngineeringError("Engineering scoped authority host approval is invalid.")
+    approver = _assurance_id(approval.get("approver"), "authority host approver")
+    try:
+        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
+    except EngineeringError as error:
+        raise EngineeringError(
+            "Engineering scoped authority host approver trust is unavailable."
+        ) from error
+    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
+        raise EngineeringError("Engineering scoped authority host approver trust is invalid.")
+    material = _canonical_json(
+        {"schema": "engineering.host-authority-claims.v1", "claims": normalized}
+    )
+    with tempfile.TemporaryDirectory(prefix="engineering-host-approval-") as temporary:
+        allowed_path = Path(temporary) / "allowed_signers"
+        signature_path = Path(temporary) / "approval.sig"
+        allowed_path.write_bytes(allowed)
+        signature_path.write_text(approval["signature"], encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_path),
+                    "-I",
+                    approver,
+                    "-n",
+                    "engineering-authority",
+                    "-s",
+                    str(signature_path),
+                ],
+                input=material,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EngineeringError(
+                "Engineering scoped authority host approval verification is unavailable."
+            ) from error
+    if verified.returncode != 0:
+        raise EngineeringError("Engineering scoped authority host approval signature is invalid.")
+    return "approval-" + hashlib.sha256(_canonical_json(approval)).hexdigest()[:32]
+
+
+def persist_scoped_authority(root: Path, binding: object, approval: object) -> dict:
+    """Persist exact business authority from a retained host approval attestation."""
+    project_root = resolve_project_root(str(root))
+    normalized = _scoped_authority_binding(project_root, binding)
+    approval_id = _verify_host_authority_approval(project_root, normalized, approval)
+    operation = _begin_authority_mutation(project_root, "authority-persist")
+    try:
+        controller = _project_controller_dir(project_root)
+        ledger = _load_scoped_authorities(project_root)
+        comparable = {
+            **normalized,
+            "approval_reference": approval_id,
+            "parent_authority_id": None,
+        }
+        for retained in ledger["authorities"]:
+            if all(retained.get(name) == value for name, value in comparable.items()):
+                return dict(retained)
+        key = _controller_key(controller, required=False)
+        new_key = os.urandom(32) if key is None else None
+        key = key or new_key
+        assert key is not None
+        record = {
+            "schema": SCOPED_AUTHORITY_SCHEMA,
+            "authority_id": "authority-" + uuid.uuid4().hex,
+            **normalized,
+            "approval_reference": approval_id,
+            "parent_authority_id": None,
+            "status": "active",
+            "transitioned_at": None,
+        }
+        record["signature"] = _scoped_authority_signature(key, record)
+        ledger["authorities"].append(record)
+        ledger["authorities"].sort(key=lambda item: item["authority_id"])
+        _publish_scoped_authorities(project_root, ledger, new_key)
+        return dict(record)
+    finally:
+        _end_completion(project_root, operation)
+
+
+def _scoped_authority_request(root: Path, request: object) -> dict:
+    required = {
+        "authority_id",
+        "authority_epoch",
+        "target",
+        "action_class",
+        "scope",
+        "safeguards",
+        "permission_mode",
+        "native_requirements",
+        "continuation",
+    }
+    if not isinstance(request, dict) or set(request) != required:
+        raise EngineeringError("Engineering scoped authority request is invalid.")
+    authority_id = request.get("authority_id")
+    if authority_id is not None and not re.fullmatch(r"authority-[0-9a-f]{32}", str(authority_id)):
+        raise EngineeringError("Engineering scoped authority request is invalid.")
+    permission = request.get("permission_mode")
+    if permission not in {"full_access", "sandboxed", "unknown"}:
+        raise EngineeringError("Engineering scoped authority request is invalid.")
+    native = request.get("native_requirements")
+    if (
+        not isinstance(native, list)
+        or len(native) > len(NATIVE_APPROVAL_REQUIREMENTS)
+        or any(item not in NATIVE_APPROVAL_REQUIREMENTS for item in native)
+    ):
+        raise EngineeringError("Engineering scoped authority request is invalid.")
+    continuation = request.get("continuation")
+    if not isinstance(continuation, dict) or len(continuation) > 8 or any(
+        not isinstance(name, str)
+        or not isinstance(value, (str, int, bool))
+        or isinstance(value, str)
+        and (len(value) > 128 or _contains_credential(value))
+        for name, value in continuation.items()
+    ):
+        raise EngineeringError("Engineering scoped authority continuation is invalid.")
+    return {
+        "authority_id": authority_id,
+        "repository_id": _project_contribution_digest(resolve_project_root(str(root))),
+        "authority_epoch": _assurance_id(request.get("authority_epoch"), "authority epoch"),
+        "target": _assurance_id(request.get("target"), "authority target"),
+        "action_class": _assurance_id(request.get("action_class"), "authority action class"),
+        "scope": _scoped_authority_values(request.get("scope"), "scope", paths=True),
+        "safeguards": _scoped_authority_values(request.get("safeguards"), "safeguards"),
+        "permission_mode": permission,
+        "native_requirements": sorted(set(native)),
+    }
+
+
+def _authority_resolution(request: dict, *, reason: str, record: dict | None = None) -> dict:
+    present = record is not None and reason == "authorized"
+    native = (
+        sorted(set(request["native_requirements"]) | set(record["native_requirements"]))
+        if present and record is not None
+        else []
+    )
+    decision = "pending_native_approval" if native else "authorized" if present else "request_required"
+    binding = {
+        name: request[name]
+        for name in (
+            "repository_id",
+            "authority_epoch",
+            "target",
+            "action_class",
+            "scope",
+            "safeguards",
+        )
+    }
+    return {
+        "schema": AUTHORITY_RESOLUTION_SCHEMA,
+        "decision": decision,
+        "reason": "native_approval_required" if native else reason,
+        "authority_id": record["authority_id"] if record is not None else request["authority_id"],
+        "binding_digest": _json_digest(binding),
+        "business_authority_present": present,
+        "request_business_approval": not present,
+        "permission_mode": request["permission_mode"],
+        "native_approval_required": native,
+    }
+
+
+def resolve_scoped_authority(root: Path, request: object) -> dict:
+    project_root = resolve_project_root(str(root))
+    normalized = _scoped_authority_request(project_root, request)
+    if normalized["authority_id"] is None:
+        return _authority_resolution(normalized, reason="missing_authority")
+    ledger = _load_scoped_authorities(project_root)
+    matches = [
+        item
+        for item in ledger["authorities"]
+        if item["authority_id"] == normalized["authority_id"]
+    ]
+    if len(matches) != 1:
+        return _authority_resolution(normalized, reason="missing_authority")
+    record = matches[0]
+    if record["status"] != "active":
+        return _authority_resolution(normalized, reason=record["status"])
+    if _assurance_timestamp(record["expires_at"]) <= datetime.now(timezone.utc):
+        return _authority_resolution(normalized, reason="expired")
+    retained = {item["authority_id"]: item for item in ledger["authorities"]}
+    ancestor_id = record["parent_authority_id"]
+    visited = {record["authority_id"]}
+    while ancestor_id is not None:
+        if ancestor_id in visited or ancestor_id not in retained:
+            raise EngineeringError("Engineering scoped authority ancestry is invalid.")
+        visited.add(ancestor_id)
+        ancestor = retained[ancestor_id]
+        if ancestor["status"] != "active":
+            return _authority_resolution(
+                normalized, reason=f"ancestor_{ancestor['status']}"
+            )
+        if _assurance_timestamp(ancestor["expires_at"]) <= datetime.now(timezone.utc):
+            return _authority_resolution(normalized, reason="ancestor_expired")
+        ancestor_id = ancestor["parent_authority_id"]
+    for field in (
+        "repository_id",
+        "authority_epoch",
+        "target",
+        "action_class",
+        "scope",
+        "safeguards",
+    ):
+        if record[field] != normalized[field]:
+            return _authority_resolution(normalized, reason=f"changed_{field}")
+    return _authority_resolution(normalized, reason="authorized", record=record)
+
+
+def _delegate_scoped_authority_unlocked(root: Path, parent_id: str, binding: object) -> dict:
+    project_root = resolve_project_root(str(root))
+    if not re.fullmatch(r"authority-[0-9a-f]{32}", str(parent_id)):
+        raise EngineeringError("Engineering scoped authority parent is invalid.")
+    normalized = _scoped_authority_binding(project_root, binding)
+    ledger = _load_scoped_authorities(project_root)
+    matches = [item for item in ledger["authorities"] if item["authority_id"] == parent_id]
+    if len(matches) != 1:
+        raise EngineeringError("Engineering scoped authority parent is missing.")
+    parent = matches[0]
+    if parent["status"] != "active" or _assurance_timestamp(parent["expires_at"]) <= datetime.now(timezone.utc):
+        raise EngineeringError("Engineering scoped authority parent is not active.")
+    for field in (
+        "repository_id",
+        "authority_epoch",
+        "target",
+        "action_class",
+        "safeguards",
+        "native_requirements",
+    ):
+        if normalized[field] != parent[field]:
+            raise EngineeringError("Engineering scoped authority delegation would broaden or change authority.")
+    if not set(normalized["scope"]).issubset(parent["scope"]) or _assurance_timestamp(
+        normalized["expires_at"]
+    ) > _assurance_timestamp(parent["expires_at"]) or _assurance_timestamp(
+        normalized["issued_at"]
+    ) < _assurance_timestamp(parent["issued_at"]):
+        raise EngineeringError("Engineering scoped authority delegation would broaden authority.")
+    comparable = {
+        **normalized,
+        "approval_reference": parent["approval_reference"],
+        "parent_authority_id": parent_id,
+    }
+    for retained in ledger["authorities"]:
+        if all(retained.get(name) == value for name, value in comparable.items()):
+            return dict(retained)
+    controller = _project_controller_dir(project_root)
+    key = _controller_key(controller, required=True)
+    assert key is not None
+    record = {
+        "schema": SCOPED_AUTHORITY_SCHEMA,
+        "authority_id": "authority-" + uuid.uuid4().hex,
+        **normalized,
+        "approval_reference": parent["approval_reference"],
+        "parent_authority_id": parent_id,
+        "status": "active",
+        "transitioned_at": None,
+    }
+    record["signature"] = _scoped_authority_signature(key, record)
+    ledger["authorities"].append(record)
+    ledger["authorities"].sort(key=lambda item: item["authority_id"])
+    _publish_scoped_authorities(project_root, ledger, None)
+    return dict(record)
+
+
+def delegate_scoped_authority(root: Path, parent_id: str, binding: object) -> dict:
+    project_root = resolve_project_root(str(root))
+    operation = _begin_authority_mutation(project_root, "authority-delegate")
+    try:
+        return _delegate_scoped_authority_unlocked(project_root, parent_id, binding)
+    finally:
+        _end_completion(project_root, operation)
+
+
+def _transition_scoped_authority_unlocked(
+    root: Path, authority_id: str, transition: str, at: str
+) -> dict:
+    project_root = resolve_project_root(str(root))
+    if transition not in {"revoked", "consumed"}:
+        raise EngineeringError("Engineering scoped authority transition is invalid.")
+    changed_at = _assurance_timestamp(at).isoformat()
+    ledger = _load_scoped_authorities(project_root)
+    matches = [item for item in ledger["authorities"] if item["authority_id"] == authority_id]
+    if len(matches) != 1:
+        raise EngineeringError("Engineering scoped authority is missing.")
+    record = matches[0]
+    if record["status"] != "active":
+        if record["status"] == transition and record["transitioned_at"] == changed_at:
+            return dict(record)
+        raise EngineeringError("Engineering scoped authority is already terminal.")
+    if _assurance_timestamp(changed_at) < _assurance_timestamp(record["issued_at"]):
+        raise EngineeringError("Engineering scoped authority transition is invalid.")
+    key = _controller_key(_project_controller_dir(project_root), required=True)
+    assert key is not None
+    record["status"] = transition
+    record["transitioned_at"] = changed_at
+    record["signature"] = _scoped_authority_signature(key, record)
+    _publish_scoped_authorities(project_root, ledger, None)
+    return dict(record)
+
+
+def transition_scoped_authority(
+    root: Path, authority_id: str, transition: str, at: str
+) -> dict:
+    project_root = resolve_project_root(str(root))
+    operation = _begin_authority_mutation(project_root, "authority-transition")
+    try:
+        return _transition_scoped_authority_unlocked(
+            project_root, authority_id, transition, at
+        )
+    finally:
+        _end_completion(project_root, operation)
+
+
+def _record_authority_audit_unlocked(
+    root: Path,
+    authority_id: str,
+    artifact_digest: str,
+    auditor_ref: str,
+    verdict: str,
+    observed_at: str,
+) -> dict:
+    project_root = resolve_project_root(str(root))
+    ledger = _load_scoped_authorities(project_root)
+    if authority_id not in {item["authority_id"] for item in ledger["authorities"]}:
+        raise EngineeringError("Engineering scoped authority is missing.")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(artifact_digest)) or verdict not in {
+        "accepted",
+        "rejected",
+    }:
+        raise EngineeringError("Engineering authority audit is invalid.")
+    auditor = _assurance_id(auditor_ref, "authority auditor reference")
+    observed = _assurance_timestamp(observed_at).isoformat()
+    identity = {
+        "authority_id": authority_id,
+        "artifact_digest": artifact_digest,
+        "auditor_ref": auditor,
+    }
+    event_id = "audit-" + hashlib.sha256(_canonical_json(identity)).hexdigest()[:32]
+    matches = [item for item in ledger["audits"] if item["event_id"] == event_id]
+    if matches:
+        if (
+            len(matches) == 1
+            and matches[0]["verdict"] == verdict
+            and matches[0]["observed_at"] == observed
+        ):
+            return dict(matches[0])
+        raise EngineeringError("Engineering authority audit replay conflicts with retained evidence.")
+    key = _controller_key(_project_controller_dir(project_root), required=True)
+    assert key is not None
+    event = {
+        "schema": AUTHORITY_AUDIT_SCHEMA,
+        "event_id": event_id,
+        **identity,
+        "verdict": verdict,
+        "observed_at": observed,
+    }
+    event["signature"] = _authority_audit_signature(key, event)
+    ledger["audits"].append(event)
+    ledger["audits"].sort(key=lambda item: item["event_id"])
+    _publish_scoped_authorities(project_root, ledger, None)
+    return dict(event)
+
+
+def record_authority_audit(
+    root: Path,
+    authority_id: str,
+    artifact_digest: str,
+    auditor_ref: str,
+    verdict: str,
+    observed_at: str,
+) -> dict:
+    project_root = resolve_project_root(str(root))
+    operation = _begin_authority_mutation(project_root, "authority-audit")
+    try:
+        return _record_authority_audit_unlocked(
+            project_root,
+            authority_id,
+            artifact_digest,
+            auditor_ref,
+            verdict,
+            observed_at,
+        )
+    finally:
+        _end_completion(project_root, operation)
+
+
 def _validate_practice(practice: object) -> dict:
     if not isinstance(practice, dict) or set(practice) != PRACTICE_KEYS:
         raise EngineeringError("Engineering learning practice is invalid.")
@@ -7835,7 +8773,13 @@ def _load_attestations(controller: Path) -> dict:
             or set(record) != {"id", "kind", "nonce", "claims", "signature"}
             or not re.fullmatch(r"attestation-[0-9a-f]{32}", str(record.get("id", "")))
             or record.get("kind")
-            not in {"check_capability", "completion", "promotion", "setup"}
+            not in {
+                "check_capability",
+                "completion",
+                "promotion",
+                "setup",
+                "scope_handoff",
+            }
             or not re.fullmatch(r"[0-9a-f]{32}", str(record.get("nonce", "")))
             or not isinstance(record.get("claims"), dict)
             or record["id"] in identifiers
@@ -8398,6 +9342,13 @@ def _terminal_completion(root: Path, completion_id: str) -> tuple[dict, str]:
         ) from error
     try:
         preparation = _load_preparation(root, completion_id)
+        if "scope_handoff" in preparation["authorization"]:
+            _validate_scope_handoff_authority(
+                root,
+                preparation["project"]["commit"],
+                load_project_config(root),
+                preparation["authorization"]["scope_handoff"],
+            )
         checks = completion["checks"]
         result = completion["result_identity"]
         checkpoint = completion["checkpoint"]
@@ -8409,6 +9360,8 @@ def _terminal_completion(root: Path, completion_id: str) -> tuple[dict, str]:
             False,
             checks,
             completion["maintenance"],
+            completion.get("scope_result"),
+            completion.get("scope_result_artifacts"),
         )
         _load_checkpoint(root, checkpoint["commit"])
         valid = (
@@ -8436,6 +9389,463 @@ def _terminal_completion(root: Path, completion_id: str) -> tuple[dict, str]:
             "Engineering learning requires terminal verified completion attestation."
         ) from error
     return completion, "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+_DELIVERY_METRICS = (
+    "duration_seconds",
+    "critical_path_seconds",
+    "coordination_cost_seconds",
+    "terminal_to_reconciliation_seconds",
+    "feedback_iterations",
+    "invalidated_evidence",
+    "rework",
+    "escaped_defects",
+    "false_blockers",
+    "missed_escalations",
+    "unnecessary_orchestrator_intervention",
+    "unconsumed_terminal_event",
+    "proxy_pass_outcome_fail",
+    "audit_false_positive",
+)
+_DELIVERY_EVALUATION_MAX_ITEMS = 365
+_DELIVERY_EVALUATION_MAX_BYTES = 1_048_576
+
+
+def _delivery_evaluation_path() -> Path:
+    path = _promotion_controller_dir() / "delivery-evaluations.json"
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _delivery_label(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", value)
+        or _contains_credential(value)
+    ):
+        raise EngineeringError(f"Engineering delivery evaluation {label} is invalid.")
+    return value
+
+
+def _delivery_count(value: object, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= 604800:
+        raise EngineeringError(f"Engineering delivery evaluation {label} is invalid.")
+    return value
+
+
+def _validate_delivery_evaluation(
+    value: object,
+    *,
+    bound_terminal_evidence: set[str] | None = None,
+    bound_acceptance_evidence: set[str] | None = None,
+    allow_legacy_terminal: bool = False,
+) -> dict:
+    required = {
+        "task_id", "dod_id", "artifact_digest", "verdict", "trigger", "model", "lanes",
+        "terminal", "acceptance", *_DELIVERY_METRICS, "auditor_coverage", "non_applicable"
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise EngineeringError("Engineering delivery evaluation input is invalid.")
+    non_applicable = value["non_applicable"]
+    permitted_reasons = {*_DELIVERY_METRICS, "model.fallback"}
+    if (
+        not isinstance(non_applicable, dict)
+        or not set(non_applicable).issubset(permitted_reasons)
+    ):
+        raise EngineeringError("Engineering delivery evaluation non-applicable reasons are invalid.")
+    reasons = {
+        name: _delivery_label(reason, "non-applicable reason")
+        for name, reason in non_applicable.items()
+    }
+    model = value["model"]
+    lanes = value["lanes"]
+    coverage = value["auditor_coverage"]
+    acceptance = value["acceptance"]
+    terminal = value["terminal"]
+    terminal_keys = {
+        "artifact_identity",
+        "acceptance_state",
+        "current_gate",
+        "next_action",
+        "reconciliation_digest",
+    }
+    legacy_terminal_keys = terminal_keys - {"reconciliation_digest"}
+    valid_terminal_shape = (
+        isinstance(terminal, dict)
+        and (
+            set(terminal) == terminal_keys
+            or (allow_legacy_terminal and set(terminal) == legacy_terminal_keys)
+        )
+    )
+    if (
+        not isinstance(model, dict)
+        or set(model) != {"requested", "actual", "fallback"}
+        or not isinstance(lanes, dict)
+        or set(lanes) != {"dependencies", "parallelism"}
+        or not isinstance(coverage, dict)
+        or set(coverage) != {"planned", "completed"}
+        or not valid_terminal_shape
+        or not isinstance(acceptance, dict)
+        or set(acceptance) != {
+            "technical", "domain", "outcome", "operating_interface", "operating_environment",
+            "representative_data", "outcome_evidence_digest", "representative_data_evidence_digest", "gate"
+        }
+    ):
+        raise EngineeringError("Engineering delivery evaluation input is invalid.")
+    fallback = model["fallback"]
+    if fallback is None:
+        if "model.fallback" not in reasons:
+            raise EngineeringError("Engineering delivery evaluation fallback reason is required.")
+    elif "model.fallback" in reasons:
+        raise EngineeringError("Engineering delivery evaluation fallback reason is invalid.")
+    else:
+        fallback = _delivery_label(fallback, "fallback model")
+    normalized_terminal = {
+        "artifact_identity": terminal["artifact_identity"],
+        "acceptance_state": _delivery_label(terminal["acceptance_state"], "terminal acceptance state"),
+        "current_gate": _delivery_label(terminal["current_gate"], "terminal current gate"),
+        "next_action": _delivery_label(terminal["next_action"], "terminal next action"),
+    }
+    if "reconciliation_digest" in terminal:
+        normalized_terminal["reconciliation_digest"] = terminal["reconciliation_digest"]
+    normalized = {
+        "task_id": _delivery_label(value["task_id"], "task identity"),
+        "dod_id": _delivery_label(value["dod_id"], "DoD identity"),
+        "artifact_digest": value["artifact_digest"],
+        "verdict": value["verdict"],
+        "trigger": _delivery_label(value["trigger"], "trigger"),
+        "model": {
+            "requested": _delivery_label(model["requested"], "requested model"),
+            "actual": _delivery_label(model["actual"], "actual model"),
+            "fallback": fallback,
+        },
+        "terminal": normalized_terminal,
+        "acceptance": {
+            "technical": _delivery_label(acceptance["technical"], "technical acceptance"),
+            "domain": _delivery_label(acceptance["domain"], "domain acceptance"),
+            "outcome": _delivery_label(acceptance["outcome"], "outcome acceptance"),
+            "operating_interface": _delivery_label(acceptance["operating_interface"], "operating interface"),
+            "operating_environment": _delivery_label(acceptance["operating_environment"], "operating environment"),
+            "representative_data": _delivery_label(acceptance["representative_data"], "representative data"),
+            "outcome_evidence_digest": acceptance["outcome_evidence_digest"],
+            "representative_data_evidence_digest": acceptance["representative_data_evidence_digest"],
+            "gate": _delivery_label(acceptance["gate"], "acceptance gate"),
+        },
+        "lanes": {
+            "dependencies": _delivery_count(lanes["dependencies"], "lane dependencies"),
+            "parallelism": _delivery_count(lanes["parallelism"], "lane parallelism", minimum=1),
+        },
+        "auditor_coverage": {
+            "planned": _delivery_count(coverage["planned"], "auditor coverage"),
+            "completed": _delivery_count(coverage["completed"], "auditor coverage"),
+        },
+        "non_applicable": dict(sorted(reasons.items())),
+    }
+    if (
+        not re.fullmatch(r"sha256:[0-9a-f]{64}", str(normalized["artifact_digest"]))
+        or normalized["verdict"] != "accepted_exact_artifact"
+        or normalized["terminal"]["artifact_identity"] != normalized["artifact_digest"]
+        or normalized["terminal"]["acceptance_state"] != normalized["verdict"]
+        or (
+            "reconciliation_digest" in normalized["terminal"]
+            and not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(normalized["terminal"]["reconciliation_digest"]),
+            )
+        )
+    ):
+        raise EngineeringError("Engineering delivery evaluation identity is invalid.")
+    if normalized["auditor_coverage"]["completed"] > normalized["auditor_coverage"]["planned"]:
+        raise EngineeringError("Engineering delivery evaluation auditor coverage is invalid.")
+    if (
+        any(normalized["acceptance"][name] not in {"passed", "failed", "unknown"} for name in ("technical", "domain", "outcome"))
+        or normalized["acceptance"]["operating_interface"] not in {"ui", "cli", "api", "file", "service", "device", "workflow"}
+        or normalized["acceptance"]["operating_environment"] not in {"local", "staging", "production", "user_environment"}
+        or normalized["acceptance"]["representative_data"] not in {"verified", "missing", "unknown"}
+        or normalized["acceptance"]["gate"] not in {"accepted", "failed"}
+        or (
+            normalized["acceptance"]["outcome"] == "passed"
+            and normalized["acceptance"]["representative_data"] != "verified"
+        )
+    ):
+        raise EngineeringError("Engineering delivery evaluation acceptance is invalid.")
+    for name in ("outcome_evidence_digest", "representative_data_evidence_digest"):
+        evidence = normalized["acceptance"][name]
+        if evidence is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", str(evidence)):
+            raise EngineeringError("Engineering delivery evaluation acceptance evidence is invalid.")
+    if (
+        (normalized["acceptance"]["outcome"] == "unknown")
+        != (normalized["acceptance"]["outcome_evidence_digest"] is None)
+        or (normalized["acceptance"]["representative_data"] == "verified")
+        != (normalized["acceptance"]["representative_data_evidence_digest"] is not None)
+    ):
+        raise EngineeringError("Engineering delivery evaluation acceptance evidence is invalid.")
+    if bound_terminal_evidence is not None or bound_acceptance_evidence is not None:
+        if (
+            "reconciliation_digest" not in normalized["terminal"]
+            or bound_terminal_evidence is None
+            or normalized["terminal"]["reconciliation_digest"] not in bound_terminal_evidence
+        ):
+            raise EngineeringError(
+                "Engineering delivery evaluation terminal evidence is not controller-bound."
+            )
+        for name in ("outcome_evidence_digest", "representative_data_evidence_digest"):
+            evidence = normalized["acceptance"][name]
+            if (
+                evidence is not None
+                and (
+                    bound_acceptance_evidence is None
+                    or evidence not in bound_acceptance_evidence
+                )
+            ):
+                raise EngineeringError(
+                    "Engineering delivery evaluation acceptance evidence is not controller-bound."
+                )
+    accepted = all(normalized["acceptance"][name] == "passed" for name in ("technical", "domain", "outcome")) and normalized["acceptance"]["representative_data"] == "verified"
+    if normalized["acceptance"]["gate"] != ("accepted" if accepted else "failed"):
+        raise EngineeringError("Engineering delivery evaluation acceptance gate is invalid.")
+    for name in _DELIVERY_METRICS:
+        item = value[name]
+        if item is None:
+            if name not in reasons:
+                raise EngineeringError("Engineering delivery evaluation non-applicable reason is required.")
+            normalized[name] = None
+        elif name in reasons:
+            raise EngineeringError("Engineering delivery evaluation non-applicable reason is invalid.")
+        else:
+            normalized[name] = _delivery_count(item, name)
+    if normalized["unconsumed_terminal_event"] not in {0, 1}:
+        raise EngineeringError("Engineering delivery evaluation terminal event is invalid.")
+    expected_proxy_failure = int(
+        normalized["acceptance"]["technical"] == "passed"
+        and normalized["acceptance"]["outcome"] == "failed"
+    )
+    expected_audit_false_positive = int(
+        expected_proxy_failure
+        and normalized["acceptance"]["domain"] == "passed"
+    )
+    if (
+        normalized["proxy_pass_outcome_fail"] != expected_proxy_failure
+        or normalized["audit_false_positive"] != expected_audit_false_positive
+        or (
+            normalized["audit_false_positive"]
+            and normalized["auditor_coverage"]["completed"] == 0
+        )
+    ):
+        raise EngineeringError("Engineering delivery evaluation proxy signal is invalid.")
+    if normalized["critical_path_seconds"] is not None and normalized["duration_seconds"] is not None and normalized["critical_path_seconds"] > normalized["duration_seconds"]:
+        raise EngineeringError("Engineering delivery evaluation critical path is invalid.")
+    if normalized["coordination_cost_seconds"] is not None and normalized["duration_seconds"] is not None and normalized["coordination_cost_seconds"] > normalized["duration_seconds"]:
+        raise EngineeringError("Engineering delivery evaluation coordination cost is invalid.")
+    return normalized
+
+
+def _delivery_artifact_digest(completion: dict) -> str:
+    try:
+        return _json_digest({
+            "changed_artifacts": completion["changed_artifacts"],
+            "result_identity": completion["result_identity"],
+        })
+    except (KeyError, TypeError):
+        raise EngineeringError("Engineering delivery evaluation exact artifact is unavailable.") from None
+
+
+def _delivery_evaluation_signature(key: bytes, record: dict) -> str:
+    material = {name: value for name, value in record.items() if name != "signature"}
+    return "hmac-sha256:" + hmac.new(key, _canonical_json(material), hashlib.sha256).hexdigest()
+
+
+def _delivery_evaluation_bytes(payload: dict) -> int:
+    return len(json.dumps(payload, indent=2).encode("utf-8") + b"\n")
+
+
+def _load_delivery_evaluations() -> dict:
+    path = _delivery_evaluation_path()
+    if not path.exists():
+        return {
+            "schema": "engineering.delivery-evaluations.v1",
+            "items": [],
+            "sequences": {},
+            "next_sequence": 1,
+        }
+    _verify_owner_private(path, directory=False)
+    if path.stat().st_size > _DELIVERY_EVALUATION_MAX_BYTES:
+        raise EngineeringError("Engineering delivery evaluation ledger exceeds its bounded size.")
+    key = _controller_key(_promotion_controller_dir(), required=True)
+    assert key is not None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering delivery evaluation ledger is invalid.") from error
+    identifiers: set[str] = set()
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "items", "sequences", "next_sequence"}
+        or payload["schema"] != "engineering.delivery-evaluations.v1"
+        or not isinstance(payload["items"], list)
+        or not isinstance(payload["sequences"], dict)
+        or isinstance(payload["next_sequence"], bool)
+        or not isinstance(payload["next_sequence"], int)
+    ):
+        raise EngineeringError("Engineering delivery evaluation ledger is invalid.")
+    for record in payload["items"]:
+        try:
+            valid = (
+                isinstance(record, dict)
+                and set(record) == {"schema", "id", "project_digest", "completion_id", "completion_digest", "input", "signature"}
+                and record["schema"] == "engineering.delivery-evaluation.v1"
+                and re.fullmatch(r"delivery-eval-[0-9a-f]{12}", str(record["id"]))
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", str(record["project_digest"]))
+                and re.fullmatch(r"run-[0-9a-f]{6}", str(record["completion_id"]))
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", str(record["completion_digest"]))
+                and _validate_delivery_evaluation(
+                    record["input"], allow_legacy_terminal=True
+                ) == record["input"]
+                and record["id"] not in identifiers
+                and hmac.compare_digest(str(record["signature"]), _delivery_evaluation_signature(key, record))
+            )
+        except (KeyError, TypeError, EngineeringError):
+            valid = False
+        if not valid:
+            raise EngineeringError("Engineering delivery evaluation ledger is invalid.")
+        identifiers.add(record["id"])
+    if (
+        set(payload["sequences"]) != identifiers
+        or any(
+            isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1
+            for sequence in payload["sequences"].values()
+        )
+        or len(set(payload["sequences"].values())) != len(identifiers)
+        or payload["next_sequence"] <= max(payload["sequences"].values(), default=0)
+        or len(payload["items"]) > _DELIVERY_EVALUATION_MAX_ITEMS
+        or _delivery_evaluation_bytes(payload) > _DELIVERY_EVALUATION_MAX_BYTES
+    ):
+        raise EngineeringError("Engineering delivery evaluation ledger exceeds its bounded limits.")
+    return payload
+
+
+def record_delivery_evaluation(root: Path, completion_id: str, value: object) -> dict:
+    project = resolve_project(Path(root))
+    completion, completion_digest = _terminal_completion(project.root, completion_id)
+    project_digest = _project_contribution_digest(project.root)
+    bound_acceptance_evidence = {
+        receipt["output_digest"]
+        for receipt in completion.get("checks", [])
+        if isinstance(receipt, dict)
+        and isinstance(receipt.get("output_digest"), str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", receipt["output_digest"])
+    }
+    normalized = _validate_delivery_evaluation(
+        value,
+        bound_terminal_evidence={completion_digest},
+        bound_acceptance_evidence=bound_acceptance_evidence,
+    )
+    if normalized["terminal"]["reconciliation_digest"] != completion_digest:
+        raise EngineeringError(
+            "Engineering delivery evaluation terminal evidence is not controller-bound."
+        )
+    if normalized["artifact_digest"] != _delivery_artifact_digest(completion):
+        raise EngineeringError("Engineering delivery evaluation exact artifact is invalid.")
+    identifier = "delivery-eval-" + hashlib.sha256(
+        f"{project_digest}\0{completion_id}\0{completion_digest}".encode("ascii")
+    ).hexdigest()[:12]
+    record = {
+        "schema": "engineering.delivery-evaluation.v1",
+        "id": identifier,
+        "project_digest": project_digest,
+        "completion_id": completion_id,
+        "completion_digest": completion_digest,
+        "input": normalized,
+    }
+    lock = _contribution_lock_path()
+    lock_owner = _acquire_directory_lock(lock, "Engineering delivery evaluation update is already in progress.")
+    try:
+        ledger = _load_delivery_evaluations()
+        existing = next((item for item in ledger["items"] if item["id"] == identifier), None)
+        if existing is not None:
+            if {name: item for name, item in existing.items() if name != "signature"} != record:
+                raise EngineeringError("Engineering delivery evaluation replay conflicts with retained state.")
+            return dict(existing)
+        controller = _promotion_controller_dir()
+        key = _controller_key(controller, required=False)
+        new_key = os.urandom(32) if key is None else None
+        key = key or new_key
+        assert key is not None
+        record["signature"] = _delivery_evaluation_signature(key, record)
+        ledger["items"].append(record)
+        ledger["sequences"][record["id"]] = ledger["next_sequence"]
+        ledger["next_sequence"] += 1
+        ledger["items"].sort(key=lambda item: ledger["sequences"][item["id"]])
+        while (
+            len(ledger["items"]) > _DELIVERY_EVALUATION_MAX_ITEMS
+            or _delivery_evaluation_bytes(ledger) > _DELIVERY_EVALUATION_MAX_BYTES
+        ):
+            if len(ledger["items"]) == 1:
+                raise EngineeringError("Engineering delivery evaluation exceeds its bounded size.")
+            removed = ledger["items"].pop(0)
+            del ledger["sequences"][removed["id"]]
+        _transactional_json_documents(
+            [(_delivery_evaluation_path(), ledger)],
+            [(_controller_key_path(controller), new_key.hex().encode("ascii") + b"\n")]
+            if new_key else None,
+        )
+        return dict(record)
+    finally:
+        _release_directory_lock(lock, lock_owner)
+
+
+def delivery_trends(window: int = 30) -> dict:
+    if isinstance(window, bool) or not isinstance(window, int) or not 1 <= window <= 365:
+        raise EngineeringError("Engineering delivery trend window is invalid.")
+    ledger = _load_delivery_evaluations()
+    ordered = sorted(ledger["items"], key=lambda item: ledger["sequences"][item["id"]])
+    verified_ordered = [
+        record
+        for record in ordered
+        if "reconciliation_digest" in record["input"].get("terminal", {})
+    ]
+    legacy_record_count = len(ordered) - len(verified_ordered)
+    latest = verified_ordered[-1] if verified_ordered else None
+    cohort = (
+        {"task_id": latest["input"]["task_id"], "dod_id": latest["input"]["dod_id"]}
+        if latest is not None else None
+    )
+    records = [
+        record for record in verified_ordered
+        if cohort is not None
+        and record["input"]["task_id"] == cohort["task_id"]
+        and record["input"]["dod_id"] == cohort["dod_id"]
+    ][-window:]
+    metric_names = (*_DELIVERY_METRICS, "lane_dependencies", "lane_parallelism", "auditors_planned", "auditors_completed")
+    values = {name: [] for name in metric_names}
+    models: dict[str, int] = {}
+    for record in records:
+        value = record["input"]
+        for name in _DELIVERY_METRICS:
+            if value[name] is not None:
+                values[name].append(value[name])
+        values["lane_dependencies"].append(value["lanes"]["dependencies"])
+        values["lane_parallelism"].append(value["lanes"]["parallelism"])
+        values["auditors_planned"].append(value["auditor_coverage"]["planned"])
+        values["auditors_completed"].append(value["auditor_coverage"]["completed"])
+        models[value["model"]["actual"]] = models.get(value["model"]["actual"], 0) + 1
+    return {
+        "schema": "engineering.delivery-trends.v1",
+        "window": window,
+        "status": "ready" if len(records) >= 2 else "insufficient_sample",
+        "cohort": cohort,
+        "record_count": len(records),
+        "legacy_record_count": legacy_record_count,
+        "models": [{"actual": name, "count": models[name]} for name in sorted(models)],
+        "metrics": {
+            name: {"count": len(items), "sum": sum(items), "average": (sum(items) / len(items) if items else None)}
+            for name, items in values.items()
+        },
+        "rates": {
+            name: (sum(values[name]) / len(values[name]) if values[name] else None)
+            for name in ("proxy_pass_outcome_fail", "audit_false_positive")
+        },
+    }
 
 
 def propose_learning(
@@ -8924,7 +10334,7 @@ def _reject_reparse_ancestors(path: Path, boundary: Path | None = None) -> None:
 
 
 def _bundle_files(source: Path) -> tuple[list[Path], dict, str, str]:
-    source = Path(source).expanduser()
+    source = _expand_install_path(source)
     _reject_reparse_ancestors(source)
     source = source.resolve()
     if not source.is_dir() or _is_reparse_point(source):
@@ -8933,13 +10343,13 @@ def _bundle_files(source: Path) -> tuple[list[Path], dict, str, str]:
         if _is_reparse_point(path):
             raise EngineeringError("Engineering bundle contains a link/reparse point.")
     required = {
-        Path("SKILL.md"),
-        Path("manifest.json"),
-        Path("scripts/engineering.py"),
-        Path("references/controller-contract.md"),
+        PurePosixPath("SKILL.md"),
+        PurePosixPath("manifest.json"),
+        PurePosixPath("scripts/engineering.py"),
+        PurePosixPath("references/controller-contract.md"),
     }
     try:
-        repository = Path(git(source, "rev-parse", "--show-toplevel")).resolve()
+        repository = _expand_install_path(git(source, "rev-parse", "--show-toplevel")).resolve()
         commit = git(source, "rev-parse", "HEAD")
         relative_source = source.relative_to(repository).as_posix()
         tracked = git(repository, "ls-files", "--", relative_source).splitlines()
@@ -8959,7 +10369,7 @@ def _bundle_files(source: Path) -> tuple[list[Path], dict, str, str]:
     for tracked_path in tracked:
         if not tracked_path.startswith(prefix):
             continue
-        relative = Path(tracked_path.removeprefix(prefix))
+        relative = PurePosixPath(tracked_path.removeprefix(prefix))
         candidate = source / relative
         if not candidate.is_file() or _is_reparse_point(candidate):
             raise EngineeringError("Engineering bundle source closure is invalid.")
@@ -9087,8 +10497,11 @@ def _valid_command_launchers(path: Path) -> bool:
     )
 
 
-def _register_windows_command_directory(directory: Path) -> None:
+def _register_windows_command_directory(install_home: Path, directory: Path) -> None:
     """Add Engineering's single managed command directory to the user PATH."""
+    normalize = lambda path: os.path.normcase(os.path.normpath(str(path)))
+    if normalize(install_home) != normalize(Path.home().resolve()):
+        return
     import winreg
 
     normalized = os.path.normcase(os.path.normpath(str(directory)))
@@ -9333,10 +10746,20 @@ def _transactional_replace(
                 _remove_install_path(backup)
 
 
+def _expand_install_path(value: Path | str) -> Path:
+    """Expand user paths without re-factorying a Path under a mocked os.name."""
+    if isinstance(value, Path):
+        return value.expanduser()
+    expanded = os.path.expanduser(os.fspath(value))
+    if os.name == "nt" and sys.platform != "win32" and expanded.startswith("/"):
+        return PosixPath(expanded)
+    return Path(expanded)
+
+
 def install_bundle(source: Path, home: Path) -> dict:
-    source = Path(source).expanduser()
-    home = Path(home).expanduser()
-    if not home.is_absolute():
+    source = _expand_install_path(source)
+    home = _expand_install_path(home)
+    if not home.is_absolute() and not os.path.isabs(os.path.expanduser(os.fspath(home))):
         raise EngineeringError("Engineering install home must be absolute.")
     if str(home).startswith("\\\\"):
         raise EngineeringError("Engineering installation on UNC paths is unsupported.")
@@ -9367,8 +10790,6 @@ def install_bundle(source: Path, home: Path) -> dict:
                 and _valid_forwarder(paths["shim"], "engineering-traceability")
                 and _valid_command_launchers(paths["command"])
             ):
-                if os.name == "nt":
-                    _register_windows_command_directory(paths["command"])
                 return current
         elif any(paths[key].exists() for key in ("canonical", "previous", "previous_receipt")):
             raise EngineeringError("Engineering install state is incomplete.")
@@ -9411,8 +10832,8 @@ def install_bundle(source: Path, home: Path) -> dict:
             replacements,
             token,
             after_publication=(
-                lambda: _register_windows_command_directory(paths["command"])
-                if os.name == "nt"
+                lambda: _register_windows_command_directory(home, paths["command"])
+                if current is None and os.name == "nt"
                 else None
             ),
         )
@@ -9424,8 +10845,8 @@ def install_bundle(source: Path, home: Path) -> dict:
 
 
 def rollback_install(home: Path) -> dict:
-    home = Path(home).expanduser()
-    if not home.is_absolute():
+    home = _expand_install_path(home)
+    if not home.is_absolute() and not os.path.isabs(os.path.expanduser(os.fspath(home))):
         raise EngineeringError("Engineering install home must be absolute.")
     if str(home).startswith("\\\\"):
         raise EngineeringError("Engineering installation on UNC paths is unsupported.")
@@ -9475,11 +10896,6 @@ def rollback_install(home: Path) -> dict:
                 "canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"
             )],
             token,
-            after_publication=(
-                lambda: _register_windows_command_directory(paths["command"])
-                if os.name == "nt"
-                else None
-            ),
         )
         return restored
     finally:
@@ -10199,9 +11615,14 @@ def main() -> int:
     complete_parser = commands.add_parser("complete")
     complete_parser.add_argument("root")
     complete_parser.add_argument("run_id")
+    complete_parser.add_argument("--result-scope", action="append")
     approve_checks_parser = commands.add_parser("approve-checks")
     approve_checks_parser.add_argument("root")
     approve_checks_parser.add_argument("--allow-inline-code", action="store_true")
+    approve_scope_parser = commands.add_parser("approve-scope")
+    approve_scope_parser.add_argument("root")
+    approve_scope_parser.add_argument("--decision-id", required=True)
+    approve_scope_parser.add_argument("--handoff-file", required=True)
     assurance_parser = commands.add_parser("assurance-status")
     assurance_parser.add_argument("root")
     assurance_parser.add_argument("capability_id")
@@ -10240,6 +11661,12 @@ def main() -> int:
     learning_disable.add_argument("--confirm", required=True)
     learning_source = commands.add_parser("learning-source-proposal")
     learning_source.add_argument("candidate_id")
+    delivery_eval = commands.add_parser("delivery-eval")
+    delivery_eval.add_argument("root")
+    delivery_eval.add_argument("completion_id")
+    delivery_eval.add_argument("--input-file", required=True)
+    delivery_trends_parser = commands.add_parser("delivery-trends")
+    delivery_trends_parser.add_argument("--window", type=int, default=30)
     arguments = parser.parse_args()
     try:
         if arguments.command == "_graph-worker":
@@ -10324,12 +11751,23 @@ def main() -> int:
                 print(json.dumps(result))
                 return 1 if arguments.command == "setup" else 0
             root = resolve_project_root(arguments.root)
-        elif not arguments.command.startswith("learning-"):
+        elif arguments.command != "delivery-trends" and not arguments.command.startswith("learning-"):
             root = resolve_project_root(arguments.root)
         if arguments.command.startswith("learning-"):
             print(json.dumps(result))
             return 0
-        if arguments.command == "autonomy":
+        if arguments.command == "delivery-trends":
+            result = delivery_trends(arguments.window)
+        elif arguments.command == "delivery-eval":
+            try:
+                source = sys.stdin.read() if arguments.input_file == "-" else Path(arguments.input_file).read_text(encoding="utf-8")
+                if len(source.encode("utf-8")) > 64 * 1024:
+                    raise ValueError
+                value = json.loads(source)
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+                raise EngineeringError("Engineering delivery evaluation input is invalid.") from error
+            result = record_delivery_evaluation(root, arguments.completion_id, value)
+        elif arguments.command == "autonomy":
             result = set_autonomy(root, arguments.level)
         elif arguments.command == "setup":
             result = setup(root, arguments.graphify_python)
@@ -10346,10 +11784,28 @@ def main() -> int:
             )
         elif arguments.command == "approve-checks":
             result = approve_checks(root, allow_inline_code=arguments.allow_inline_code)
+        elif arguments.command == "approve-scope":
+            try:
+                source = (
+                    sys.stdin.read()
+                    if arguments.handoff_file == "-"
+                    else Path(arguments.handoff_file).read_text(encoding="utf-8")
+                )
+                if len(source.encode("utf-8")) > 64 * 1024:
+                    raise ValueError
+                handoff = json.loads(source)
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+                raise EngineeringError("Engineering scope handoff JSON is invalid.") from error
+            result = approve_scope_handoff(root, arguments.decision_id, handoff)
         elif arguments.command == "assurance-status":
             result = assurance_status(root, arguments.capability_id, arguments.cell_id, arguments.as_of)
         elif arguments.command == "complete":
-            result = complete(root, arguments.run_id, [])
+            result = complete(
+                root,
+                arguments.run_id,
+                [],
+                result_scope=arguments.result_scope,
+            )
         elif arguments.command == "prepare":
             try:
                 if arguments.scope_file is not None:

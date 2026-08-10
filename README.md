@@ -10,6 +10,93 @@ setup, establish or reconstruct a baseline, prepare bounded work, then verify
 and complete it. Missing or contradictory evidence remains **Unknown**. It
 does not alter a project, publish code, or make a live decision automatically.
 
+## Native delivery
+
+Start with the orchestrator. It classifies the task, definition of done,
+dependencies, and risk triggers, then uses the host's native task DAG. It fans
+out independent work only when beneficial, assigns one writer per shared
+mutable resource, and receives observable state from direct implementer-
+designer feedback. Consequential lanes can carry an independent auditor.
+Engineering does not replace Codex or Claude, remove their tools, context,
+permissions, or autonomy, or impose an artificial concurrency limit.
+
+User input and feedback start the investigation; they do not define the whole
+scope by themselves. Before dispatch, the orchestrator reconstructs the
+available decision history, approved intent, dependencies, adjacent flows, and
+bounded workspace state. Architecture/design and SME work investigates root
+causes and adjacent omissions and maps both the reported symptom and those
+findings to acceptance. Dispatch that investigation first; only its
+architect-approved scope goes to the implementer. The orchestrator rejects
+symptom-only handoffs and narrow, incomplete, or proxy-only results, even when
+the literal symptom appears fixed.
+
+For a consequential feedback handoff, the native controller can carry the
+bounded `scope_handoff` envelope: seed evidence, reconstructed scope,
+architect-approved scope, result scope, expected result artifacts, and a
+commit-bound signed approval over an exact decision-ledger artifact must be
+explicit. Completion compares observed changed artifacts to that signed set.
+Missing or
+self-attested approval, or a narrow result, fails closed; this is a contract
+on the host-native task flow, not a second orchestration runtime.
+
+The orchestrator integrates accepted lane results and independently accepts or
+rejects the exact integrated artifact. A lane result or stale artifact is not
+acceptance. Material feedback identifies affected requirements and invalidated
+evidence; unrelated evidence remains usable.
+
+Model choice remains with the caller and native platform. When delivery
+evaluation is used, requested, actual, and fallback model facts are recorded
+without prescribing a provider, model family, reasoning level, or task
+topology. Material decision review asks whether the concept should exist and
+whether doing nothing is better. The narrowest technical or functional SME is
+used when material risk or domain impact could change design, business rules,
+ownership, KPIs, or acceptance. Current primary web research is allowed for
+external facts, but facts, assumptions, citations, and Unknowns stay separate;
+organization-specific details are never invented.
+
+Owner-private delivery evaluations retain trigger decisions, requested and
+actual models, fallback, dependency and parallelism data, feedback/rework,
+auditor coverage, escaped defects, false blockers, and trends. A missing or
+non-applicable item carries a reason. Recommendations remain local to the
+user's harness and cannot silently modify the upstream Engineering Skill.
+Before a parent lane reports active, complete, or awaiting approval, its
+orchestrator consumes each native child terminal event and records the exact
+artifact identity, acceptance state, current gate, and next action. The
+owner-private evaluation ledger retains the newest 365 records within 1 MiB;
+it records terminal reconciliation latency and unconsumed-event signals.
+Trends use the latest comparable task/DoD cohort and return
+`insufficient_sample` when fewer than two records are comparable.
+Automated, build, technical, and visual checks are necessary evidence, never
+product acceptance by themselves. Every delivery separately records technical,
+domain/semantic, and end-to-end outcome acceptance against representative data
+through the actual consumer interface/environment; missing data or outcome evidence is
+`unknown` and fails the acceptance gate. The interface may be a CLI, API, file,
+or other real consumer--not necessarily a UI. Proxy-pass/outcome-fail and audit
+false-positive signals keep a high technical score from implying acceptance.
+Accepted outcomes retain bounded outcome and representative-data evidence
+digests bound to validated completion/check receipts; unbound claims are
+rejected, and an audit false positive requires completed audit coverage.
+Historical pre-binding evaluation records remain readable but are not upgraded
+into current acceptance evidence during migration or current trend cohorts.
+LangGraph is intentionally absent: add a runtime only after a demonstrated gap
+in native task semantics and separate architecture approval.
+
+## Scoped authority in 2.2.4
+
+Engineering now distinguishes business-authority presence from whether approval
+must be requested again. A controller-signed project-local record keeps exact
+authority across unchanged turns, retries, callbacks, and bounded repair
+epochs. It is bound to repository lineage, authority epoch, target, action
+class, scope, and safeguards. Missing, revoked, consumed, expired, or changed
+bindings require new business authority.
+
+Full Access remains a native technical permission, not business approval.
+Native destructive, connector, credential, and system approvals remain
+mandatory even when business authority is present. Delegation can only narrow
+authority, and signed exact-artifact audit history remains evidence rather than
+authority. Codex and Claude continue to use one canonical skill without losing
+native tools, context, permissions, autonomy, or concurrency.
+
 ## How it works
 
 For a greenfield repository, Engineering assesses the local Git state, previews
@@ -56,8 +143,12 @@ local inspection, run `engineering --help`, then use `engineering map`,
 `engineering assurance-status <root> <capability> <cell>`,
 `engineering retrospect <root>`, or `engineering maintain status` as
 appropriate. `engineering autonomy <level> [root]` changes the saved level; it
-is not an inspection command. On Windows, installation adds its one managed
-command directory to the user PATH; open a new terminal after first install.
+is not an inspection command. On Windows, only an install into the active
+operating-system user's home adds its managed command directory to user `PATH`
+and the current process. A new terminal may still be required. Temporary or
+custom-home installs, replay, upgrade, and rollback never mutate either `PATH`.
+Version 2.2.3 prevents new test-home pollution; it does not remove arbitrary
+historical entries.
 
 Setup approval, `prepare`/`complete`, hooks, checkpoint/rebuild, and the
 learning lifecycle are controller or CI operations—not routine user commands.
@@ -71,6 +162,16 @@ learning lifecycle are controller or CI operations—not routine user commands.
 All levels still need explicit approval for setup, dependencies, public or
 persisted contracts, publication, merge, deployment, security, credentials,
 financial decisions, destructive work, and ambiguity.
+
+Traceability debt is explicit but proportionate. Historical or advisory gaps
+remain visible while unrelated work proceeds. A native orchestrator may launch
+disjoint maintenance in parallel; shared-ledger mutations and overlapping
+writers serialize under the existing repository lock. Preparation blocks only
+when checkpoint identity/integrity, required
+current-contract evidence, or a selected graph/release acceptance is at risk.
+Authoritative-ledger and deterministic-overlay parity remains a blocking gate
+for graph-dependent acceptance. This uses native task events and the existing
+evaluation ledger, not a scheduler or another state machine.
 
 ## What ships in 2.2
 
@@ -94,6 +195,12 @@ outputs, and optional host-LLM cost; rerun with `--preview-digest` to audit. It
 reports evidence classifications, declared matrix cells, and ledger/overlay drift. Optional host
 LLM reconciliation receives only that bounded source list and remains advisory;
 the controller never invokes an LLM or writes remediation.
+
+Version 2.2.3 adds the native delivery policy and bounded owner-private
+evaluation/trend records. Upgrade and rollback replace only validated skill,
+loader, launcher, and receipt surfaces; they preserve applied-learning queues,
+applied practices, attestations, keys, graph/checkpoint state, and other local
+overlays. Neither operation activates a project, connector, hook, or schedule.
 
 ## Scale and limits
 

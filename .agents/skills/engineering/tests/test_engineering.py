@@ -15,13 +15,14 @@ import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PosixPath
 from unittest.mock import Mock, patch
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SKILL = SKILL_DIR / "SKILL.md"
 MANIFEST = SKILL_DIR / "manifest.json"
+SCENARIOS = SKILL_DIR / "tests" / "scenarios.json"
 ENGINEERING_SCRIPT = SKILL_DIR / "scripts" / "engineering.py"
 V1_SCRIPT = (
     Path.home()
@@ -169,6 +170,75 @@ class SkillShapeTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, contract)
+
+    def test_portable_policy_and_scenarios_are_executable_contracts(self):
+        scenario_payload = json.loads(SCENARIOS.read_text(encoding="utf-8"))
+        scenarios = {
+            item["id"]: item
+            for item in scenario_payload["scenarios"]
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        for identifier in ("seed-feedback-scope", "traceability-debt-maintenance"):
+            with self.subTest(identifier=identifier):
+                self.assertIn(identifier, scenarios)
+                self.assertTrue(scenarios[identifier]["must"])
+                self.assertTrue(scenarios[identifier]["must_not"])
+        behavior = {
+            "seed-feedback-scope": (
+                Task5ContractTests,
+                ("test_seed_feedback_scope_handoff_uses_signed_approval_and_completion",),
+            ),
+            "traceability-debt-maintenance": (
+                Task6ContractTests,
+                (
+                    "test_unrelated_blocked_maintenance_is_advisory_even_when_in_scope",
+                    "test_queued_maintenance_serializes_shared_state_without_broad_authority",
+                    "test_traceability_debt_scenario_executes_controller_blocking_matrix",
+                    "test_required_current_contract_maintenance_blocks_preparation",
+                    "test_unsafe_checkpoint_maintenance_blocks_preparation",
+                ),
+            ),
+        }
+        for identifier, (owner, methods) in behavior.items():
+            for method in methods:
+                with self.subTest(identifier=identifier, method=method):
+                    self.assertTrue(callable(getattr(owner, method, None)))
+
+        distributable = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                SKILL,
+                SKILL_DIR / "references" / "controller-contract.md",
+                Path(__file__).resolve().parents[4] / "README.md",
+                Path(__file__).resolve().parents[4] / "docs" / "specs" / "engineering-v2.2.3-design.md",
+            )
+        )
+        self.assertRegex(distributable, r"requested.{0,40}actual.{0,40}fallback")
+        for forbidden in ("Luna Max", "Terra High", "Decision Studio", "top_level_project_task", "root_task"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, distributable)
+
+    def test_seed_feedback_scope_handoff_requires_signed_approval(self):
+        self.assertIsNotNone(engineering)
+        handoff = {
+            "seed_evidence": ["REQ-ORDERS-EXPORT"],
+            "reconstructed_scope": ["REQ-ORDERS-EXPORT", "FLOW-ORDERS-EXPORT-API"],
+            "architect_scope": ["REQ-ORDERS-EXPORT", "FLOW-ORDERS-EXPORT-API"],
+            "result_scope": ["REQ-ORDERS-EXPORT", "FLOW-ORDERS-EXPORT-API"],
+        }
+        with self.assertRaises(engineering.EngineeringError):
+            engineering._scope_envelope(
+                {"scope": ["README.md"], "forbidden": [], "scope_handoff": handoff}
+            )
+        self.assertRaises(
+            engineering.EngineeringError,
+            engineering._scope_envelope,
+            {
+                "scope": ["README.md"],
+                "forbidden": [],
+                "scope_handoff": {**handoff, "architect_approved": True},
+            },
+        )
 
 
 class Task2ContractTests(unittest.TestCase):
@@ -5011,6 +5081,91 @@ class Task5ContractTests(unittest.TestCase):
         self.assertNotEqual("blocked", prepared["readiness"])
         return root, prepared
 
+    def test_seed_feedback_scope_handoff_uses_signed_approval_and_completion(self):
+        module = self.module()
+        root, _ = self.prepared_repo("scope-handoff")
+        ledger = root / "docs" / "engineering-traceability" / "decision-ledger.md"
+        ledger.write_text(
+            "# Engineering Traceability Decision Ledger\n"
+            "## PROJ-DEC-1 - Approved reconstructed scope\n",
+            encoding="utf-8",
+        )
+        links_path = root / "docs" / "engineering-traceability" / "links.json"
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].append(
+            {
+                "id": "PROJ-DEC-1",
+                "type": "decision",
+                "title": "Approved reconstructed scope",
+                "source": {
+                    "path": "docs/engineering-traceability/decision-ledger.md",
+                    "line": 2,
+                },
+            }
+        )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+        commit = self.commit_all(root, "record approved scope decision")
+        self.write_canonical_checkpoint(root, commit)
+        module.approve_checks(root)
+        raw_handoff = {
+            "seed_evidence": ["REQ-1"],
+            "reconstructed_scope": ["REQ-1", "DEC-1"],
+            "architect_scope": ["REQ-1", "DEC-1"],
+            "result_scope": ["REQ-1", "DEC-1"],
+            "result_artifacts": ["README.md", "requirements.md"],
+        }
+        approval = module.approve_scope_handoff(root, "PROJ-DEC-1", raw_handoff)
+        handoff = approval["scope_handoff"]
+        with self.assertRaisesRegex(module.EngineeringError, "attestation"):
+            module.prepare(
+                root,
+                "change REQ-1",
+                {
+                    "scope": ["README.md", "requirements.md"],
+                    "forbidden": [],
+                    "scope_handoff": {
+                        **handoff,
+                        "approval_id": "attestation-" + "0" * 32,
+                    },
+                },
+            )
+        prepared = module.prepare(
+            root,
+            "change REQ-1",
+            {
+                "scope": ["README.md", "requirements.md"],
+                "forbidden": [],
+                "scope_handoff": handoff,
+            },
+        )
+        self.assertNotEqual("blocked", prepared["readiness"], prepared)
+
+        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
+        with self.assertRaisesRegex(module.EngineeringError, "result scope"):
+            module.complete(
+                root,
+                prepared["run_id"],
+                receipts=[],
+                result_scope=["REQ-1"],
+            )
+        with self.assertRaisesRegex(module.EngineeringError, "result artifacts"):
+            module.complete(
+                root,
+                prepared["run_id"],
+                receipts=[],
+                result_scope=handoff["result_scope"],
+            )
+        (root / "requirements.md").write_text("# REQ-1\nupdated\n", encoding="utf-8")
+        completion = module.complete(
+            root,
+            prepared["run_id"],
+            receipts=[],
+            result_scope=handoff["result_scope"],
+        )
+        self.assertEqual(handoff["result_scope"], completion["scope_result"])
+        replay = module.complete(root, prepared["run_id"], receipts=[])
+        self.assertEqual(completion, replay)
+
     def green_receipts(self, prepared: dict) -> list[dict]:
         module = self.module()
         return [
@@ -5976,6 +6131,157 @@ class Task6ContractTests(unittest.TestCase):
         self.assertEqual("blocked", result["readiness"])
         self.assertIn("dirty work exists outside the authorized scope", result["blockers"])
 
+    def test_unrelated_blocked_maintenance_is_advisory_even_when_in_scope(self):
+        module = self.module()
+        root, _ = self.prepared_repo("maintenance-unrelated-blocker")
+        self.queue(
+            root,
+            artifact="docs/guide.md",
+            kind="stale_artifact",
+            impact="blocking",
+        )
+        module.approve_checks(root)
+
+        result = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": ["docs/guide.md"], "forbidden": []},
+            None,
+        )
+
+        self.assertNotEqual("blocked", result["readiness"])
+        self.assertIn(
+            "Engineering maintenance: 1 queued artifact(s). Run `engineering maintain` "
+            "once to repair safe items; blocked items still require review. The command "
+            "does not change autonomy.",
+            result["advisories"],
+        )
+
+    def test_required_current_contract_maintenance_blocks_preparation(self):
+        module = self.module()
+        root, _ = self.prepared_repo("maintenance-required-contract")
+        artifact = "docs/engineering-traceability/decision-ledger.md"
+        self.queue(root, artifact=artifact, kind="stale_artifact", impact="blocking")
+
+        result = module.prepare(
+            root,
+            "change REQ-1",
+            {
+                "scope": ["README.md"],
+                "required_sources": [artifact],
+                "forbidden": [],
+            },
+            None,
+        )
+
+        self.assertEqual("blocked", result["readiness"])
+        self.assertIn("dirty work exists outside the authorized scope", result["blockers"])
+
+    def test_unsafe_checkpoint_maintenance_blocks_preparation(self):
+        module = self.module()
+        root, _ = self.prepared_repo("maintenance-checkpoint-blocker")
+        self.queue(
+            root,
+            artifact="checkpoint",
+            kind="checkpoint_stale",
+            impact="blocking",
+        )
+        module.approve_checks(root)
+
+        result = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": ["docs/guide.md"], "forbidden": []},
+            None,
+        )
+
+        self.assertEqual("blocked", result["readiness"])
+        self.assertIn("dirty work exists outside the authorized scope", result["blockers"])
+
+    def test_queued_maintenance_serializes_shared_state_without_broad_authority(self):
+        module = self.module()
+        root, _ = self.prepared_repo("maintenance-serialization-advisory")
+        first = self.queue(root, artifact="docs/guide.md", kind="stale_artifact")
+        second = self.queue(root, artifact="docs/other.md", kind="stale_artifact")
+
+        status = module.maintenance_status(root)
+        self.assertEqual(2, status["counts"]["pending"])
+        self.assertEqual(
+            sorted([first["id"], second["id"]]),
+            [item["id"] for item in status["items"]],
+        )
+        module.approve_checks(root)
+        result = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": ["docs/guide.md", "docs/other.md"], "forbidden": []},
+            None,
+        )
+        self.assertNotEqual("blocked", result["readiness"])
+
+    def test_traceability_debt_scenario_executes_controller_blocking_matrix(self):
+        module = self.module()
+        payload = json.loads(SCENARIOS.read_text(encoding="utf-8"))
+        scenario = next(
+            item for item in payload["scenarios"]
+            if item.get("id") == "traceability-debt-maintenance"
+        )
+        self.assertIn("block_only_checkpoint_contract_or_dependent_acceptance", scenario["must"])
+        unrelated = {
+            "safe": False,
+            "kind": "stale_artifact",
+            "artifact": "docs/guide.md",
+        }
+        checkpoint = {
+            "safe": False,
+            "kind": "checkpoint_stale",
+            "artifact": "checkpoint",
+        }
+        required = {
+            "safe": False,
+            "kind": "stale_artifact",
+            "artifact": "docs/engineering/decision-ledger.md",
+        }
+        dependent = {
+            "safe": False,
+            "kind": "stale_artifact",
+            "artifact": "src/app.py",
+        }
+        self.assertFalse(
+            module._maintenance_blocks_preparation(
+                unrelated, required_sources=set(), impact=[]
+            )
+        )
+        self.assertTrue(
+            module._maintenance_blocks_preparation(
+                checkpoint, required_sources=set(), impact=[]
+            )
+        )
+        self.assertTrue(
+            module._maintenance_blocks_preparation(
+                required,
+                required_sources={"docs/engineering/decision-ledger.md"},
+                impact=[],
+            )
+        )
+        self.assertTrue(
+            module._maintenance_blocks_preparation(
+                dependent,
+                required_sources=set(),
+                impact=[{"id": "src/app.py"}],
+            )
+        )
+        source = ENGINEERING_SCRIPT.read_text(encoding="utf-8")
+        imports = {
+            alias.name
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        self.assertNotIn("sched", imports)
+        self.assertNotIn("threading", imports)
+        self.assertIn("_acquire_repository_lock", source)
+
     def test_collaborative_explains_one_off_maintenance_command(self):
         module = self.module()
         root, _ = self.prepared_repo("maintenance-collaborative")
@@ -6492,7 +6798,8 @@ class Task7ContractTests(unittest.TestCase):
         (source / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
-        root = Path(self.git(source, "rev-parse", "--show-toplevel"))
+        root_text = self.git(source, "rev-parse", "--show-toplevel")
+        root = Path(root_text) if sys.platform == "win32" else PosixPath(root_text)
         self.git(root, "add", ".")
         self.git(root, "commit", "-m", f"bundle {version}")
 
@@ -7123,6 +7430,123 @@ class Task7ContractTests(unittest.TestCase):
         self.assertEqual(prior_bytes, canonical.read_bytes())
         self.assertEqual("rolled_back", rolled_back["status"])
         self.assertEqual(first["skill_version"], rolled_back["skill_version"])
+
+    def test_temporary_home_install_replay_and_rollback_do_not_mutate_windows_path(self):
+        """A custom installation must not register its launcher in the active user profile."""
+        module = self.module()
+        source = self.bundle_repo("custom-home-path")
+        active_home = Path(self.temporary_directory.name) / "active-home"
+        active_home.mkdir()
+        registry = Mock()
+        registry.HKEY_CURRENT_USER = object()
+        registry.KEY_QUERY_VALUE = 1
+        registry.KEY_SET_VALUE = 2
+        registry.REG_SZ = 1
+        registry.REG_EXPAND_SZ = 2
+        registry.QueryValueEx.return_value = ("", registry.REG_EXPAND_SZ)
+        registry.OpenKey.return_value = contextlib.nullcontext(Mock())
+        path_before = os.environ.get("PATH", "")
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(Path, "home", return_value=active_home),
+            patch.dict(sys.modules, {"winreg": registry}),
+        ):
+            module.install_bundle(source, self.home)
+            module.install_bundle(source, self.home)
+            self.update_bundle(source, "2.1.1")
+            module.install_bundle(source, self.home)
+            module.rollback_install(self.home)
+
+        self.assertEqual(path_before, os.environ.get("PATH", ""))
+        self.assertEqual(0, registry.OpenKey.call_count)
+        self.assertEqual(0, registry.SetValueEx.call_count)
+
+    def test_active_home_replay_upgrade_and_rollback_do_not_restore_windows_path(self):
+        """Only the first active-home install may register a launcher directory."""
+        module = self.module()
+        source = self.bundle_repo("active-home-path")
+        first_bundle = module._bundle_files(source)
+        baseline = r"C:\\baseline"
+        registry_state = {"path": baseline}
+        registry = Mock()
+        registry.HKEY_CURRENT_USER = object()
+        registry.KEY_QUERY_VALUE = 1
+        registry.KEY_SET_VALUE = 2
+        registry.REG_SZ = 1
+        registry.REG_EXPAND_SZ = 2
+        registry.OpenKey.return_value = contextlib.nullcontext(Mock())
+        registry.QueryValueEx.side_effect = lambda _key, _name: (
+            registry_state["path"], registry.REG_EXPAND_SZ
+        )
+        registry.SetValueEx.side_effect = lambda _key, _name, _reserved, _kind, value: (
+            registry_state.__setitem__("path", value)
+        )
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(Path, "home", return_value=self.home),
+            patch.dict(sys.modules, {"winreg": registry}),
+            patch.dict(os.environ, {"PATH": baseline}, clear=False),
+            patch.object(module, "_bundle_files", return_value=first_bundle),
+        ):
+            module.install_bundle(source, self.home)
+            self.assertNotEqual(baseline, registry_state["path"])
+            self.assertNotEqual(baseline, os.environ["PATH"])
+
+            def assert_not_restored():
+                self.assertEqual(baseline, registry_state["path"])
+                self.assertEqual(baseline, os.environ["PATH"])
+                self.assertEqual(0, registry.OpenKey.call_count)
+                self.assertEqual(0, registry.SetValueEx.call_count)
+
+            registry_state["path"] = baseline
+            os.environ["PATH"] = baseline
+            registry.reset_mock()
+            module.install_bundle(source, self.home)
+            assert_not_restored()
+
+        self.update_bundle(source, "2.1.1")
+        updated_bundle = module._bundle_files(source)
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(Path, "home", return_value=self.home),
+            patch.dict(sys.modules, {"winreg": registry}),
+            patch.dict(os.environ, {"PATH": baseline}, clear=False),
+            patch.object(module, "_bundle_files", return_value=updated_bundle),
+        ):
+            registry_state["path"] = baseline
+            registry.reset_mock()
+            module.install_bundle(source, self.home)
+            assert_not_restored()
+
+            registry.reset_mock()
+            module.rollback_install(self.home)
+            assert_not_restored()
+
+    def test_active_home_windows_launcher_registration_is_idempotent(self):
+        module = self.module()
+        command = self.home / ".agents" / "bin"
+        registry = Mock()
+        registry.HKEY_CURRENT_USER = object()
+        registry.KEY_QUERY_VALUE = 1
+        registry.KEY_SET_VALUE = 2
+        registry.REG_SZ = 1
+        registry.REG_EXPAND_SZ = 2
+        registry.QueryValueEx.return_value = (str(command), registry.REG_EXPAND_SZ)
+        registry.OpenKey.return_value = contextlib.nullcontext(Mock())
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(Path, "home", return_value=self.home),
+            patch.dict(sys.modules, {"winreg": registry}),
+            patch.dict(os.environ, {"PATH": str(command)}, clear=False),
+        ):
+            module._register_windows_command_directory(self.home.resolve(), command)
+            module._register_windows_command_directory(self.home.resolve(), command)
+
+        self.assertEqual(2, registry.OpenKey.call_count)
+        self.assertEqual(0, registry.SetValueEx.call_count)
 
     def test_tampered_installed_script_or_prior_bundle_is_never_known_good(self):
         module = self.module()
@@ -9071,6 +9495,409 @@ class Task7ContractTests(unittest.TestCase):
         self.assertEqual(before, module._working_state_identity(root))
 
 
+class DeliveryEvaluationContractTests(unittest.TestCase):
+    init_repo = Task2ContractTests.init_repo
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.home = Path(self.temporary_directory.name) / "home"
+        self.home.mkdir()
+        self.environment = patch.dict(
+            os.environ, {"ENGINEERING_USER_HOME": str(self.home)}, clear=False
+        )
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.private_files = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.private_files.start()
+        self.addCleanup(self.private_files.stop)
+        self.private_verifier = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.verify_private = self.private_verifier.start()
+        self.addCleanup(self.private_verifier.stop)
+
+    def module(self):
+        if engineering is None:
+            self.fail("scripts/engineering.py must exist")
+        return engineering
+
+    def evaluation_input(self, **changes):
+        value = {
+            "task_id": "task-controller",
+            "dod_id": "dod-controller",
+            "artifact_digest": "sha256:ddb48e5b1d320ff88ac89675b60f8b5f61fb64881c7e8b247efbaff3c87bf075",
+            "verdict": "accepted_exact_artifact",
+            "trigger": "completion",
+            "model": {"requested": "requested-model", "actual": "actual-model", "fallback": None},
+            "lanes": {"dependencies": 2, "parallelism": 3},
+            "terminal": {
+                "artifact_identity": "sha256:ddb48e5b1d320ff88ac89675b60f8b5f61fb64881c7e8b247efbaff3c87bf075",
+                "acceptance_state": "accepted_exact_artifact",
+                "current_gate": "release_gate",
+                "next_action": "awaiting_approval",
+                "reconciliation_digest": "sha256:" + "1" * 64,
+            },
+            "acceptance": {
+                "technical": "passed",
+                "domain": "passed",
+                "outcome": "passed",
+                "operating_interface": "cli",
+                "operating_environment": "local",
+                "representative_data": "verified",
+                "outcome_evidence_digest": "sha256:" + "c" * 64,
+                "representative_data_evidence_digest": "sha256:" + "d" * 64,
+                "gate": "accepted",
+            },
+            "proxy_pass_outcome_fail": 0,
+            "audit_false_positive": 0,
+            "unconsumed_terminal_event": 0,
+            "duration_seconds": 30,
+            "critical_path_seconds": 20,
+            "coordination_cost_seconds": 5,
+            "terminal_to_reconciliation_seconds": 2,
+            "feedback_iterations": 1,
+            "invalidated_evidence": 0,
+            "auditor_coverage": {"planned": 2, "completed": 2},
+            "rework": 1,
+            "escaped_defects": 0,
+            "false_blockers": 0,
+            "missed_escalations": 0,
+            "unnecessary_orchestrator_intervention": 0,
+            "non_applicable": {"model.fallback": "no_fallback_used"},
+        }
+        value.update(changes)
+        return value
+
+    def record(
+        self,
+        root,
+        completion_id,
+        value,
+        *,
+        digest="sha256:" + "1" * 64,
+        bind_terminal=True,
+    ):
+        module = self.module()
+        completion = {
+            "changed_artifacts": ["README.md"],
+            "result_identity": {"commit": "1" * 40, "dirty_tree_digest": None},
+            "checks": [
+                {"output_digest": "sha256:" + "c" * 64},
+                {"output_digest": "sha256:" + "d" * 64},
+            ],
+        }
+        if bind_terminal:
+            value = {
+                **value,
+                "terminal": {
+                    **value["terminal"],
+                    "reconciliation_digest": digest,
+                },
+            }
+        with (
+            patch.object(module, "_terminal_completion", return_value=(completion, digest)),
+            patch.object(module, "_project_contribution_digest", return_value="sha256:" + "2" * 64),
+        ):
+            return module.record_delivery_evaluation(root, completion_id, value)
+
+    def test_delivery_evaluation_rejects_unbounded_or_private_input(self):
+        root = self.init_repo("delivery-validation")
+        cases = (
+            self.evaluation_input(raw_source="private source body"),
+            self.evaluation_input(trigger="x" * 65),
+            self.evaluation_input(task_id="x" * 65),
+            self.evaluation_input(model={"actual": "password=secret", "fallback": None}),
+            self.evaluation_input(terminal={"artifact_identity": "sha256:" + "0" * 64}),
+            self.evaluation_input(artifact_digest="sha256:" + "0" * 64),
+            self.evaluation_input(duration_seconds=None, non_applicable={"model.fallback": "no_fallback_used"}),
+        )
+
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(self.module().EngineeringError, "delivery evaluation"):
+                    self.record(root, "run-a1b2c3", value)
+
+    def test_delivery_evaluation_tracks_reconciled_terminal_event(self):
+        root = self.init_repo("delivery-terminal")
+        record = self.record(root, "run-a1b2c3", self.evaluation_input())
+
+        self.assertEqual("requested-model", record["input"]["model"]["requested"])
+        self.assertEqual(record["input"]["artifact_digest"], record["input"]["terminal"]["artifact_identity"])
+        self.assertEqual("accepted_exact_artifact", record["input"]["terminal"]["acceptance_state"])
+        self.assertEqual("release_gate", record["input"]["terminal"]["current_gate"])
+        self.assertEqual("awaiting_approval", record["input"]["terminal"]["next_action"])
+        self.assertEqual(0, record["input"]["unconsumed_terminal_event"])
+        self.assertEqual(2, record["input"]["terminal_to_reconciliation_seconds"])
+
+    def test_delivery_evaluation_rejects_unbound_terminal_or_outcome_evidence(self):
+        module = self.module()
+        root = self.init_repo("delivery-bound-evidence")
+
+        with self.assertRaisesRegex(module.EngineeringError, "terminal evidence"):
+            self.record(
+                root,
+                "run-a1b2c3",
+                self.evaluation_input(),
+                digest="sha256:" + "2" * 64,
+                bind_terminal=False,
+            )
+
+        value = self.evaluation_input()
+        value["acceptance"] = {
+            **value["acceptance"],
+            "outcome_evidence_digest": "sha256:" + "a" * 64,
+        }
+        with self.assertRaisesRegex(module.EngineeringError, "acceptance evidence"):
+            self.record(root, "run-b2c3d4", value, digest="sha256:" + "2" * 64)
+
+        for field in ("outcome_evidence_digest", "representative_data_evidence_digest"):
+            with self.subTest(field=field):
+                value = self.evaluation_input()
+                value["acceptance"] = {
+                    **value["acceptance"],
+                    field: "sha256:" + "1" * 64,
+                }
+                with self.assertRaisesRegex(module.EngineeringError, "acceptance evidence"):
+                    self.record(
+                        root,
+                        "run-c3d4e5" if field.startswith("outcome") else "run-d4e5f6",
+                        value,
+                        digest="sha256:" + "1" * 64,
+                    )
+
+    def test_delivery_evaluation_keeps_outcome_acceptance_distinct_from_proxy_checks(self):
+        module = self.module()
+        root = self.init_repo("delivery-outcome")
+        failed_outcome = self.record(
+            root,
+            "run-a1b2c3",
+            self.evaluation_input(
+                acceptance={
+                    "technical": "passed",
+                    "domain": "passed",
+                    "outcome": "failed",
+                    "operating_interface": "cli",
+                    "operating_environment": "local",
+                    "representative_data": "verified",
+                    "outcome_evidence_digest": "sha256:" + "c" * 64,
+                    "representative_data_evidence_digest": "sha256:" + "d" * 64,
+                    "gate": "failed",
+                },
+                proxy_pass_outcome_fail=1,
+                audit_false_positive=1,
+            ),
+        )
+        unknown_outcome = self.record(
+            root,
+            "run-b2c3d4",
+            self.evaluation_input(
+                acceptance={
+                    "technical": "passed",
+                    "domain": "passed",
+                    "outcome": "unknown",
+                    "operating_interface": "cli",
+                    "operating_environment": "local",
+                    "representative_data": "missing",
+                    "outcome_evidence_digest": None,
+                    "representative_data_evidence_digest": None,
+                    "gate": "failed",
+                },
+                proxy_pass_outcome_fail=0,
+                audit_false_positive=0,
+            ),
+            digest="sha256:" + "3" * 64,
+        )
+
+        self.assertEqual("failed", failed_outcome["input"]["acceptance"]["gate"])
+        self.assertEqual("unknown", unknown_outcome["input"]["acceptance"]["outcome"])
+        trends = module.delivery_trends(window=2)
+        self.assertEqual(1, trends["metrics"]["proxy_pass_outcome_fail"]["sum"])
+        self.assertEqual(0.5, trends["rates"]["audit_false_positive"])
+        with self.assertRaisesRegex(module.EngineeringError, "proxy signal"):
+            self.record(
+                root,
+                "run-c3d4e5",
+                self.evaluation_input(
+                    acceptance=failed_outcome["input"]["acceptance"],
+                    auditor_coverage={"planned": 0, "completed": 0},
+                    proxy_pass_outcome_fail=1,
+                    audit_false_positive=1,
+                ),
+                digest="sha256:" + "4" * 64,
+            )
+        with self.assertRaisesRegex(module.EngineeringError, "acceptance"):
+            self.record(
+                root,
+                "run-d4e5f6",
+                self.evaluation_input(
+                    acceptance={
+                        **failed_outcome["input"]["acceptance"],
+                        "operating_interface": "mock",
+                    },
+                    proxy_pass_outcome_fail=1,
+                    audit_false_positive=1,
+                ),
+                digest="sha256:" + "5" * 64,
+            )
+
+    def test_delivery_evaluation_is_signed_replay_safe_owner_private_and_trendable(self):
+        module = self.module()
+        root = self.init_repo("delivery-replay")
+        before = module._working_state_identity(root)
+        first = self.record(root, "run-a1b2c3", self.evaluation_input())
+        replay = self.record(root, "run-a1b2c3", self.evaluation_input())
+        second = self.record(
+            root,
+            "run-d4e5f6",
+            self.evaluation_input(duration_seconds=10, critical_path_seconds=8),
+            digest="sha256:" + "3" * 64,
+        )
+
+        self.assertEqual(first, replay)
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertTrue(first["signature"].startswith("hmac-sha256:"))
+        self.assertEqual("accepted_exact_artifact", first["input"]["verdict"])
+        self.assertEqual(before, module._working_state_identity(root))
+        ledger = module._delivery_evaluation_path()
+        self.assertTrue(ledger.is_file())
+        self.assertNotIn(str(root), ledger.read_text(encoding="utf-8"))
+
+        trends = module.delivery_trends(window=2)
+        self.assertEqual("engineering.delivery-trends.v1", trends["schema"])
+        self.assertEqual(2, trends["record_count"])
+        self.assertEqual(40, trends["metrics"]["duration_seconds"]["sum"])
+        self.assertEqual(1, module.delivery_trends(window=1)["record_count"])
+        self.assertGreater(self.verify_private.call_count, 0)
+        self.assertIn(((ledger,), {"directory": False}), self.verify_private.call_args_list)
+
+    def test_delivery_evaluations_are_bounded_and_trends_use_latest_comparable_cohort(self):
+        module = self.module()
+        root = self.init_repo("delivery-cohorts")
+        self.record(root, "run-a1b2c3", self.evaluation_input(duration_seconds=30))
+        self.record(root, "run-b2c3d4", self.evaluation_input(duration_seconds=10, critical_path_seconds=8), digest="sha256:" + "3" * 64)
+        self.record(
+            root,
+            "run-c3d4e5",
+            self.evaluation_input(task_id="task-other", dod_id="dod-other", duration_seconds=15, critical_path_seconds=10),
+            digest="sha256:" + "4" * 64,
+        )
+
+        insufficient = module.delivery_trends(window=30)
+        self.assertEqual("insufficient_sample", insufficient["status"])
+        self.assertEqual({"task_id": "task-other", "dod_id": "dod-other"}, insufficient["cohort"])
+        self.assertEqual(1, insufficient["record_count"])
+
+        self.record(
+            root,
+            "run-d4e5f6",
+            self.evaluation_input(task_id="task-other", dod_id="dod-other", duration_seconds=20, critical_path_seconds=15),
+            digest="sha256:" + "5" * 64,
+        )
+        trends = module.delivery_trends(window=30)
+        self.assertEqual("ready", trends["status"])
+        self.assertEqual(2, trends["record_count"])
+        self.assertEqual(35, trends["metrics"]["duration_seconds"]["sum"])
+
+        bounded_root = self.init_repo("delivery-bounds")
+        bounded_home = self.home / "bounded-home"
+        bounded_home.mkdir()
+        with (
+            patch.dict(os.environ, {"ENGINEERING_USER_HOME": str(bounded_home)}, clear=False),
+            patch.object(module, "_DELIVERY_EVALUATION_MAX_ITEMS", 1),
+        ):
+            first = self.record(bounded_root, "run-e5f6a7", self.evaluation_input())
+            second = self.record(bounded_root, "run-f6a7b8", self.evaluation_input(), digest="sha256:" + "6" * 64)
+            ledger = module._load_delivery_evaluations()
+        self.assertEqual([second["id"]], [item["id"] for item in ledger["items"]])
+        self.assertNotEqual(first["id"], second["id"])
+
+        sized_home = self.home / "sized-home"
+        sized_home.mkdir()
+        with (
+            patch.dict(os.environ, {"ENGINEERING_USER_HOME": str(sized_home)}, clear=False),
+            patch.object(module, "_DELIVERY_EVALUATION_MAX_BYTES", 1),
+            self.assertRaisesRegex(module.EngineeringError, "bounded size"),
+        ):
+            self.record(self.init_repo("delivery-size"), "run-a7b8c9", self.evaluation_input())
+
+    def test_delivery_evaluation_retention_persists_sequence_and_evicts_for_size(self):
+        module = self.module()
+        sequence_home = self.home / "sequence-home"
+        sequence_home.mkdir()
+        with patch.dict(os.environ, {"ENGINEERING_USER_HOME": str(sequence_home)}, clear=False):
+            root = self.init_repo("delivery-sequence")
+            first = self.record(root, "run-a1b2c3", self.evaluation_input())
+            second = self.record(root, "run-b2c3d4", self.evaluation_input(), digest="sha256:" + "3" * 64)
+            persisted = module._load_delivery_evaluations()
+        self.assertEqual([first["id"], second["id"]], [item["id"] for item in persisted["items"]])
+        self.assertEqual(1, persisted["sequences"][first["id"]])
+        self.assertEqual(2, persisted["sequences"][second["id"]])
+
+        sized_home = self.home / "size-retention-home"
+        sized_home.mkdir()
+        with patch.dict(os.environ, {"ENGINEERING_USER_HOME": str(sized_home)}, clear=False):
+            root = self.init_repo("delivery-size-retention")
+            first = self.record(root, "run-c3d4e5", self.evaluation_input())
+            maximum = module._delivery_evaluation_bytes(module._load_delivery_evaluations())
+            with patch.object(module, "_DELIVERY_EVALUATION_MAX_BYTES", maximum):
+                second = self.record(root, "run-d4e5f6", self.evaluation_input(), digest="sha256:" + "4" * 64)
+                retained = module._load_delivery_evaluations()
+        self.assertEqual([second["id"]], [item["id"] for item in retained["items"]])
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertLessEqual(module._delivery_evaluation_bytes(retained), maximum)
+
+    def test_delivery_trends_exclude_legacy_unbound_records_from_current_cohort(self):
+        module = self.module()
+        legacy = self.evaluation_input()
+        legacy["terminal"].pop("reconciliation_digest")
+        current = self.evaluation_input(duration_seconds=10, critical_path_seconds=8)
+        payload = {
+            "items": [
+                {"id": "delivery-eval-" + "a" * 12, "input": legacy},
+                {"id": "delivery-eval-" + "b" * 12, "input": current},
+            ],
+            "sequences": {
+                "delivery-eval-" + "a" * 12: 1,
+                "delivery-eval-" + "b" * 12: 2,
+            },
+        }
+        with patch.object(module, "_load_delivery_evaluations", return_value=payload):
+            trends = module.delivery_trends(window=30)
+
+        self.assertEqual(1, trends["legacy_record_count"])
+        self.assertEqual(1, trends["record_count"])
+        self.assertEqual("insufficient_sample", trends["status"])
+
+    def test_delivery_eval_cli_accepts_only_bounded_input_file(self):
+        module = self.module()
+        root = self.init_repo("delivery-cli")
+        output = io.StringIO()
+        with (
+            patch.object(module, "_terminal_completion", return_value=({
+                "changed_artifacts": ["README.md"],
+                "result_identity": {"commit": "1" * 40, "dirty_tree_digest": None},
+                "checks": [
+                    {"output_digest": "sha256:" + "c" * 64},
+                    {"output_digest": "sha256:" + "d" * 64},
+                ],
+            }, "sha256:" + "1" * 64)),
+            patch.object(module, "_project_contribution_digest", return_value="sha256:" + "2" * 64),
+            patch.object(sys, "argv", [
+                "engineering", "delivery-eval", str(root), "run-a1b2c3", "--input-file", "-"
+            ]),
+            patch.object(sys, "stdin", io.StringIO(json.dumps(self.evaluation_input()))),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+
+        self.assertEqual(
+            "engineering.delivery-evaluation.v1", json.loads(output.getvalue())["schema"]
+        )
+
+
 class CapabilityAssuranceContractTests(unittest.TestCase):
     def module(self):
         if engineering is None:
@@ -9616,6 +10443,475 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
         ):
             pending_checkpoint = module._setup_readiness(Path("."), sys.executable)
         self.assertEqual("checkpoint_pending", pending_checkpoint["readiness"])
+
+
+class Task10ContractTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name) / "authority-project"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(self.root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        self.host_key = Path(self.temporary_directory.name) / "synthetic-host-key"
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-f",
+                str(self.host_key),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        public_key = self.host_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"synthetic-host {public_key}\n", encoding="ascii"
+        )
+        (self.root / "README.md").write_text("# Authority fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "initial"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "remote", "add", "origin", "https://example.invalid/authority.git"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "update-ref", "refs/remotes/origin/main", "HEAD"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            check=True,
+        )
+        self.repository_id = engineering._project_contribution_digest(self.root)
+        self.repository_identity = patch.object(
+            engineering, "_project_contribution_digest", return_value=self.repository_id
+        )
+        self.repository_identity.start()
+        self.addCleanup(self.repository_identity.stop)
+        self.private_writer = patch.object(
+            engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
+        )
+        self.private_writer.start()
+        self.addCleanup(self.private_writer.stop)
+        self.private_reader = patch.object(
+            engineering, "_verify_owner_private", return_value=None
+        )
+        self.private_reader.start()
+        self.addCleanup(self.private_reader.stop)
+
+    def module(self):
+        if engineering is None:
+            self.fail("scripts/engineering.py must exist")
+        return engineering
+
+    def binding(self, **changes):
+        module = self.module()
+        issued = module.datetime.now(module.timezone.utc)
+        value = {
+            "authority_epoch": "epoch-local-1",
+            "target": "candidate-v2-2-4",
+            "action_class": "local_implementation",
+            "scope": ["src/authority.py", "tests/test_authority.py"],
+            "safeguards": ["no_install", "no_network", "one_writer"],
+            "native_requirements": [],
+            "issued_at": issued.isoformat(),
+            "expires_at": (issued + module.timedelta(hours=2)).isoformat(),
+        }
+        value.update(changes)
+        return value
+
+    def approval(self, value):
+        module = self.module()
+        normalized = module._scoped_authority_binding(self.root, value)
+        material = module._canonical_json(
+            {"schema": "engineering.host-authority-claims.v1", "claims": normalized}
+        )
+        claims_path = Path(self.temporary_directory.name) / f"claims-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(self.host_key),
+                "-n",
+                "engineering-authority",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": "engineering.host-authority-approval.v1",
+            "approver": "synthetic-host",
+            "claims": normalized,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def persist(self, binding=None, **changes):
+        module = self.module()
+        value = dict(binding or self.binding(**changes))
+        approval = self.approval(value)
+        return module.persist_scoped_authority(self.root, value, approval)
+
+    def request(self, authority_id, **changes):
+        value = {
+            "authority_id": authority_id,
+            "authority_epoch": "epoch-local-1",
+            "target": "candidate-v2-2-4",
+            "action_class": "local_implementation",
+            "scope": ["src/authority.py", "tests/test_authority.py"],
+            "safeguards": ["no_install", "no_network", "one_writer"],
+            "permission_mode": "sandboxed",
+            "native_requirements": [],
+            "continuation": {"turn": "turn-1", "retry": 0, "callback": False},
+        }
+        value.update(changes)
+        return value
+
+    def test_exact_authority_persists_across_unchanged_continuations(self):
+        module = self.module()
+        authority = self.persist()
+        first = module.resolve_scoped_authority(
+            self.root, self.request(authority["authority_id"])
+        )
+        retry = module.resolve_scoped_authority(
+            self.root,
+            self.request(
+                authority["authority_id"],
+                continuation={"turn": "turn-2", "retry": 3, "callback": True},
+            ),
+        )
+        self.assertEqual("authorized", first["decision"])
+        self.assertTrue(first["business_authority_present"])
+        self.assertFalse(first["request_business_approval"])
+        self.assertEqual(authority["authority_id"], retry["authority_id"])
+        self.assertEqual(first["binding_digest"], retry["binding_digest"])
+
+    def test_missing_authority_and_full_access_still_require_business_approval(self):
+        module = self.module()
+        result = module.resolve_scoped_authority(
+            self.root,
+            self.request(None, permission_mode="full_access"),
+        )
+        self.assertEqual("request_required", result["decision"])
+        self.assertFalse(result["business_authority_present"])
+        self.assertTrue(result["request_business_approval"])
+        self.assertEqual("missing_authority", result["reason"])
+        self.assertEqual("full_access", result["permission_mode"])
+
+    def test_changed_binding_requires_new_authority(self):
+        module = self.module()
+        authority = self.persist()
+        changes = {
+            "authority_epoch": "epoch-local-2",
+            "target": "another-candidate",
+            "action_class": "installation",
+            "scope": ["src/authority.py"],
+            "safeguards": ["no_network"],
+        }
+        for field, changed in changes.items():
+            with self.subTest(field=field):
+                result = module.resolve_scoped_authority(
+                    self.root,
+                    self.request(authority["authority_id"], **{field: changed}),
+                )
+                self.assertEqual("request_required", result["decision"])
+                self.assertEqual(f"changed_{field}", result["reason"])
+                self.assertTrue(result["request_business_approval"])
+
+        with patch.object(
+            module, "_project_contribution_digest", return_value="sha256:" + "f" * 64
+        ):
+            changed_project = module.resolve_scoped_authority(
+                self.root, self.request(authority["authority_id"])
+            )
+        self.assertEqual("changed_repository_id", changed_project["reason"])
+        self.assertTrue(changed_project["request_business_approval"])
+
+    def test_revocation_consumption_and_expiry_fail_closed(self):
+        module = self.module()
+        for transition in ("revoked", "consumed"):
+            with self.subTest(transition=transition):
+                authority = self.persist(authority_epoch=f"epoch-{transition}")
+                at = module.datetime.now(module.timezone.utc).isoformat()
+                terminal = module.transition_scoped_authority(
+                    self.root, authority["authority_id"], transition, at
+                )
+                replay = module.transition_scoped_authority(
+                    self.root, authority["authority_id"], transition, at
+                )
+                self.assertEqual(terminal, replay)
+                result = module.resolve_scoped_authority(
+                    self.root, self.request(authority["authority_id"])
+                )
+                self.assertEqual(transition, result["reason"])
+                with self.assertRaisesRegex(module.EngineeringError, "terminal"):
+                    module.transition_scoped_authority(
+                        self.root,
+                        authority["authority_id"],
+                        "consumed" if transition == "revoked" else "revoked",
+                        at,
+                    )
+
+        past = module.datetime.now(module.timezone.utc) - module.timedelta(minutes=1)
+        expired = self.persist(
+            issued_at=(past - module.timedelta(hours=1)).isoformat(),
+            expires_at=past.isoformat(),
+        )
+        result = module.resolve_scoped_authority(
+            self.root, self.request(expired["authority_id"])
+        )
+        self.assertEqual("expired", result["reason"])
+        self.assertTrue(result["request_business_approval"])
+
+    def test_native_destructive_and_connector_approvals_remain_pending(self):
+        module = self.module()
+        authority = self.persist(native_requirements=["connector", "destructive"])
+        result = module.resolve_scoped_authority(
+            self.root,
+            self.request(
+                authority["authority_id"],
+                permission_mode="full_access",
+                native_requirements=["connector", "destructive"],
+            ),
+        )
+        self.assertEqual("pending_native_approval", result["decision"])
+        self.assertTrue(result["business_authority_present"])
+        self.assertFalse(result["request_business_approval"])
+        self.assertEqual(["connector", "destructive"], result["native_approval_required"])
+
+    def test_delegation_preserves_provenance_and_can_only_narrow(self):
+        module = self.module()
+        parent = self.persist()
+        child = module.delegate_scoped_authority(
+            self.root,
+            parent["authority_id"],
+            self.binding(
+                scope=["src/authority.py"],
+                issued_at=parent["issued_at"],
+                expires_at=parent["expires_at"],
+            ),
+        )
+        self.assertEqual(parent["authority_id"], child["parent_authority_id"])
+        self.assertEqual(["src/authority.py"], child["scope"])
+        replay = module.delegate_scoped_authority(
+            self.root,
+            parent["authority_id"],
+            self.binding(
+                scope=["src/authority.py"],
+                issued_at=parent["issued_at"],
+                expires_at=parent["expires_at"],
+            ),
+        )
+        self.assertEqual(child["authority_id"], replay["authority_id"])
+        with self.assertRaisesRegex(module.EngineeringError, "broaden"):
+            module.delegate_scoped_authority(
+                self.root,
+                parent["authority_id"],
+                self.binding(
+                    scope=["src/authority.py", "tests/test_authority.py", "release/publish.py"],
+                    issued_at=parent["issued_at"],
+                    expires_at=parent["expires_at"],
+                ),
+            )
+
+    def test_delegated_authority_follows_parent_revocation_and_consumption(self):
+        module = self.module()
+        for transition in ("revoked", "consumed"):
+            with self.subTest(transition=transition):
+                parent = self.persist(authority_epoch=f"epoch-parent-{transition}")
+                child = module.delegate_scoped_authority(
+                    self.root,
+                    parent["authority_id"],
+                    self.binding(
+                        authority_epoch=f"epoch-parent-{transition}",
+                        scope=["src/authority.py"],
+                        issued_at=parent["issued_at"],
+                        expires_at=parent["expires_at"],
+                    ),
+                )
+                module.transition_scoped_authority(
+                    self.root,
+                    parent["authority_id"],
+                    transition,
+                    module.datetime.now(module.timezone.utc).isoformat(),
+                )
+                result = module.resolve_scoped_authority(
+                    self.root,
+                    self.request(child["authority_id"], scope=["src/authority.py"]),
+                )
+                self.assertEqual("request_required", result["decision"])
+                self.assertEqual(f"ancestor_{transition}", result["reason"])
+                self.assertTrue(result["request_business_approval"])
+
+    def test_exact_artifact_audit_history_is_signed_and_replay_safe(self):
+        module = self.module()
+        authority = self.persist()
+        observed = module.datetime.now(module.timezone.utc).isoformat()
+        digest = "sha256:" + "a" * 64
+        event = module.record_authority_audit(
+            self.root,
+            authority["authority_id"],
+            digest,
+            "auditor-independent-1",
+            "accepted",
+            observed,
+        )
+        replay = module.record_authority_audit(
+            self.root,
+            authority["authority_id"],
+            digest,
+            "auditor-independent-1",
+            "accepted",
+            observed,
+        )
+        self.assertEqual(event, replay)
+        self.assertEqual(digest, event["artifact_digest"])
+        with self.assertRaisesRegex(module.EngineeringError, "conflict"):
+            module.record_authority_audit(
+                self.root,
+                authority["authority_id"],
+                digest,
+                "auditor-independent-1",
+                "rejected",
+                (module.datetime.now(module.timezone.utc) + module.timedelta(seconds=1)).isoformat(),
+            )
+
+    def test_authority_requires_retained_host_approval_attestation(self):
+        module = self.module()
+        with self.assertRaisesRegex(module.EngineeringError, "host approval"):
+            module.persist_scoped_authority(
+                self.root, self.binding(), {"fabricated": True}
+            )
+        binding = self.binding()
+        approval = self.approval(binding)
+        signature_lines = approval["signature"].splitlines()
+        signature_lines[1] = (
+            ("A" if signature_lines[1][0] != "A" else "B") + signature_lines[1][1:]
+        )
+        approval["signature"] = "\n".join(signature_lines) + "\n"
+        with self.assertRaisesRegex(module.EngineeringError, "signature"):
+            module.persist_scoped_authority(self.root, binding, approval)
+
+    def test_destructive_binding_cannot_suppress_native_approval(self):
+        module = self.module()
+        authority = self.persist(action_class="destructive")
+        result = module.resolve_scoped_authority(
+            self.root,
+            self.request(
+                authority["authority_id"],
+                action_class="destructive",
+                native_requirements=[],
+            ),
+        )
+        self.assertEqual("pending_native_approval", result["decision"])
+        self.assertEqual(["destructive"], result["native_approval_required"])
+
+    def test_publish_rejects_cardinality_before_writing(self):
+        module = self.module()
+        ledger = {
+            "schema": module.AUTHORITY_LEDGER_SCHEMA,
+            "authorities": [{}] * (module.MAX_SCOPED_AUTHORITIES + 1),
+            "audits": [],
+        }
+        with self.assertRaisesRegex(module.EngineeringError, "bounded size"):
+            module._publish_scoped_authorities(self.root, ledger, b"x" * 32)
+        self.assertFalse(module._scoped_authority_path(self.root).exists())
+
+    def test_conflicting_concurrent_transitions_are_serialized(self):
+        module = self.module()
+        authority = self.persist()
+        barrier = threading.Barrier(3)
+        outcomes = []
+
+        def transition(status):
+            barrier.wait()
+            try:
+                outcomes.append(
+                    module.transition_scoped_authority(
+                        self.root,
+                        authority["authority_id"],
+                        status,
+                        module.datetime.now(module.timezone.utc).isoformat(),
+                    )["status"]
+                )
+            except module.EngineeringError as error:
+                outcomes.append(str(error))
+
+        workers = [
+            threading.Thread(target=transition, args=(status,))
+            for status in ("revoked", "consumed")
+        ]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(1, sum(item in {"revoked", "consumed"} for item in outcomes))
+        self.assertEqual(
+            1,
+            sum("terminal" in item or "lock timed out" in item for item in outcomes),
+        )
+        retained = module._load_scoped_authorities(self.root)["authorities"][0]
+        self.assertIn(retained["status"], {"revoked", "consumed"})
+
+    def test_tampered_authority_state_fails_closed(self):
+        module = self.module()
+        self.persist()
+        path = module._scoped_authority_path(self.root)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["authorities"][0]["target"] = "tampered-target"
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(module.EngineeringError, "ledger"):
+            module.resolve_scoped_authority(self.root, self.request(payload["authorities"][0]["authority_id"]))
+
+    def test_policy_preserves_native_hosts_and_pauses_exhausted_workers(self):
+        skill = " ".join(SKILL.read_text(encoding="utf-8").split())
+        contract = " ".join(
+            (SKILL_DIR / "references" / "controller-contract.md")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+        for required in (
+            "approval presence",
+            "request approval again",
+            "Full Access",
+            "PAUSED_AWAITING_CENTRAL_ADJUDICATION",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, skill)
+        for required in (
+            "native destructive",
+            "native connector",
+            "Codex and Claude",
+            "exact artifact",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, contract)
 
 
 if __name__ == "__main__":

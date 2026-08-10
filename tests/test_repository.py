@@ -42,6 +42,20 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_release_manifest_is_v2_2_4_with_pinned_graphify(self) -> None:
+        manifest = json.loads((SKILL_ROOT / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual("2.2.4", manifest["version"])
+        self.assertEqual(1, manifest["controller_schema"])
+        self.assertEqual(
+            {
+                "repository": "https://github.com/safishamsi/graphify",
+                "tag": "v0.9.5",
+                "version": "0.9.5",
+                "commit": "d89ec68af95e0cad801b56d88df383991e659823",
+            },
+            manifest["graphify"],
+        )
+
     def test_ci_installs_the_pinned_graphify_dependency(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(
             encoding="utf-8"
@@ -51,6 +65,24 @@ class RepositoryContractTests(unittest.TestCase):
             "@d89ec68af95e0cad801b56d88df383991e659823\"",
             workflow,
         )
+
+    def test_ci_runs_windows_controller_and_installer_isolation_regression(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("matrix:\n        os: [ubuntu-latest, windows-latest]", workflow)
+        self.assertIn(
+            "python -m unittest discover -s .agents/skills/engineering/tests",
+            workflow,
+        )
+        self.assertIn("if: runner.os == 'Windows'", workflow)
+        self.assertIn(
+            "Task7ContractTests."
+            "test_temporary_home_install_replay_and_rollback_do_not_mutate_windows_path",
+            workflow,
+        )
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertNotIn("self-hosted", workflow)
 
     def test_skill_tree_is_generic_and_exact(self) -> None:
         actual = {
@@ -181,6 +213,8 @@ class RepositoryContractTests(unittest.TestCase):
                 "tools/export_public.py",
             }
             self.assertLessEqual(required_generic_payload, actual)
+            self.assertIn("docs/specs/engineering-v2.2.3-design.md", actual)
+            self.assertIn("docs/specs/engineering-v2.2.4-authority-persistence.md", actual)
             workflow = (destination / ".github/workflows/security.yml").read_text(
                 encoding="utf-8"
             )

@@ -23,6 +23,11 @@ jobs:
       - run: python -m pip install "git+https://github.com/safishamsi/graphify.git@d89ec68af95e0cad801b56d88df383991e659823"
       - run: python -m unittest discover -s tests
       - run: python -m unittest discover -s .agents/skills/engineering/tests
+      - name: Verify temporary-home installer isolation
+        if: runner.os == 'Windows'
+        run: >-
+          python .agents/skills/engineering/tests/test_engineering.py
+          Task7ContractTests.test_temporary_home_install_replay_and_rollback_do_not_mutate_windows_path
       - run: python -m compileall -q .agents/skills/engineering tools tests
       - run: python tools/check_sensitive.py
       - run: git show --check --oneline --no-renames HEAD
