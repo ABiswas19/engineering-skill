@@ -136,6 +136,13 @@ GRAPHIFY_ADAPTER_PARAMETERS = (
 )
 AUTONOMY_LEVELS = {"guided", "collaborative", "steward"}
 DEFAULT_AUTONOMY = "collaborative"
+MATERIAL_CHANGE_CLASSES = {
+    "redesign",
+    "replacement",
+    "capability_deletion",
+    "simplification",
+}
+OUTCOME_SURVIVAL_DISPOSITIONS = {"INCLUDED", "REPLACED", "DEFERRED", "EXCLUDED"}
 MAINTENANCE_IMPACT = {"routine", "blocking", "consequential", "ambiguous"}
 MAINTENANCE_AGING_DAYS = 14
 CONTRIBUTION_STATES = {
@@ -187,6 +194,7 @@ PREPARATION_BLOCKERS = {
     "missing_required_source": "required source or exact context is missing",
     "checkpoint_pending": "the first exact checkpoint is pending; run the reported foreground recovery",
     "semantic_matrix_incomplete": "an impacted declared ownership or routing matrix lacks atomic coverage",
+    "outcome_survival_incomplete": "material change lacks a complete signed baseline outcome mapping",
 }
 PREPARATION_ADVISORIES = {
     "remote_freshness_unknown": "canonical remote freshness is unknown",
@@ -4770,6 +4778,139 @@ def _contains_credential(value: str) -> bool:
     return _redact_credentials(value) != value
 
 
+def _outcome_survival(value: object, architect_scope: list[str]) -> dict[str, object]:
+    """Validate one complete baseline-to-candidate mapping without a second ledger."""
+    if not isinstance(value, dict) or set(value) != {"baseline_ids", "mappings"}:
+        raise EngineeringError("Engineering outcome survival mapping is invalid.")
+    baseline = value["baseline_ids"]
+    mappings = value["mappings"]
+    if (
+        not isinstance(baseline, list)
+        or not baseline
+        or len(baseline) > 256
+        or any(not isinstance(item, str) for item in baseline)
+        or not isinstance(mappings, list)
+        or not mappings
+        or len(mappings) > 256
+    ):
+        raise EngineeringError("Engineering outcome survival mapping is invalid.")
+    try:
+        baseline_ids = sorted(
+            _assurance_id(item, "baseline outcome") for item in baseline
+        )
+    except EngineeringError as error:
+        raise EngineeringError("Engineering outcome survival mapping is invalid.") from error
+    if len(set(baseline_ids)) != len(baseline_ids):
+        raise EngineeringError("Engineering outcome survival baseline is duplicated.")
+
+    expected_keys = {
+        "baseline_id",
+        "disposition",
+        "reason",
+        "verification_ids",
+        "replacement_ids",
+        "equivalence_decision_id",
+    }
+    normalized_mappings = []
+    for mapping in mappings:
+        if not isinstance(mapping, dict) or set(mapping) != expected_keys:
+            raise EngineeringError("Engineering outcome survival mapping is invalid.")
+        try:
+            baseline_id = _assurance_id(mapping["baseline_id"], "baseline outcome")
+        except (EngineeringError, TypeError) as error:
+            raise EngineeringError("Engineering outcome survival mapping is invalid.") from error
+        disposition = mapping["disposition"]
+        reason = mapping["reason"]
+        if (
+            disposition not in OUTCOME_SURVIVAL_DISPOSITIONS
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 500
+            or _contains_credential(reason)
+        ):
+            raise EngineeringError("Engineering outcome survival mapping is invalid.")
+
+        normalized_lists: dict[str, list[str]] = {}
+        for key in ("verification_ids", "replacement_ids"):
+            items = mapping[key]
+            if (
+                not isinstance(items, list)
+                or len(items) > 64
+                or any(not isinstance(item, str) for item in items)
+            ):
+                raise EngineeringError("Engineering outcome survival mapping is invalid.")
+            try:
+                normalized_lists[key] = sorted(
+                    _assurance_id(item, f"outcome survival {key}") for item in items
+                )
+            except EngineeringError as error:
+                raise EngineeringError("Engineering outcome survival mapping is invalid.") from error
+            if len(set(normalized_lists[key])) != len(normalized_lists[key]):
+                raise EngineeringError("Engineering outcome survival mapping is invalid.")
+        if not normalized_lists["verification_ids"]:
+            raise EngineeringError("Engineering outcome survival verification is missing.")
+
+        equivalence = mapping["equivalence_decision_id"]
+        if equivalence is not None:
+            try:
+                equivalence = _assurance_id(
+                    equivalence, "outcome-equivalence decision"
+                )
+            except EngineeringError as error:
+                raise EngineeringError(
+                    "Engineering outcome-equivalence decision is invalid."
+                ) from error
+        if disposition == "REPLACED":
+            if not normalized_lists["replacement_ids"] or equivalence is None:
+                raise EngineeringError(
+                    "Engineering REPLACED outcome lacks outcome-equivalence evidence."
+                )
+        elif normalized_lists["replacement_ids"] or equivalence is not None:
+            raise EngineeringError(
+                "Engineering non-replacement outcome carries replacement evidence."
+            )
+
+        normalized_mappings.append(
+            {
+                "baseline_id": baseline_id,
+                "disposition": disposition,
+                "reason": reason.strip(),
+                "verification_ids": normalized_lists["verification_ids"],
+                "replacement_ids": normalized_lists["replacement_ids"],
+                "equivalence_decision_id": equivalence,
+            }
+        )
+
+    mapped_ids = [item["baseline_id"] for item in normalized_mappings]
+    missing = sorted(set(baseline_ids) - set(mapped_ids))
+    unexpected = sorted(set(mapped_ids) - set(baseline_ids))
+    if missing:
+        raise EngineeringError(
+            "Engineering outcome survival is incomplete; missing baseline mappings: "
+            + ", ".join(missing)
+        )
+    if unexpected or len(set(mapped_ids)) != len(mapped_ids):
+        raise EngineeringError("Engineering outcome survival mapping is ambiguous.")
+
+    architect = set(architect_scope)
+    referenced = set(baseline_ids)
+    for mapping in normalized_mappings:
+        referenced.update(mapping["verification_ids"])
+        referenced.update(mapping["replacement_ids"])
+        if mapping["equivalence_decision_id"] is not None:
+            referenced.add(mapping["equivalence_decision_id"])
+    outside = sorted(referenced - architect)
+    if outside:
+        raise EngineeringError(
+            "Engineering outcome survival evidence is outside architect scope: "
+            + ", ".join(outside)
+        )
+    return {
+        "baseline_ids": baseline_ids,
+        "mappings": sorted(normalized_mappings, key=lambda item: item["baseline_id"]),
+    }
+
+
 def _scope_handoff(value: object, *, require_approval: bool = True) -> dict[str, object]:
     """Validate the bounded scope contract carried from investigation to delivery."""
     base_keys = {
@@ -4781,7 +4922,11 @@ def _scope_handoff(value: object, *, require_approval: bool = True) -> dict[str,
     }
     approval_keys = {"approval_id", "decision_id", "decision_digest"}
     required = base_keys | approval_keys if require_approval else base_keys
-    if not isinstance(value, dict) or set(value) != required:
+    allowed = required | {"outcome_survival"}
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(required),
+        frozenset(allowed),
+    }:
         raise EngineeringError("Preparation scope handoff is invalid.")
     normalized: dict[str, object] = {}
     for key in ("seed_evidence", "reconstructed_scope", "architect_scope", "result_scope"):
@@ -4824,6 +4969,10 @@ def _scope_handoff(value: object, *, require_approval: bool = True) -> dict[str,
         raise EngineeringError("Preparation scope handoff is not architect-approved.")
     if result != architect:
         raise EngineeringError("Preparation scope handoff is narrow or incomplete.")
+    if "outcome_survival" in value:
+        normalized["outcome_survival"] = _outcome_survival(
+            value["outcome_survival"], normalized["architect_scope"]
+        )
     if require_approval:
         approval_id = value["approval_id"]
         if (
@@ -4861,10 +5010,28 @@ def _scope_result(value: object) -> list[str]:
     return sorted(identifiers)
 
 
+def _material_change_class(intent: str, scope: dict) -> str | None:
+    explicit = scope.get("change_class")
+    if explicit is not None:
+        if explicit not in MATERIAL_CHANGE_CLASSES:
+            raise EngineeringError("Preparation material change class is invalid.")
+        return explicit
+    lowered = intent.casefold()
+    for change_class, terms in (
+        ("capability_deletion", ("delete capability", "remove capability")),
+        ("replacement", ("replace", "replacement")),
+        ("redesign", ("redesign", "re-design")),
+        ("simplification", ("simplify", "simplification")),
+    ):
+        if any(term in lowered for term in terms):
+            return change_class
+    return None
+
+
 def _scope_envelope(scope: dict) -> dict[str, object]:
     if not isinstance(scope, dict):
         raise EngineeringError("Preparation scope must be an object.")
-    result: dict[str, list[str]] = {}
+    result: dict[str, object] = {}
     for key in ("scope", "forbidden"):
         value = scope.get(key, [])
         if (
@@ -4896,6 +5063,11 @@ def _scope_envelope(scope: dict) -> dict[str, object]:
         result["task_authority"] = scope["task_authority"]
     if "scope_handoff" in scope:
         result["scope_handoff"] = _scope_handoff(scope["scope_handoff"])
+    if "change_class" in scope:
+        change_class = scope["change_class"]
+        if change_class not in MATERIAL_CHANGE_CLASSES:
+            raise EngineeringError("Preparation material change class is invalid.")
+        result["change_class"] = change_class
     return result
 
 
@@ -5756,6 +5928,9 @@ def _unmanaged_preparation(root: Path, intent: str, scope: dict, override: str |
     """Give adoptable projects a no-write readiness result, never a fake run."""
     project_root = resolve_project_root(str(root))
     authorization = _scope_envelope(scope)
+    change_class = _material_change_class(intent, scope)
+    if change_class is not None:
+        authorization["change_class"] = change_class
     if "scope_handoff" in authorization:
         raise EngineeringError(
             "Preparation scope handoff requires an adopted project decision ledger."
@@ -5782,7 +5957,7 @@ def _unmanaged_preparation(root: Path, intent: str, scope: dict, override: str |
         "intent": _intent_projection(_bounded_intent(intent)),
         "authorization": authorization,
         "autonomy": autonomy,
-        "readiness": "ready_with_advisories",
+        "readiness": "advisory",
         "blockers": [],
         "advisories": advisories,
         "context": [],
@@ -5790,6 +5965,16 @@ def _unmanaged_preparation(root: Path, intent: str, scope: dict, override: str |
         "required_checks": checks,
         "check_authority": check_authority,
         "completion_available": False,
+        "outcome_survival": {
+            "state": "unknown",
+            "boundary": "unmanaged_project",
+            "accepted": False,
+            "implementation_ready": False,
+            "missing_baseline_mappings": (
+                ["canonical_baseline_unavailable"] if change_class is not None else []
+            ),
+            "approval_boundary": "adopted_decision_ledger_and_checkpoint_required",
+        },
     }
 
 
@@ -5801,6 +5986,9 @@ def prepare(
     project = resolve_project(Path(root))
     bounded_intent = _bounded_intent(intent)
     authorization = _scope_envelope(scope)
+    change_class = _material_change_class(intent, scope)
+    if change_class is not None:
+        authorization["change_class"] = change_class
     config = load_project_config(project.root)
     if "scope_handoff" in authorization:
         _validate_scope_handoff_authority(
@@ -5832,6 +6020,15 @@ def prepare(
             advisory_codes.append("checkpoint_recovered")
         else:
             blocker_codes.append("checkpoint_pending")
+
+    scope_handoff = authorization.get("scope_handoff")
+    survival_mapping = (
+        scope_handoff.get("outcome_survival")
+        if isinstance(scope_handoff, dict)
+        else None
+    )
+    if change_class is not None and survival_mapping is None:
+        blocker_codes.append("outcome_survival_incomplete")
 
     nodes = {node["id"]: node for node in checkpoint["nodes"]}
     matrix_issues = _semantic_matrix_issues(config, checkpoint["nodes"], set(authorization["scope"]))
@@ -5965,6 +6162,65 @@ def prepare(
     advisory_codes = list(dict.fromkeys(advisory_codes))
     applied_practices, practice_status = _practice_projection("preparation")
     completion_practices, completion_practice_status = _practice_projection("completion")
+    outcome_projection = None
+    if change_class is not None:
+        if survival_mapping is None:
+            outcome_projection = {
+                "state": "blocked",
+                "boundary": "baseline_outcome_mapping_missing",
+                "accepted": False,
+                "implementation_ready": False,
+                "missing_baseline_mappings": ["baseline_reconstruction_required"],
+                "approval_boundary": "signed_scope_handoff_required",
+            }
+        elif checkpoint_path is None:
+            outcome_projection = {
+                "state": "unknown",
+                "boundary": "canonical_checkpoint_unavailable",
+                "accepted": False,
+                "implementation_ready": False,
+                "missing_baseline_mappings": survival_mapping["baseline_ids"],
+                "approval_boundary": "current_checkpoint_required",
+                "mappings": survival_mapping["mappings"],
+            }
+        elif any(
+            code in blocker_codes
+            for code in (
+                "ambiguous_project",
+                "conflicting_authority",
+                "missing_required_source",
+                "checkpoint_pending",
+            )
+        ):
+            boundary = next(
+                code
+                for code in (
+                    "ambiguous_project",
+                    "conflicting_authority",
+                    "missing_required_source",
+                    "checkpoint_pending",
+                )
+                if code in blocker_codes
+            )
+            outcome_projection = {
+                "state": "unknown",
+                "boundary": boundary,
+                "accepted": False,
+                "implementation_ready": False,
+                "missing_baseline_mappings": [],
+                "approval_boundary": "current_traceability_required",
+                "mappings": survival_mapping["mappings"],
+            }
+        else:
+            outcome_projection = {
+                "state": "mapped",
+                "boundary": "independent_outcome_acceptance_required",
+                "accepted": False,
+                "implementation_ready": not blocker_codes,
+                "missing_baseline_mappings": [],
+                "approval_boundary": "signed_scope_handoff_verified",
+                "mappings": survival_mapping["mappings"],
+            }
     result = {
         "schema": "engineering.prepare.v1",
         "run_id": "",
@@ -5997,6 +6253,8 @@ def prepare(
         "required_checks": required_checks,
         "check_authority": check_authority,
     }
+    if outcome_projection is not None:
+        result["outcome_survival"] = outcome_projection
     if applied_practices:
         result["applied_practices"] = applied_practices
     if practice_status is not None:
@@ -6139,13 +6397,14 @@ def _check_capability_claims(root: Path, checks: list[list[str]]) -> dict:
         )
         for argv in checks
     )
-    return {
+    claims = {
         "repository_id": _project_contribution_digest(root),
         "commands_digest": _json_digest(identities),
         "inline_code": inline_code,
         "shell_free": not shell,
         "allow_inline_code": inline_code,
     }
+    return claims
 
 
 def approve_checks(root: Path, *, allow_inline_code: bool = False) -> dict:
@@ -6189,7 +6448,7 @@ def _scope_handoff_claims(
     )
     if normalized["decision_digest"] != decision_digest:
         raise EngineeringError("Engineering scope approval decision artifact changed.")
-    return {
+    claims = {
         "repository_id": _project_contribution_digest(root),
         "commit": commit,
         "decision_id": normalized["decision_id"],
@@ -6200,6 +6459,9 @@ def _scope_handoff_claims(
         "result_scope": normalized["result_scope"],
         "result_artifacts": normalized["result_artifacts"],
     }
+    if "outcome_survival" in normalized:
+        claims["outcome_survival"] = normalized["outcome_survival"]
+    return claims
 
 
 def approve_scope_handoff(root: Path, decision_id: str, handoff: dict) -> dict:
@@ -6667,6 +6929,9 @@ def _completion_payload(
         payload["scope_result"] = scope_result
     if scope_result_artifacts is not None:
         payload["scope_result_artifacts"] = scope_result_artifacts
+    handoff = preparation["authorization"].get("scope_handoff")
+    if isinstance(handoff, dict) and "outcome_survival" in handoff:
+        payload["outcome_survival"] = handoff["outcome_survival"]
     return payload
 
 
@@ -6711,6 +6976,13 @@ def complete(
         }
         authorization = preparation["authorization"]
         scope_handoff = authorization.get("scope_handoff")
+        if authorization.get("change_class") in MATERIAL_CHANGE_CLASSES and (
+            not isinstance(scope_handoff, dict)
+            or "outcome_survival" not in scope_handoff
+        ):
+            raise EngineeringError(
+                "Engineering completion blocks material change without baseline outcome survival."
+            )
         scope_result = _scope_result(result_scope) if result_scope is not None else None
         scope_result_artifacts = None
         if scope_handoff is not None:

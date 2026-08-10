@@ -17,7 +17,8 @@
 - At most 128 active practices and 256 KiB serialized applied-ledger state are allowed.
 - Existing `promoted` records remain historical and inactive unless they satisfy the new practice validation.
 - Codex and Claude consume one canonical Engineering home.
-- The public mirror has independent history and receives only an allowlisted, fully scanned tree.
+- The paired exported repository has independent history and receives only an
+  allowlisted, fully scanned shared tree.
 - Public publication requires an approved licence and explicit delivery authority.
 - No user-home installation, project-controls application, or live-project mutation occurs in this plan.
 - Each task records its dependency and completion signal before the next begins.

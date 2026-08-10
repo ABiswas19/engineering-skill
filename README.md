@@ -2,228 +2,381 @@
 
 ## Why, what, how
 
-Engineering prevents an attractive but unsafe shortcut: calling a change
-"ready" because a graph, test, or task happened to pass. It gives each Git
-project a local, evidence-bound view of requirements, decisions, code, checks,
-and known gaps. It works in the foreground: assess the repository, preview any
-setup, establish or reconstruct a baseline, prepare bounded work, then verify
-and complete it. Missing or contradictory evidence remains **Unknown**. It
-does not alter a project, publish code, or make a live decision automatically.
+Engineering is a project-local traceability system for connecting requirements
+and decisions to the code and tests that implement them. Its evidence is bound
+to an exact commit, so a map or passing check cannot silently stand in for a
+different tree. Stale, missing, or conflicting evidence remains **Unknown** and
+graph-dependent claims fail closed.
 
-## Native delivery
+The product is the reviewable chain from intent to implementation and
+verification: project-owned requirements and decisions, a reproducible code
+graph, deterministic links and checks, local queries, and retained completion
+evidence. Engineering does not infer approval from code, publish a project, or
+make a live decision automatically.
 
-Start with the orchestrator. It classifies the task, definition of done,
-dependencies, and risk triggers, then uses the host's native task DAG. It fans
-out independent work only when beneficial, assigns one writer per shared
-mutable resource, and receives observable state from direct implementer-
-designer feedback. Consequential lanes can carry an independent auditor.
-Engineering does not replace Codex or Claude, remove their tools, context,
-permissions, or autonomy, or impose an artificial concurrency limit.
+## Capabilities at a glance
 
-User input and feedback start the investigation; they do not define the whole
-scope by themselves. Before dispatch, the orchestrator reconstructs the
-available decision history, approved intent, dependencies, adjacent flows, and
-bounded workspace state. Architecture/design and SME work investigates root
-causes and adjacent omissions and maps both the reported symptom and those
-findings to acceptance. Dispatch that investigation first; only its
-architect-approved scope goes to the implementer. The orchestrator rejects
-symptom-only handoffs and narrow, incomplete, or proxy-only results, even when
-the literal symptom appears fixed.
+- **Traceability:** exact-commit checkpoints and deterministic status, coverage,
+  trace, impact, why-code, why-test, and compare queries connect intent to code
+  and verification.
+- **Repository assessment and governed setup:** inspect an existing repository,
+  preview project controls and the pinned toolchain, then apply only an exact
+  approved plan.
+- **Checkpoint lifecycle:** construct or rebuild the canonical and isolated
+  feature evidence without merging feature claims into the default branch.
+- **Bounded delivery evidence:** prepare and complete authorized work, compare
+  predicted and actual impact, run approved checks, and retain receipts.
+- **Outcome-survival guard:** material redesigns map every baseline approved
+  outcome to included, equivalent replacement, explicit deferral, or explicit
+  exclusion before they can become implementation-ready.
+- **Approval persistence and bounded autonomy:** unchanged exact scope remains
+  approved; Guided, Collaborative (default), and Steward govern only routine
+  local work.
+- **Ongoing assurance:** foreground maintenance, opt-in semantic matrices, and
+  read-only retrospect expose drift and missing evidence without inventing it.
+- **Delivery evaluation and trends:** retain bounded, owner-private technical,
+  semantic, and outcome evidence without turning proxy checks into acceptance.
+- **Applied learning:** capture a sanitized project-local practice after verified
+  completion, validate it in a distinct project, and produce only a governed
+  proposal for an upstream improvement.
 
-For a consequential feedback handoff, the native controller can carry the
-bounded `scope_handoff` envelope: seed evidence, reconstructed scope,
-architect-approved scope, result scope, expected result artifacts, and a
-commit-bound signed approval over an exact decision-ledger artifact must be
-explicit. Completion compares observed changed artifacts to that signed set.
-Missing or
-self-attested approval, or a narrow result, fails closed; this is a contract
-on the host-native task flow, not a second orchestration runtime.
+## Traceability flow
 
-The orchestrator integrates accepted lane results and independently accepts or
-rejects the exact integrated artifact. A lane result or stale artifact is not
-acceptance. Material feedback identifies affected requirements and invalidated
-evidence; unrelated evidence remains usable.
+1. **Assess the repository.** Engineering resolves one Git root, branch,
+   commit, configured default branch, existing instructions, and native checks.
+   An unmanaged project stays advisory and reports traceability as Unknown.
+2. **Preview and approve project controls.** Setup first shows the exact
+   digest-bound manifest, ledgers, instructions, hook preservation, and pinned
+   toolchain plan. Only explicit, matching setup authority may apply it.
+3. **Reach the first eligible commit.** In greenfield work, that commit becomes
+   the first canonical checkpoint. Mid-flight work adopts existing controls and
+   reconstructs an advisory baseline without pretending undocumented history is
+   complete.
+4. **Build the pinned Graphify code graph.** Graphify 0.9.5 at reviewed commit
+   `d89ec68af95e0cad801b56d88df383991e659823` maps code at the exact checkpoint.
+   A missing, incompatible, or wrong-commit graph blocks graph claims.
+5. **Compile the deterministic overlay.** Engineering overlays project-owned
+   requirements, decisions, direct or derived links, checks, and integrity
+   evidence. Ambiguous graph navigation never becomes verified provenance.
+6. **Query locally.** Use `engineering map`, `engineering status`,
+   `engineering coverage`, `engineering trace`, `engineering impact`,
+   `engineering why-code`, `engineering why-test`, and `engineering compare`
+   to navigate the current checkpoint without a provider call.
+7. **Prepare and complete bounded work.** Preparation selects exact context,
+   impact, authority, and checks. Completion compares predicted and actual
+   artifacts, verifies the prepared checks, refreshes eligible feature evidence,
+   and rejects scope or contract drift.
+8. **Keep retained receipts.** Local completion manifests and check digests
+   preserve what was verified. They are evidence, not approval, and a later
+   change can make them stale.
 
-Model choice remains with the caller and native platform. When delivery
-evaluation is used, requested, actual, and fallback model facts are recorded
-without prescribing a provider, model family, reasoning level, or task
-topology. Material decision review asks whether the concept should exist and
-whether doing nothing is better. The narrowest technical or functional SME is
-used when material risk or domain impact could change design, business rules,
-ownership, KPIs, or acceptance. Current primary web research is allowed for
-external facts, but facts, assumptions, citations, and Unknowns stay separate;
-organization-specific details are never invented.
+## Deterministic core, optional reasoning
 
-Owner-private delivery evaluations retain trigger decisions, requested and
-actual models, fallback, dependency and parallelism data, feedback/rework,
-auditor coverage, escaped defects, false blockers, and trends. A missing or
-non-applicable item carries a reason. Recommendations remain local to the
-user's harness and cannot silently modify the upstream Engineering Skill.
-Before a parent lane reports active, complete, or awaiting approval, its
-orchestrator consumes each native child terminal event and records the exact
-artifact identity, acceptance state, current gate, and next action. The
-owner-private evaluation ledger retains the newest 365 records within 1 MiB;
-it records terminal reconciliation latency and unconsumed-event signals.
-Trends use the latest comparable task/DoD cohort and return
-`insufficient_sample` when fewer than two records are comparable.
-Automated, build, technical, and visual checks are necessary evidence, never
-product acceptance by themselves. Every delivery separately records technical,
-domain/semantic, and end-to-end outcome acceptance against representative data
-through the actual consumer interface/environment; missing data or outcome evidence is
-`unknown` and fails the acceptance gate. The interface may be a CLI, API, file,
-or other real consumer--not necessarily a UI. Proxy-pass/outcome-fail and audit
-false-positive signals keep a high technical score from implying acceptance.
-Accepted outcomes retain bounded outcome and representative-data evidence
-digests bound to validated completion/check receipts; unbound claims are
-rejected, and an audit false positive requires completed audit coverage.
-Historical pre-binding evaluation records remain readable but are not upgraded
-into current acceptance evidence during migration or current trend cohorts.
-LangGraph is intentionally absent: add a runtime only after a demonstrated gap
-in native task semantics and separate architecture approval.
+Graph construction, traversal, map rendering, overlay compilation, reducers,
+hooks, checkpoint validation, status, coverage, trace, impact, comparison, and
+receipt verification are local deterministic code. Engineering invokes neither
+provider-backed Graphify extraction nor an LLM backend. There is no background
+LLM, no daemon or scheduler, no hidden provider calls, and no enterprise graph
+upload.
 
-## Scoped authority in 2.2.4
+Codex or Claude is optional. A host may use its normal reasoning for design,
+implementation, review, or interpretation of a bounded redacted context slice,
+but that reasoning does not enter the canonical code graph or upgrade an
+inference into evidence. Engineering overlays the host's native capabilities;
+it does not replace its tools, context, permissions, autonomy, approval
+mechanisms, or concurrency.
 
-Engineering now distinguishes business-authority presence from whether approval
-must be requested again. A controller-signed project-local record keeps exact
-authority across unchanged turns, retries, callbacks, and bounded repair
-epochs. It is bound to repository lineage, authority epoch, target, action
-class, scope, and safeguards. Missing, revoked, consumed, expired, or changed
-bindings require new business authority.
+## Onboarding and evidence boundaries
 
-Full Access remains a native technical permission, not business approval.
-Native destructive, connector, credential, and system approvals remain
-mandatory even when business authority is present. Delegation can only narrow
-authority, and signed exact-artifact audit history remains evidence rather than
-authority. Codex and Claude continue to use one canonical skill without losing
-native tools, context, permissions, autonomy, or concurrency.
+- **Greenfield:** assess first, preview controls, obtain explicit setup approval,
+  then let the first eligible commit establish the canonical checkpoint.
+- **Mid-flight:** assess and preview adoption, retain historical gaps as Unknown,
+  and accept reconstructed links only when their evidence is reviewed.
+- **Linked worktrees:** worktrees in one clone share the Git-common local
+  checkpoint catalogue while feature checkpoints remain isolated from the
+  canonical default-branch checkpoint.
+- **Independent clones:** each clone rebuilds and validates its own local cache;
+  fetched source alone does not import another machine's evidence.
+- **Privacy:** tracked manifests, ledgers, links, and instructions stay
+  reviewable in Git. Compiled graphs, checkpoints, completion records,
+  attestations, and other local/private evidence remain outside the publication
+  tree. There is no enterprise graph service in version 2.
+- **Fail closed:** stale, missing, or conflicting evidence is Unknown. A test
+  does not erase an incident, a graph edge does not prove approval, and a
+  completion receipt does not authorize publication or live use.
 
-## How it works
+Setup, dependency installation, hooks, persisted public contracts,
+publication, merge, deployment, release, production, security, privacy,
+credentials, financial decisions, destructive work, and ambiguous intent keep
+their explicit approval boundaries. Guided, Collaborative (default), and
+Steward autonomy change routine local behavior only; no level schedules work or
+expands authority.
 
-For a greenfield repository, Engineering assesses the local Git state, previews
-project controls, and—after approval—scaffolds the controls. Its first eligible
-commit gets a canonical local graph and deterministic overlay. For a mid-flight
-repository, it assesses first, previews adoption, reconstructs an advisory
-baseline, and preserves historical gaps as Unknown until they are reviewed and
-accepted. In both cases the everyday flow is: **assess → preview/approve setup
-→ baseline → prepare bounded work → verify/complete**.
+## Install for a project
 
-## Deterministic and LLM-assisted work
+Use the native Codex `skill-installer` against the repository from which you
+received access, pinned to the exact reviewed source revision. Repository read
+access permits installation; it does not grant write, merge, maintain, or admin
+rights. Use the exact 40-character merged release commit supplied with the
+release evidence, never a moving branch name:
 
-| Phase | Mode |
-| --- | --- |
-| Setup preview/mutation, pinned Graphify build/update/traversal/map, overlays, reducers, hooks, status, coverage, impact, assurance, receipts, maintenance | Local deterministic; no LLM or provider call. |
-| Graphify installation | Network only after explicit approval; no LLM. |
-| Codex/Claude design, planning, implementation, review, bounded-context interpretation, and optional semantic-evidence authoring | LLM-assisted and task-dependent. |
-| Greenfield setup | Controls can be scaffolded mechanically; intent and requirements still need human or host reasoning. |
-| Mid-flight reconstruction | The host may help; exact links stay evidence-bound and incomplete history stays Unknown/advisory. |
+```text
+--repo <owner>/<repository>
+--path .agents/skills/engineering
+--ref <exact-40-character-merged-release-commit>
+```
 
-Engineering has no daemon or background LLM loop. Map, status, hooks, and the
-controller never silently call an LLM; host usage depends on the task.
+The installer uses existing GitHub credentials and copies only that skill
+directory to `$CODEX_HOME/skills/engineering` (normally
+`~/.codex/skills/engineering`). Start a new Codex turn before using the skill. It
+neither writes to the repository nor adds the Engineering command to `PATH`.
+Until a command launcher has been installed through a separately authorized
+release procedure, invoke the checked-in `scripts/engineering` or
+`scripts/engineering.cmd` from that installed directory.
 
-## Dependencies and prerequisites
+Project controls remain a separate, explicit approval flow:
 
-- Required: a local Git repository and an eligible commit for a canonical map.
-  Without Git, Engineering stays useful in advisory mode and recommends local
-  initialization; it does not create a remote or commit implicitly.
-- Required for graph features: pinned Graphify 0.9.5 at reviewed commit
-  `d89ec68af95e0cad801b56d88df383991e659823`, so the code graph is
-  reproducible. The package does not declare a broader Python support range.
-- Optional: Codex or Claude for host reasoning; deterministic CLI/map paths do
-  not depend on either. Network is needed only for approved dependency install
-  or separately authorized external work.
-- Optional enhancements: schedulers, telemetry, identity, feedback, and
-  portfolio services. They are not hidden dependencies.
+1. Run `engineering setup <project-root>` to preview the exact project and
+   pinned-Graphify plans. It returns the required scopes and plan digests without
+   applying them.
+2. Review that output, then run `engineering approve-setup <project-root>` with
+   the returned `--project-plan-digest`, each required `--scope`, and the
+   `--graphify-plan-digest` when `graphify_install` is required.
+3. Rerun `engineering setup <project-root>`. Only an unchanged, matching
+   attestation is consumed to write project controls; the first eligible commit
+   then establishes the canonical checkpoint.
+
+This native route is **Codex-only**. The current skill-installer does not create
+Engineering's canonical `~/.agents` bundle, signed receipt, rollback copy,
+command launchers, or the thin Claude loader. The repository contains and tests
+those Codex/Claude parity functions, but exposes no supported self-service CLI
+that safely installs them from an exact repository commit. Claiming a portable
+Codex+Claude installation through this route is therefore unsupported. The
+minimal follow-up is a governed entry point over the existing canonical
+installer that verifies an exact clean source commit and emits its signed
+receipt; it must be separately designed, approved, and tested before use.
 
 ## Quick start
 
-Ask Codex or Claude to use Engineering for the current project. For routine
-local inspection, run `engineering --help`, then use `engineering map`,
-`engineering status <root>`, `engineering coverage <root>`,
-`engineering trace <root> <id>`, `engineering impact <root> <id>`,
-`engineering assurance-status <root> <capability> <cell>`,
-`engineering retrospect <root>`, or `engineering maintain status` as
-appropriate. `engineering autonomy <level> [root]` changes the saved level; it
-is not an inspection command. On Windows, only an install into the active
-operating-system user's home adds its managed command directory to user `PATH`
-and the current process. A new terminal may still be required. Temporary or
-custom-home installs, replay, upgrade, and rollback never mutate either `PATH`.
-Version 2.2.3 prevents new test-home pollution; it does not remove arbitrary
-historical entries.
+Ask Codex or Claude to use Engineering for the current project, or inspect the
+local CLI:
 
-Setup approval, `prepare`/`complete`, hooks, checkpoint/rebuild, and the
-learning lifecycle are controller or CI operations—not routine user commands.
+```text
+engineering --help
+engineering map <root>
+engineering status <root>
+engineering coverage <root>
+engineering trace <root> <identifier>
+engineering impact <root> <identifier>
+engineering why-code <root> <identifier>
+engineering why-test <root> <identifier>
+engineering compare <root> <commit-a> <commit-b>
+```
 
-| Autonomy | May do | Never does |
-| --- | --- | --- |
-| Guided | Detect and recommend. | Edit project controls without approval. |
-| Collaborative (default) | Handle routine, authorized in-scope work; queue unrelated maintenance. | Make consequential changes. |
-| Steward | Collaborative work plus one safe foreground maintenance pass. | Start a background service or expand authority. |
+`map` defaults to the current directory. Setup approval, checkpoint/rebuild,
+`prepare`/`complete`, hooks, and the learning lifecycle are controller or CI
+protocols; use the linked contracts below rather than guessing their inputs.
 
-All levels still need explicit approval for setup, dependencies, public or
-persisted contracts, publication, merge, deployment, security, credentials,
-financial decisions, destructive work, and ambiguity.
+On Windows the launcher prefers the Python Launcher (`py -3`) and falls back to
+`python` when `py` is unavailable. It does not install an interpreter or alter
+`PATH` while selecting one.
 
-Traceability debt is explicit but proportionate. Historical or advisory gaps
-remain visible while unrelated work proceeds. A native orchestrator may launch
-disjoint maintenance in parallel; shared-ledger mutations and overlapping
-writers serialize under the existing repository lock. Preparation blocks only
-when checkpoint identity/integrity, required
-current-contract evidence, or a selected graph/release acceptance is at risk.
-Authoritative-ledger and deterministic-overlay parity remains a blocking gate
-for graph-dependent acceptance. This uses native task events and the existing
-evaluation ledger, not a scheduler or another state machine.
+### Choose an autonomy level
+
+Inspect the saved level with `engineering status <root>`. Change it with
+`engineering autonomy <level> [root]`, where the level is:
+
+- **Guided:** detect, explain, and recommend; ask before project edits.
+- **Collaborative (default):** handle routine authorized work in the exact task
+  scope and queue unrelated maintenance.
+- **Steward:** Collaborative behavior plus safe queued maintenance during a
+  foreground Engineering run.
+
+Autonomy changes routine local behavior only. None schedules or backgrounds
+work. An autonomy level does not authorize setup, dependencies, checks,
+publication, merge, deployment, production, security, privacy, credentials,
+destructive or external actions; it does not expand native permissions and it
+does not override exact authority. Steward may process only safe queued
+maintenance during a foreground Engineering run.
+
+### Trace one requirement
+
+Suppose the project ledger names `REQ-042` and links it to a decision, a code
+symbol, and two checks:
+
+```text
+engineering trace <root> REQ-042
+engineering why-code <root> src.checkout:validate_order
+engineering why-test <root> tests.checkout:test_rejects_empty_order
+```
+
+`trace` shows the evidence path for the requirement. `why-code` and `why-test`
+walk back from a code or test identity to the requirement or decision that
+justifies it. If an expected link is absent, stale, ambiguous, or bound to a
+different commit, the answer stays Unknown rather than being guessed.
+
+## Where to see the graph
+
+`engineering map <root>` renders the exact current checkpoint as local HTML and
+opens it in the default browser. Add `--focus <identifier>` to narrow the view
+to that identifier and its reachable context. Add `--no-open` to leave the file
+unopened; the `engineering.map.v1` result still returns its output path.
+
+The generated view lives outside Git under the clone's Git-common
+`engineering-graphs/maps/<cache>/index.html`. It is local/private, not uploaded,
+and its cache identity is bound to the current checkpoint, overlays, and render
+options. For up to 5000 nodes the HTML shows a node and type table; for more
+than 5000 nodes it shows a type aggregate. The page reports the checkpoint's
+node count and deterministic link count. It is a bounded inspection surface,
+not a graph exploration application: `trace`, `impact`, `why-code`, `why-test`,
+and `compare` provide relationship paths and evidence detail. There is no hosted
+UI or enterprise graph service.
+
+## Workflow integrations
+
+Engineering also supports governed delivery without making orchestration the
+product. The host-native orchestrator can reconstruct scope, build a
+dependency-aware task DAG, use beneficial parallelism, assign one writer per
+shared mutable resource, and obtain independent acceptance of one exact
+integrated artifact. Codex and Claude use the same portable contract and keep
+their native capabilities and permissions. Automated and technical checks are
+necessary evidence; domain and real-consumer outcome acceptance remain separate
+and Unknown when representative evidence is missing.
+
+Material redesign, replacement, capability deletion, and simplification also
+use the existing signed scope handoff to map every baseline requirement as
+`INCLUDED`, `REPLACED`, `DEFERRED`, or `EXCLUDED`, with a reason and verification
+method. Replacement needs outcome-equivalence evidence. Deferral or exclusion
+needs exact owner-approved scope. Unmanaged, missing-checkpoint, stale,
+conflicting, or otherwise Unknown traceability supports advisory analysis only;
+it cannot be reported as accepted design or implementation-ready. Independent
+design and final acceptance verify that original user/business outcomes survive,
+so a narrowed contract does not pass merely by auditing itself.
+
+Version 2.2.4 distinguishes business-authority presence from whether approval
+must be requested again. Exact scoped authority can persist across unchanged
+turns, retries, callbacks, and bounded repair epochs. Revocation, consumption,
+expiry, or a changed repository, epoch, target, action, scope, or safeguard
+requires reapproval. Delegation can only narrow authority. Full Access is a
+technical permission, not business authority, and native destructive and
+connector approvals remain mandatory. Exact-artifact audit records are evidence
+only; they never mint or expand authority.
+
+Optional owner-private delivery evaluation records requested and actual model
+facts, dependencies, coordination, rework, auditor coverage, and independent
+technical, semantic, and outcome states. It retains the newest 365 records
+within 1 MiB and returns `insufficient_sample` below two comparable records.
+Model selection stays with the caller and native platform. No LangGraph runtime
+ships; adding one requires a demonstrated native-task gap and separate
+architecture and dependency approval.
+
+## Applied learning and source improvement
+
+Engineering uses one project-local lifecycle rather than a second learning
+store. A verified completion can capture a sanitized project-local improvement
+candidate with `learning-propose`. A distinct second project supplies evaluation
+evidence through `learning-evaluate`. The owner then keeps, inspects, dismisses,
+or promotes and applies the candidate through the existing `learning-keep`,
+`learning-inspect`, `learning-dismiss`, and `learning-promote-apply` surfaces;
+an applied practice can later be disabled explicitly.
+
+Only a promotion-attested applied practice can produce a bounded proposal-only
+upstream source-improvement proposal through `learning-source-proposal`. Raw
+project bodies, paths, secrets, commands, diffs, commits, publication, release,
+and install actions are excluded. A proposal contains no patch or authority to
+change, publish, release, or install the shared skill.
+
+## Feedback and improving Engineering
+
+For ordinary bugs, usability feedback, documentation gaps, or feature ideas,
+**open an Issue in the repository from which you installed the skill**. Include
+the Engineering version, operating system, Codex or Claude host when relevant,
+command or workflow, expected versus actual behavior, whether the result was
+Unknown or BLOCKED, and a minimal synthetic reproduction.
+
+Use sanitized or synthetic examples only. Never include credentials, private
+repository bodies, generated graphs or checkpoints, business data, tenant
+identifiers, personal paths, or production evidence. For a suspected
+vulnerability, follow that repository's SECURITY policy
+([SECURITY.md](SECURITY.md)); never report a suspected vulnerability in an Issue.
+
+Project-local improvement capture through `learning-propose` remains private and
+governed, and nothing is uploaded automatically. A user may manually submit a
+sanitized Issue when maintainer consideration is wanted. Every repository input
+enters the same capture -> evaluate/propose -> owner decision -> apply/verify
+lifecycle. Feedback is a proposal only: nothing uploads, merges, installs,
+promotes, or applies automatically, and Issue access does not confer upstream
+write or decision authority.
+
+## Dependencies and prerequisites
+
+- A local Git repository and an eligible commit are required for a canonical
+  map. A non-Git folder stays read-only and advisory; Engineering never creates
+  a remote or commit implicitly.
+- Graph features require Graphify 0.9.5 from
+  `https://github.com/safishamsi/graphify` at commit
+  `d89ec68af95e0cad801b56d88df383991e659823`. Installing or upgrading it is a
+  separate approved action. The package does not claim a broader Python support
+  range.
+- Codex and Claude are optional for host reasoning. Deterministic CLI and map
+  paths depend on neither. Network is needed only for an approved dependency
+  install or separately authorized external work.
+- Schedulers, telemetry, identity, feedback, portfolio services, and enterprise
+  graph sharing are optional or deferred integrations, not hidden dependencies.
+
+On Windows, only a new install into the active operating-system user's home may
+add the managed command directory to user and current-process `PATH`; a new
+terminal may still be needed. Custom/test-home install, replay, upgrade, and
+rollback do not mutate `PATH`. Version 2.2.3 prevents new arbitrary test-home
+pollution but does not delete historical entries whose ownership is unknown.
 
 ## What ships in 2.2
 
-2.2 ships the local capability manifest/topology, evidence reducer,
-deployment-cell assessment, bounded execution context, project-owned decision
-ledger indexing, and exact-commit Graphify plus deterministic overlays. It also
-supports opt-in `semantic_matrices`: only a declared ownership, routing,
-responsibility, classification, or state matrix touched by the change is
-checked. Each row needs one owner (or explicit unavailable/unowned state), one
+Version 2.2 ships exact-commit Graphify checkpoints, deterministic overlays,
+project-owned decision-ledger indexing, bounded execution context, local
+capability/topology and evidence reducers, deployment-cell assessment,
+completion receipts, and proportionate traceability debt.
+
+Opt-in `semantic_matrices` cover only an already-declared finite ownership,
+routing, responsibility, classification, or state matrix touched by a change.
+Each required row has one owner or an explicit unavailable/unowned state, one
 code identity, and positive and negative verification. Undeclared matrices,
-historical gaps, and unrelated work are not blocked.
+historical gaps, and unrelated work are not silently promoted into blockers.
 
-Decisions remain project-owned. Engineering indexes them but never infers
-approval or implementation from code, tests, or graph edges. Local/private
-evidence stays outside Git, and no live state changes automatically.
+`engineering retrospect` is a read-only, digest-bound inventory of the finite
+declared sources and evidence classifications. Optional host reconciliation is
+advisory; the controller invokes no LLM and writes no remediation. Foreground
+maintenance processes only mechanically verified work and starts no daemon,
+timer, poller, or background schedule.
 
-Version 2.2.2 also adds `engineering retrospect`: a read-only audit over the
-finite manifest, ledger, declared overlay sources, and checkpoint. The first
-call returns a digest-bound preview of sources, matrix scope, work, permissions,
-outputs, and optional host-LLM cost; rerun with `--preview-digest` to audit. It
-reports evidence classifications, declared matrix cells, and ledger/overlay drift. Optional host
-LLM reconciliation receives only that bounded source list and remains advisory;
-the controller never invokes an LLM or writes remediation.
-
-Version 2.2.3 adds the native delivery policy and bounded owner-private
-evaluation/trend records. Upgrade and rollback replace only validated skill,
-loader, launcher, and receipt surfaces; they preserve applied-learning queues,
-applied practices, attestations, keys, graph/checkpoint state, and other local
-overlays. Neither operation activates a project, connector, hook, or schedule.
+Installation and rollback replace only validated skill, loader, launcher, and
+receipt surfaces. They preserve owner-private evaluations and practices plus
+project-local graphs, checkpoints, keys, and attestations; they do not activate
+a project, connector, hook, schedule, or data record.
 
 ## Scale and limits
 
 | Context | Evidence today |
 | --- | --- |
-| Solo developer | Intended and locally validated; worktrees on one machine share local evidence. |
-| Team | Manifests/ledgers are tracked; each machine regenerates checkpoints. Tests model clones, worktrees, locking, reconciliation, and concurrency, not a real multi-user deployment. |
-| Enterprise | Capability/topology reducers have cell and boundary fixtures, but this is not an enterprise platform claim. No centralized HA service, distributed operational store, SSO/RBAC authority, telemetry platform, scheduler, cross-project live aggregator, or large-enterprise field validation ships in 2.2. |
+| Solo developer | Intended and locally validated; linked worktrees on one machine share local evidence. |
+| Team | Manifests and ledgers are tracked; each machine regenerates checkpoints. Tests model clones, worktrees, locking, reconciliation, and concurrency, not a real multi-user deployment. |
+| Enterprise | Reducers have bounded fixtures, but version 2 is not an enterprise platform claim. It ships no centralized HA graph service, distributed operational store, SSO/RBAC authority, telemetry platform, scheduler, cross-project live aggregator, or large-enterprise field validation. |
 
-Very large monorepos, many concurrent users or machines, long-duration
-operational evidence, and real enterprise topology/adapters remain untested or
-partially tested. The surrounding harness services above are roadmap/deferred
-work, not shipped dependencies.
+Very large monorepos, many concurrent users or machines, long-duration evidence,
+and real enterprise topology/adapters remain untested or partially tested.
+Roadmap services are not shipped dependencies.
 
 ## Troubleshooting and deeper detail
 
-If a map is unavailable, check Git/commit state, the pinned Graphify runner,
-and checkpoint freshness; Engineering reports the smallest recovery action.
-Read [SKILL.md](.agents/skills/engineering/SKILL.md) for operating guidance,
-the [controller contract](.agents/skills/engineering/references/controller-contract.md)
-for exact commands and receipts, and the
+If a map is unavailable, check Git and eligible-commit state, the exact pinned
+Graphify runner, and checkpoint freshness. Engineering reports the smallest
+recovery action while leaving unsupported claims Unknown.
+
+Read [SKILL.md](.agents/skills/engineering/SKILL.md) for canonical operating
+guidance and the [controller contract](.agents/skills/engineering/references/controller-contract.md)
+for exact protocols, schemas, authority rules, storage, and receipts. The
 [Capability Assurance design](docs/specs/engineering-capability-assurance-design.md)
-for the reviewed scope and deferred services.
+records its reviewed scope and deferred services.
 
 This repository is available under Apache-2.0. Verification does not authorize
 installation or use in a live project.

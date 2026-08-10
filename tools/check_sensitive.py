@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -36,8 +37,28 @@ def files() -> list[Path]:
     return [ROOT / item for item in result.stdout.decode("utf-8").split("\0") if item]
 
 
+def nonshared_files() -> set[str]:
+    path = ROOT / "release" / "audience-classification.json"
+    if not path.is_file():
+        return set()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(value, dict):
+        return set()
+    result: set[str] = set()
+    for name in ("internal_only", "audience_specific"):
+        items = value.get(name)
+        if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+            return set()
+        result.update(items)
+    return result
+
+
 def main() -> int:
     failures: list[str] = []
+    nonshared = nonshared_files()
     for path in files():
         relative = path.relative_to(ROOT)
         if any(part in SKIP_PARTS for part in relative.parts) or not path.is_file():
@@ -48,6 +69,8 @@ def main() -> int:
             failures.append(f"{relative.as_posix()}: non-UTF-8 tracked file")
             continue
         for label, pattern in PATTERNS.items():
+            if label == "private identifier" and relative.as_posix() in nonshared:
+                continue
             if pattern.search(text):
                 failures.append(f"{relative.as_posix()}: {label}")
     if failures:

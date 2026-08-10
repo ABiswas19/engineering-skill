@@ -411,6 +411,25 @@ caller scope as complete authority.
 commit-bound attestation; a handoff completion supplies `--result-scope`, and
 the retained completion manifest records that exact result for replay.
 
+A material `redesign`, `replacement`, `capability_deletion`, or
+`simplification` also carries `outcome_survival` inside that same signed
+handoff. It enumerates the reconstructed baseline IDs and maps every one to
+`INCLUDED`, `REPLACED`, `DEFERRED`, or `EXCLUDED`, with a bounded reason and
+verification identities. `REPLACED` additionally requires replacement
+identities and an outcome-equivalence decision inside architect/result scope.
+`DEFERRED` and `EXCLUDED` carry no replacement claim; their exact mapping is
+permitted only because the existing commit-bound decision artifact and scope
+attestation record owner authority. Missing and duplicate mappings list the
+affected baseline IDs and fail closed. The mapping is retained through
+completion and replay; no second decision ledger is created.
+
+An unmanaged project returns advisory readiness with outcome survival Unknown
+and no completion surface. A missing canonical checkpoint, stale or invalid
+context, conflicting authority, or other traceability failure blocks material
+change readiness and reports the exact Unknown boundary. Such analysis may
+inform a draft, but it is never end-to-end design acceptance or
+implementation-ready evidence.
+
 Final handoff defaults to one-sentence **Outcome**, then **Now** and **Next**;
 include **Blocked** only for a genuine blocker. Preparation, readiness, impact,
 completion evidence, and technical caveats are optional **Details**, used only
@@ -706,7 +725,10 @@ canonical bundle, prior bundle and loaders are
 `<engineering-home>/.claude/skills/engineering/`. The installed command launchers
 are `<engineering-home>/.agents/bin/engineering` and `engineering.cmd`; on Windows
 installation adds only that managed directory to the user `PATH` (a new terminal
-picks it up). The machine controller is
+picks it up). The Windows skill launcher preserves `py -3` when that command is
+available and otherwise invokes `python`; selection uses only constant command
+names and the launcher-relative controller path, never rewrites `PATH`, and
+propagates the selected interpreter's exit code. The machine controller is
 `<engineering-home>/.agents/engineering/controller/`; its key, attestations and
 index are `attestation.key`, `attestations.json`, and
 `contribution-index.json`. The queue and operation locks are
@@ -762,6 +784,14 @@ Reject symptom-only or narrow handoffs rather than letting implementers
 self-scope from the latest request. Exact-artifact acceptance independently
 rejects narrow, incomplete, or proxy-only results even when the seed symptom
 passes.
+
+For a material redesign or replacement, design and final exact-artifact
+acceptance also verify the original user or business outcomes against the
+signed outcome-survival mapping. Candidate-local contracts, tests, and audits
+cannot accept a stateless or otherwise narrowed replacement merely because it
+is internally consistent. Semantic outcome equivalence remains an independent
+review responsibility; the deterministic controller ensures that no baseline
+outcome disappears from that review.
 
 A parent does not report a lane as active, complete, or awaiting approval
 until its orchestrator has consumed and reconciled every native child terminal

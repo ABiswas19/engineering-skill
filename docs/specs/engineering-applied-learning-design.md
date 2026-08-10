@@ -102,7 +102,7 @@ release, and installation governance remains required.
 
 The canonical repository contains generic skill source, synthetic tests,
 human-readable documentation, and canonical-source release controls. A separate
-public mirror is regenerated through an allowlisted export and independent Git
+paired exported repository is regenerated through an allowlisted shared export and independent Git
 history.
 
 Neither repository contains project histories, applied-harness state,

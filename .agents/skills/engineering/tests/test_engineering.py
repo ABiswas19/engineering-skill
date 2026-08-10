@@ -178,7 +178,11 @@ class SkillShapeTests(unittest.TestCase):
             for item in scenario_payload["scenarios"]
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         }
-        for identifier in ("seed-feedback-scope", "traceability-debt-maintenance"):
+        for identifier in (
+            "seed-feedback-scope",
+            "traceability-debt-maintenance",
+            "outcome-survival",
+        ):
             with self.subTest(identifier=identifier):
                 self.assertIn(identifier, scenarios)
                 self.assertTrue(scenarios[identifier]["must"])
@@ -196,6 +200,16 @@ class SkillShapeTests(unittest.TestCase):
                     "test_traceability_debt_scenario_executes_controller_blocking_matrix",
                     "test_required_current_contract_maintenance_blocks_preparation",
                     "test_unsafe_checkpoint_maintenance_blocks_preparation",
+                ),
+            ),
+            "outcome-survival": (
+                Task5ContractTests,
+                (
+                    "test_material_replacement_rejects_candidate_local_success_without_equivalence",
+                    "test_outcome_survival_lists_each_missing_baseline_mapping",
+                    "test_unmanaged_material_redesign_is_advisory_and_never_accepted",
+                    "test_managed_material_redesign_blocks_with_exact_mapping_boundary",
+                    "test_seed_feedback_scope_handoff_uses_signed_approval_and_completion",
                 ),
             ),
         }
@@ -5081,6 +5095,134 @@ class Task5ContractTests(unittest.TestCase):
         self.assertNotEqual("blocked", prepared["readiness"])
         return root, prepared
 
+    def test_material_replacement_rejects_candidate_local_success_without_equivalence(self):
+        handoff = {
+            "seed_evidence": ["REQ-COOPERATIVE-ORCHESTRATION"],
+            "reconstructed_scope": [
+                "REQ-COOPERATIVE-ORCHESTRATION",
+                "CAP-STATELESS-VALIDATOR",
+                "TEST-VALIDATOR-PASSES",
+            ],
+            "architect_scope": [
+                "REQ-COOPERATIVE-ORCHESTRATION",
+                "CAP-STATELESS-VALIDATOR",
+                "TEST-VALIDATOR-PASSES",
+            ],
+            "result_scope": [
+                "REQ-COOPERATIVE-ORCHESTRATION",
+                "CAP-STATELESS-VALIDATOR",
+                "TEST-VALIDATOR-PASSES",
+            ],
+            "result_artifacts": ["validator.py", "tests/test_validator.py"],
+            "outcome_survival": {
+                "baseline_ids": ["REQ-COOPERATIVE-ORCHESTRATION"],
+                "mappings": [
+                    {
+                        "baseline_id": "REQ-COOPERATIVE-ORCHESTRATION",
+                        "disposition": "REPLACED",
+                        "reason": "Candidate-local validator checks pass.",
+                        "verification_ids": ["TEST-VALIDATOR-PASSES"],
+                        "replacement_ids": ["CAP-STATELESS-VALIDATOR"],
+                        "equivalence_decision_id": None,
+                    }
+                ],
+            },
+        }
+
+        with self.assertRaisesRegex(
+            self.module().EngineeringError, "outcome-equivalence"
+        ):
+            self.module()._scope_handoff(handoff, require_approval=False)
+
+    def test_outcome_survival_lists_each_missing_baseline_mapping(self):
+        handoff = {
+            "seed_evidence": ["REQ-COOPERATIVE-ORCHESTRATION"],
+            "reconstructed_scope": [
+                "REQ-COOPERATIVE-ORCHESTRATION",
+                "REQ-HUMAN-COORDINATION",
+                "TEST-ORCHESTRATION",
+            ],
+            "architect_scope": [
+                "REQ-COOPERATIVE-ORCHESTRATION",
+                "REQ-HUMAN-COORDINATION",
+                "TEST-ORCHESTRATION",
+            ],
+            "result_scope": [
+                "REQ-COOPERATIVE-ORCHESTRATION",
+                "REQ-HUMAN-COORDINATION",
+                "TEST-ORCHESTRATION",
+            ],
+            "result_artifacts": ["orchestrator.py"],
+            "outcome_survival": {
+                "baseline_ids": [
+                    "REQ-COOPERATIVE-ORCHESTRATION",
+                    "REQ-HUMAN-COORDINATION",
+                ],
+                "mappings": [
+                    {
+                        "baseline_id": "REQ-COOPERATIVE-ORCHESTRATION",
+                        "disposition": "INCLUDED",
+                        "reason": "Cooperative orchestration remains present.",
+                        "verification_ids": ["TEST-ORCHESTRATION"],
+                        "replacement_ids": [],
+                        "equivalence_decision_id": None,
+                    }
+                ],
+            },
+        }
+
+        with self.assertRaisesRegex(
+            self.module().EngineeringError, "REQ-HUMAN-COORDINATION"
+        ):
+            self.module()._scope_handoff(handoff, require_approval=False)
+
+    def test_unmanaged_material_redesign_is_advisory_and_never_accepted(self):
+        root = self.init_repo("unmanaged-outcome-survival")
+
+        prepared = self.module().prepare(
+            root,
+            "replace cooperative orchestration with a stateless validator",
+            {
+                "scope": ["validator.py"],
+                "forbidden": [],
+                "change_class": "replacement",
+            },
+        )
+
+        self.assertEqual("advisory", prepared["readiness"])
+        self.assertFalse(prepared["completion_available"])
+        self.assertEqual("unknown", prepared["outcome_survival"]["state"])
+        self.assertEqual(
+            "unmanaged_project", prepared["outcome_survival"]["boundary"]
+        )
+        self.assertFalse(prepared["outcome_survival"]["accepted"])
+        self.assertFalse(prepared["outcome_survival"]["implementation_ready"])
+
+    def test_managed_material_redesign_blocks_with_exact_mapping_boundary(self):
+        root, _ = self.prepared_repo("managed-outcome-survival")
+        self.module().approve_checks(root)
+
+        prepared = self.module().prepare(
+            root,
+            "simplify cooperative orchestration",
+            {
+                "scope": ["README.md"],
+                "forbidden": [],
+                "change_class": "simplification",
+            },
+        )
+
+        self.assertEqual("blocked", prepared["readiness"])
+        self.assertEqual(
+            ["baseline_reconstruction_required"],
+            prepared["outcome_survival"]["missing_baseline_mappings"],
+        )
+        self.assertEqual(
+            "signed_scope_handoff_required",
+            prepared["outcome_survival"]["approval_boundary"],
+        )
+
+
     def test_seed_feedback_scope_handoff_uses_signed_approval_and_completion(self):
         module = self.module()
         root, _ = self.prepared_repo("scope-handoff")
@@ -5113,6 +5255,19 @@ class Task5ContractTests(unittest.TestCase):
             "architect_scope": ["REQ-1", "DEC-1"],
             "result_scope": ["REQ-1", "DEC-1"],
             "result_artifacts": ["README.md", "requirements.md"],
+            "outcome_survival": {
+                "baseline_ids": ["REQ-1"],
+                "mappings": [
+                    {
+                        "baseline_id": "REQ-1",
+                        "disposition": "EXCLUDED",
+                        "reason": "Owner approved the exact exclusion for this redesign.",
+                        "verification_ids": ["DEC-1"],
+                        "replacement_ids": [],
+                        "equivalence_decision_id": None,
+                    }
+                ],
+            },
         }
         approval = module.approve_scope_handoff(root, "PROJ-DEC-1", raw_handoff)
         handoff = approval["scope_handoff"]
@@ -5123,6 +5278,7 @@ class Task5ContractTests(unittest.TestCase):
                 {
                     "scope": ["README.md", "requirements.md"],
                     "forbidden": [],
+                    "change_class": "capability_deletion",
                     "scope_handoff": {
                         **handoff,
                         "approval_id": "attestation-" + "0" * 32,
@@ -5135,6 +5291,7 @@ class Task5ContractTests(unittest.TestCase):
             {
                 "scope": ["README.md", "requirements.md"],
                 "forbidden": [],
+                "change_class": "capability_deletion",
                 "scope_handoff": handoff,
             },
         )
@@ -5163,6 +5320,9 @@ class Task5ContractTests(unittest.TestCase):
             result_scope=handoff["result_scope"],
         )
         self.assertEqual(handoff["result_scope"], completion["scope_result"])
+        self.assertEqual(
+            handoff["outcome_survival"], completion["outcome_survival"]
+        )
         replay = module.complete(root, prepared["run_id"], receipts=[])
         self.assertEqual(completion, replay)
 
@@ -7380,6 +7540,110 @@ class Task7ContractTests(unittest.TestCase):
         self.assertTrue(launcher.is_file())
         self.assertIn("..\\skills\\engineering\\scripts\\engineering.cmd", launcher.read_text(encoding="utf-8"))
         self.assertTrue(module._valid_command_launchers(launcher.parent))
+
+    def _run_windows_skill_launcher(self, available: tuple[str, ...]) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copy2(SKILL_DIR / "scripts" / "engineering.cmd", scripts / "engineering.cmd")
+            (scripts / "engineering.py").write_text("raise SystemExit(99)\n", encoding="utf-8")
+            capture = root / "capture.txt"
+            for command in available:
+                (root / f"{command}.cmd").write_text(
+                    '@echo off\r\n>"%CAPTURE_FILE%" echo %~n0 %*\r\nexit /b 0\r\n',
+                    encoding="utf-8",
+                    newline="",
+                )
+            environment = {
+                **os.environ,
+                "PATH": str(root),
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                "CAPTURE_FILE": str(capture),
+            }
+            result = subprocess.run(
+                [
+                    os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+                    "/d",
+                    "/c",
+                    str(scripts / "engineering.cmd"),
+                    "--help",
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=10,
+            )
+            result.capture = capture.read_text(encoding="utf-8").strip() if capture.is_file() else ""
+            return result
+
+    @unittest.skipUnless(os.name == "nt", "Windows launcher contract")
+    def test_windows_skill_launcher_preserves_py3_preference(self):
+        result = self._run_windows_skill_launcher(("py", "python"))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertRegex(result.capture, r'^py -3 ".+engineering\.py" --help$')
+
+    @unittest.skipUnless(os.name == "nt", "Windows launcher contract")
+    def test_windows_skill_launcher_falls_back_to_python_when_py_is_unavailable(self):
+        result = self._run_windows_skill_launcher(("python",))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertRegex(result.capture, r'^python ".+engineering\.py" --help$')
+
+    @unittest.skipUnless(os.name == "nt", "Windows launcher contract")
+    def test_windows_skill_launcher_invokes_resolved_python_without_pathext(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copy2(SKILL_DIR / "scripts" / "engineering.cmd", scripts / "engineering.cmd")
+            shutil.copy2(sys.executable, root / "python.exe")
+            runtime_dll = Path(sys.executable).with_name(
+                f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+            )
+            if runtime_dll.is_file():
+                shutil.copy2(runtime_dll, root / runtime_dll.name)
+            capture = root / "capture.txt"
+            (scripts / "engineering.py").write_text(
+                "from pathlib import Path\n"
+                "import os, sys\n"
+                "Path(os.environ['CAPTURE_FILE']).write_text(' '.join(sys.argv[1:]), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            environment = {
+                **os.environ,
+                "PATH": str(root),
+                "PATHEXT": "",
+                "CAPTURE_FILE": str(capture),
+            }
+
+            result = subprocess.run(
+                [
+                    os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+                    "/d",
+                    "/c",
+                    str(scripts / "engineering.cmd"),
+                    "--help",
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=10,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("--help", capture.read_text(encoding="utf-8"))
+
+    def test_windows_skill_launcher_executes_the_resolved_interpreter_path(self):
+        launcher = (SKILL_DIR / "scripts" / "engineering.cmd").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('set "ENGINEERING_PYTHON=%%~$PATH:I"', launcher)
+        self.assertIn('"%ENGINEERING_PYTHON%"', launcher)
+        self.assertNotRegex(launcher, r"(?m)^py -3 ")
+        self.assertNotRegex(launcher, r"(?m)^python ")
 
     def test_semantic_matrix_blocks_only_impacted_declared_rows(self):
         module = self.module()
@@ -10291,9 +10555,10 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
 
             result = module.prepare(root, "change an existing module", {"scope": ["README.md"]})
 
-            self.assertEqual("ready_with_advisories", result["readiness"])
+            self.assertEqual("advisory", result["readiness"])
             self.assertIsNone(result["run_id"])
             self.assertEqual("unknown", result["project"]["traceability"])
+            self.assertFalse(result["completion_available"])
             self.assertFalse((root / "engineering-traceability.json").exists())
             self.assertFalse((Path(module.common_graph_dir(root)) / "runs").exists())
 
