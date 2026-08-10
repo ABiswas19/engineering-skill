@@ -94,6 +94,42 @@ def _source_commit(root: Path) -> str:
     return commit
 
 
+def _assert_clean_head_snapshot(root: Path, files: list[str]) -> None:
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    if status:
+        raise ExportError("export source worktree is not clean")
+    for relative in files:
+        _safe_file(root, relative)
+        try:
+            committed = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", f"HEAD:{relative}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            observed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "hash-object",
+                    f"--path={relative}",
+                    relative,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except subprocess.SubprocessError as error:
+            raise ExportError("export source is not bound to HEAD") from error
+        if observed != committed:
+            raise ExportError("export source bytes do not match HEAD")
+
+
 def _snapshot_digest(commit: str, tree_digest: str) -> str:
     return "sha256:" + hashlib.sha256(
         (commit + "\0" + tree_digest).encode("ascii")
@@ -169,9 +205,9 @@ def _validate_audience_classification(source: Path, shared_files: list[str]) -> 
 
 def _audience_policy(
     source: Path,
+    destination: Path,
     shared_files: list[str],
     metadata: dict[str, object] | None = None,
-    metadata_commits: dict[str, str] | None = None,
 ) -> tuple[dict | None, list[str]]:
     path = source / "release" / "audience-isolation-policy.json"
     if not path.is_file():
@@ -179,7 +215,9 @@ def _audience_policy(
     module = _audience_module()
     policy = module.load_policy(path)
     snapshots = metadata if isinstance(metadata, dict) else {}
-    commits = metadata_commits if isinstance(metadata_commits, dict) else {}
+    commits = {"source": _source_commit(source)}
+    if metadata is not None:
+        commits["distribution"] = _source_commit(destination)
     blockers = module.policy_blockers(
         policy, "source", snapshots.get("source"), commits.get("source")
     )
@@ -247,7 +285,6 @@ def export_tree(
     source: Path,
     destination: Path,
     metadata: dict[str, object] | None = None,
-    metadata_commits: dict[str, str] | None = None,
 ) -> dict:
     source = Path(source).resolve()
     destination = Path(destination).resolve()
@@ -274,15 +311,16 @@ def export_tree(
     ):
         raise ExportError("public export manifest is invalid")
     files = manifest["files"]
+    _assert_clean_head_snapshot(source, files)
+    source_commit = _source_commit(source)
     audience_specific = _validate_audience_classification(source, files)
     policy, policy_blockers = _audience_policy(
-        source, files, metadata, metadata_commits
+        source, destination, files, metadata
     )
     audience_specific_files = _audience_specific_receipt(
         destination, audience_specific, policy
     )
     sources = {relative: _safe_file(source, relative) for relative in files}
-    source_commit = _source_commit(source)
     source_tree_digest = _tree_digest(source, files)
     source_snapshot_digest = _snapshot_digest(source_commit, source_tree_digest)
     receipt_path = _safe_destination(destination_git, "engineering-public-export.json")

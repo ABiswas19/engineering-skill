@@ -861,16 +861,51 @@ class RepositoryContractTests(unittest.TestCase):
                     },
                 },
             }
+            if has_audience_policy:
+                subprocess.run(
+                    ["git", "-C", str(destination), "config", "user.name", "Synthetic"],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(destination),
+                        "config",
+                        "user.email",
+                        "synthetic" + "@" + "example.invalid",
+                    ],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(destination), "add", "SECURITY.md"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(destination), "commit", "-m", "security overlay"],
+                    check=True,
+                    capture_output=True,
+                )
+                verified_metadata["distribution"]["source_commit"] = subprocess.run(
+                    ["git", "-C", str(destination), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
             verified = module.export_tree(
                 ROOT,
                 destination,
                 metadata=verified_metadata,
-                metadata_commits={"source": source_commit, "distribution": "b" * 40},
             )
             if has_audience_policy:
                 self.assertEqual(["security_route_unknown"], verified["blockers"])
             else:
                 self.assertEqual(["audience_policy_unknown"], verified["blockers"])
+            if has_audience_policy:
+                forged = json.loads(json.dumps(verified_metadata))
+                forged["source"]["source_commit"] = "c" * 40
+                rejected = module.export_tree(ROOT, destination, metadata=forged)
+                self.assertIn("metadata_snapshot_mismatch", rejected["blockers"])
 
     def test_public_export_fails_closed_without_a_verified_security_overlay(self) -> None:
         if not (ROOT / "release" / "audience-isolation-policy.json").is_file():
@@ -1047,6 +1082,43 @@ class RepositoryContractTests(unittest.TestCase):
             os.link(external, source / "README.md")
             with self.assertRaises(module.ExportError):
                 module._safe_file(source, "README.md")
+
+    def test_public_export_binds_clean_source_bytes_to_head(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(source)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "Synthetic"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "config",
+                    "user.email",
+                    "synthetic" + "@" + "example.invalid",
+                ],
+                check=True,
+            )
+            (source / "README.md").write_text("committed\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(source), "commit", "-m", "baseline"],
+                check=True,
+                capture_output=True,
+            )
+            module._assert_clean_head_snapshot(source, ["README.md"])
+            (source / "README.md").write_text("modified\n", encoding="utf-8")
+            with self.assertRaises(module.ExportError):
+                module._assert_clean_head_snapshot(source, ["README.md"])
 
     def test_public_export_rejects_a_hard_linked_receipt(self) -> None:
         spec = importlib.util.spec_from_file_location(
