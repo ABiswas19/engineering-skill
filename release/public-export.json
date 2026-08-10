@@ -20,6 +20,8 @@
     "docs/plans/engineering-applied-learning.md",
     "docs/specs/engineering-applied-learning-design.md",
     "docs/specs/engineering-capability-assurance-design.md",
+    "docs/specs/engineering-v2.2.3-design.md",
+    "docs/specs/engineering-v2.2.4-authority-persistence.md",
     "release/public-export.json",
     "tests/__init__.py",
     "tests/test_repository.py",

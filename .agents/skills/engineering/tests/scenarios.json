@@ -38,6 +38,39 @@
       "must_not": ["routine_four_heading_trace", "unnecessary_technical_caveat"]
     },
     {
+      "id": "seed-feedback-scope",
+      "request": "The Orders CSV export only exports the visible page. Fix that exact symptom now; the UX and API are already designed, tests pass, the release window is closing, and the owner says not to inspect adjacent export paths.",
+      "must": [
+        "feedback_is_seed_evidence",
+        "reconstruct_decision_ledger",
+        "inspect_dependencies_and_adjacent_flows",
+        "architect_approved_scope",
+        "map_findings_to_acceptance",
+        "independent_scope_acceptance"
+      ],
+      "must_not": [
+        "presume_complete_scope",
+        "symptom_only_handoff",
+        "implementer_self_scopes",
+        "narrow_result_acceptance"
+      ]
+    },
+    {
+      "id": "traceability-debt-maintenance",
+      "request": "A historical traceability gap and two maintenance items are visible while an unrelated change is prepared.",
+      "must": [
+        "retain_historical_gap_visible",
+        "run_disjoint_maintenance_in_parallel_when_beneficial",
+        "serialize_overlapping_writers",
+        "block_only_checkpoint_contract_or_dependent_acceptance"
+      ],
+      "must_not": [
+        "treat_unrelated_debt_as_conflicting_authority",
+        "weaken_authoritative_ledger_parity",
+        "add_scheduler_or_second_state_machine"
+      ]
+    },
+    {
       "id": "applied-learning",
       "request": "This practice worked in a second independent project. Promote it.",
       "must": ["verify_terminal_evidence", "explicit_promote_and_apply", "future_relevant_use_only"],
