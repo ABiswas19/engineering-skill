@@ -66,6 +66,16 @@ class RepositoryContractTests(unittest.TestCase):
             workflow,
         )
 
+    def test_ci_fetches_reachable_history_for_audience_audit(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            workflow,
+            r"(?m)^      - uses: actions/checkout@v4\n        with:\n"
+            r"          fetch-depth: 0$",
+        )
+
     def test_ci_runs_windows_controller_and_installer_isolation_regression(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(
             encoding="utf-8"
