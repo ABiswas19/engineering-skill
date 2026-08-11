@@ -61,10 +61,36 @@ def _validated_policy(value: object) -> dict:
             or markers != sorted(set(markers), key=str.casefold)
             or any(not isinstance(marker, str) or not marker.strip() for marker in markers)
             or not isinstance(route, dict)
-            or set(route) != {"state", "mechanism"}
-            or route["state"] not in {"verified", "unknown"}
-            or (route["state"] == "verified") != isinstance(route["mechanism"], str)
         ):
+            raise AudienceError("audience policy is invalid")
+        state = route.get("state")
+        if state == "verified":
+            valid_route = (
+                set(route) == {"state", "mechanism"}
+                and isinstance(route.get("mechanism"), str)
+                and bool(route["mechanism"].strip())
+            )
+        elif state == "unknown":
+            valid_route = (
+                set(route) == {"state", "mechanism"}
+                and route.get("mechanism") is None
+            )
+        elif state == "not_required":
+            valid_route = (
+                set(route)
+                == {"state", "mechanism", "authority_reference", "residual_risk"}
+                and route.get("mechanism") is None
+                and re.fullmatch(
+                    r"owner-approved:[a-z0-9._-]{1,120}",
+                    str(route.get("authority_reference", "")),
+                )
+                is not None
+                and isinstance(route.get("residual_risk"), str)
+                and 1 <= len(route["residual_risk"].strip()) <= 240
+            )
+        else:
+            valid_route = False
+        if not valid_route:
             raise AudienceError("audience policy is invalid")
     surfaces = value.get("surfaces")
     if (
@@ -325,6 +351,56 @@ def audit_tree(root: Path, paths: list[str], policy_value: object, audience: str
     return sorted(set(_content_blockers(texts, policy, audience, "tree")))
 
 
+def audit_security_overlay(root: Path, policy_value: object, audience: str) -> list[str]:
+    policy = _validated_policy(policy_value)
+    if audience not in AUDIENCES:
+        raise AudienceError("audience is invalid")
+    path = Path(root) / "SECURITY.md"
+    if not path.is_file() or path.is_symlink():
+        return ["security_policy_unknown"]
+    try:
+        security = " ".join(path.read_text(encoding="utf-8").casefold().split())
+    except (OSError, UnicodeDecodeError):
+        return ["security_policy_unknown"]
+    route = policy["audiences"][audience]["security_route"]
+    if route["state"] == "unknown":
+        return ["security_route_unknown"]
+    if route["state"] == "not_required":
+        required = (
+            "does not provide a repository-supported vulnerability-reporting channel",
+            "must not be submitted through ordinary issues",
+            "do not open an ordinary issue for a suspected vulnerability",
+            "residual risk",
+            route["residual_risk"].casefold(),
+        )
+        blockers: list[str] = []
+        if any(marker not in security for marker in required):
+            blockers.append("security_policy_unknown")
+        if (
+            "github private vulnerability reporting" in security
+            or "security/advisories/new" in security
+            or re.search(r"https?://|[a-z0-9._%+-]+@[a-z0-9.-]+", security)
+        ):
+            blockers.append("security_route_invented")
+        if any(
+            marker in security
+            for marker in (
+                "report it in an ordinary issue",
+                "submit it through an ordinary issue",
+                "disclose it in an ordinary issue",
+            )
+        ):
+            blockers.append("ordinary_issue_vulnerability_intake")
+        return sorted(set(blockers))
+    if (
+        route["mechanism"] != "github_private_vulnerability_reporting"
+        or "github private vulnerability reporting" not in security
+        or "security/advisories/new" not in security
+    ):
+        return ["security_route_unknown"]
+    return []
+
+
 def policy_blockers(
     policy_value: object,
     audience: str,
@@ -335,7 +411,7 @@ def policy_blockers(
     if audience not in AUDIENCES:
         raise AudienceError("audience is invalid")
     blockers: list[str] = []
-    if policy["audiences"][audience]["security_route"]["state"] != "verified":
+    if policy["audiences"][audience]["security_route"]["state"] == "unknown":
         blockers.append("security_route_unknown")
     if metadata is None:
         blockers.append("metadata_audit_unknown")
@@ -376,6 +452,7 @@ def main() -> int:
         ).stdout.strip()
         blockers = policy_blockers(policy, arguments.audience, metadata, head)
         blockers.extend(audit_tree(root, [item for item in tracked if item], policy, arguments.audience))
+        blockers.extend(audit_security_overlay(root, policy, arguments.audience))
         blockers.extend(audit_reachable_history(root, policy, arguments.audience))
         blockers = sorted(set(blockers))
     except (AudienceError, OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:

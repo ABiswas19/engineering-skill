@@ -441,6 +441,49 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual("byte_identical", policy["export"]["mode"])
         self.assertTrue(policy["export"]["same_snapshot_required"])
         self.assertEqual([], policy["export"]["transformations"])
+        source_route = policy["audiences"]["source"]["security_route"]
+        self.assertEqual("not_required", source_route["state"])
+        self.assertIsNone(source_route["mechanism"])
+        self.assertRegex(
+            source_route["authority_reference"],
+            r"^owner-approved:[a-z0-9._-]+$",
+        )
+        self.assertIn(
+            "no repository-supported vulnerability intake",
+            source_route["residual_risk"].lower(),
+        )
+        distribution_route = policy["audiences"]["distribution"]["security_route"]
+        self.assertEqual(
+            {
+                "state": "verified",
+                "mechanism": "github_private_vulnerability_reporting",
+            },
+            distribution_route,
+        )
+
+        governance = " ".join(
+            (ROOT / "docs" / "plans" / "engineering-v2.2.4-security-governance.md")
+            .read_text(encoding="utf-8")
+            .lower()
+            .split()
+        )
+        for marker in (
+            "requirement matrix",
+            "design matrix",
+            "trace matrix",
+            "release matrix",
+            "owner-approved:engineering-v2.2.4-internal-security-intake-not-required",
+            "residual risk",
+        ):
+            self.assertIn(marker, governance)
+        self.assertNotIn(
+            "docs/plans/engineering-v2.2.4-security-governance.md",
+            json.loads(
+                (ROOT / "release" / "public-export.json").read_text(
+                    encoding="utf-8"
+                )
+            )["files"],
+        )
 
         internal = " ".join(
             (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").lower().split()
@@ -485,10 +528,12 @@ class RepositoryContractTests(unittest.TestCase):
             return
 
         self.assertIn("do not open an ordinary issue", security)
-        self.assertIn("owner-approved private", security)
-        self.assertIn("unknown", security)
-        self.assertIn("release blocker", security)
-        self.assertIn("do not invent", security)
+        self.assertIn("does not provide a repository-supported vulnerability-reporting channel", security)
+        self.assertIn("must not be submitted through ordinary issues", security)
+        self.assertIn("residual risk", security)
+        self.assertNotIn("github private vulnerability reporting", security)
+        self.assertNotIn("security/advisories/new", security)
+        self.assertNotRegex(security, r"https?://|[a-z0-9._%+-]+@[a-z0-9.-]+")
         forms = {
             "bug": ROOT / ".github" / "ISSUE_TEMPLATE" / "bug-idea.yml",
             "code": ROOT / ".github" / "ISSUE_TEMPLATE" / "code-proposal.yml",
@@ -553,7 +598,12 @@ class RepositoryContractTests(unittest.TestCase):
             "audiences": {
                 "source": {
                     "forbidden_markers": ["DISTRIBUTION-ONLY"],
-                    "security_route": {"state": "unknown", "mechanism": None},
+                    "security_route": {
+                        "state": "not_required",
+                        "mechanism": None,
+                        "authority_reference": "owner-approved:synthetic-release-scope",
+                        "residual_risk": "No repository-supported vulnerability intake is available.",
+                    },
                 },
                 "distribution": {
                     "forbidden_markers": ["CANONICAL-ONLY"],
@@ -610,8 +660,29 @@ class RepositoryContractTests(unittest.TestCase):
         incomplete = json.loads(json.dumps(valid))
         del incomplete["surfaces"]["comments"]
         self.assertIn("metadata_surface_unknown", module.audit_metadata(policy, incomplete))
-        self.assertIn("security_route_unknown", module.policy_blockers(policy, "source", None))
+        self.assertNotIn("security_route_unknown", module.policy_blockers(policy, "source", None))
         self.assertIn("metadata_audit_unknown", module.policy_blockers(policy, "source", None))
+
+        source_security = """# Security
+
+This release does not provide a repository-supported vulnerability-reporting channel.
+Vulnerability and security-sensitive or private-production details must not be submitted
+through ordinary Issues. Do not open an ordinary Issue for a suspected vulnerability.
+Residual risk: No repository-supported vulnerability intake is available.
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            security_root = Path(temporary)
+            (security_root / "SECURITY.md").write_text(source_security, encoding="utf-8")
+            self.assertEqual(
+                [], module.audit_security_overlay(security_root, policy, "source")
+            )
+            (security_root / "SECURITY.md").write_text(
+                source_security + "\nReport it in an ordinary Issue.\n", encoding="utf-8"
+            )
+            self.assertIn(
+                "ordinary_issue_vulnerability_intake",
+                module.audit_security_overlay(security_root, policy, "source"),
+            )
 
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -776,10 +847,7 @@ class RepositoryContractTests(unittest.TestCase):
                 )
             self.assertFalse(result["publication_ready"])
             expected_blockers = (
-                [
-                    "metadata_audit_unknown",
-                    "security_route_unknown",
-                ]
+                ["metadata_audit_unknown"]
                 if (ROOT / "release" / "audience-isolation-policy.json").is_file()
                 else ["audience_policy_unknown"]
             )
@@ -898,7 +966,7 @@ class RepositoryContractTests(unittest.TestCase):
                 metadata=verified_metadata,
             )
             if has_audience_policy:
-                self.assertEqual(["security_route_unknown"], verified["blockers"])
+                self.assertEqual([], verified["blockers"])
             else:
                 self.assertEqual(["audience_policy_unknown"], verified["blockers"])
             if has_audience_policy:

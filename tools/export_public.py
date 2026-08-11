@@ -230,6 +230,7 @@ def _audience_policy(
         )
     )
     blockers.extend(module.audit_reachable_history(source, policy, "source"))
+    blockers.extend(module.audit_security_overlay(source, policy, "source"))
     blockers.extend(module.audit_tree(source, shared_files, policy, "distribution"))
     if policy["export"]["mode"] != "byte_identical" or policy["export"]["transformations"]:
         blockers.append("transformation_equivalence_unimplemented")
@@ -254,16 +255,7 @@ def _audience_specific_receipt(
     module = _audience_module()
     if module.audit_tree(destination, sorted(paths), policy, "distribution"):
         raise ExportError("audience-specific security overlay is contaminated")
-    route = policy["audiences"]["distribution"]["security_route"]
-    if route["state"] != "verified":
-        raise ExportError("audience-specific security route is unknown")
-    security = " ".join(
-        paths["SECURITY.md"].read_text(encoding="utf-8").split()
-    ).casefold()
-    if route["mechanism"] == "github_private_vulnerability_reporting" and (
-        "github private vulnerability reporting" not in security
-        or "security/advisories/new" not in security
-    ):
+    if module.audit_security_overlay(destination, policy, "distribution"):
         raise ExportError("audience-specific security route is unverified")
     return {relative: _file_digest(path) for relative, path in sorted(paths.items())}
 

@@ -2510,19 +2510,28 @@ class Task3ContractTests(unittest.TestCase):
     def test_hook_budget_preserves_prior_checkpoint_and_marks_stale(self):
         module = self.module()
         root = self.governed_repo()
-        fake, environment = self.cold_checkpoint(root)
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        with patch.dict(os.environ, environment, clear=False):
+            baseline = module.rebuild(
+                root,
+                sys.executable,
+                cleanup_timeout_seconds=30,
+            )
+        self.assertEqual("full", baseline["mode"])
         prior = module._checkpoint_path(root, self.git(root, "rev-parse", "HEAD"))
         self.commit_file(root, "src/example.py", "changed = True\n")
 
         with patch.dict(
             os.environ,
-            {**environment, "FAKE_GRAPHIFY_SLOW": "0.2"},
+            {**environment, "FAKE_GRAPHIFY_SLOW": "120"},
             clear=False,
         ):
             result = module.rebuild(
                 root,
                 sys.executable,
                 hook_budget_seconds=0.01,
+                cleanup_timeout_seconds=30,
             )
 
         self.assertEqual("stale", result["freshness"])

@@ -15,6 +15,7 @@
 | AUTH-09 | Exact-artifact acceptance history is distinct from task completion and authority. | Signed append-only audit events bind authority ID, artifact SHA-256, auditor reference, verdict, and timestamp; the authority-artifact-auditor tuple has one immutable observation, and conflicting replay fails closed. | Accepted/rejected event, replay, changed-time conflict, and ledger-bound tests. |
 | AUTH-10 | Codex and Claude remain portable peers with native capabilities intact. | The canonical skill states the same authority contract for both hosts and installation continues to generate thin loaders over one canonical bundle. No tool, permission, context, autonomy, or concurrency restriction is added. | Repository parity and policy contract tests. |
 | AUTH-11 | Worker retry exhaustion is not a new approval request. | Policy requires `PAUSED_AWAITING_CENTRAL_ADJUDICATION`; a new bounded epoch may reuse authority only when the exact binding and authority epoch remain unchanged. | Policy contract test plus unchanged-binding resolution test. |
+| AUTH-12 | An owner may remove a repository-specific vulnerability-intake requirement for one release without representing the omitted capability as verified security coverage. | The audience policy records `not_required`, an exact owner-authority reference, and explicit residual risk; ordinary Issues remain prohibited for vulnerability or private-production evidence, while audiences with verified private reporting remain unchanged. | Policy-schema, overlay, exporter, negative Issue-intake, audience-isolation, and paired-release tests. |
 
 ## Storage and trust boundary
 
@@ -84,3 +85,14 @@ does not silently reinterpret it as proof of either valid or invalid origin.
   scoped installation-provenance change.
 - No connector, network, publication, merge, deployment, installation,
   settings, PATH, credential, live-data, or populated-data action is included.
+
+## Audience-specific security release decision
+
+The release policy distinguishes `verified`, `unknown`, and owner-authorized
+`not_required`. `not_required` is an explicit task-scoped release decision, not
+a verified route and not security coverage. It requires an exact owner-authority
+reference and a retained residual-risk statement. A repository using that state
+must prohibit vulnerability and security-sensitive or private-production
+evidence in ordinary Issues and must not invent a mailbox, contact, URL, or
+redirect. A paired audience with verified private reporting remains independently
+required and is verified against its own security overlay.
