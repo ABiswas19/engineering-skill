@@ -16,7 +16,6 @@
     "CLAUDE.md",
     "LICENSE",
     "README.md",
-    "SECURITY.md",
     "docs/plans/engineering-applied-learning.md",
     "docs/specs/engineering-applied-learning-design.md",
     "docs/specs/engineering-capability-assurance-design.md",
@@ -25,6 +24,7 @@
     "release/public-export.json",
     "tests/__init__.py",
     "tests/test_repository.py",
+    "tools/check_audience.py",
     "tools/check_sensitive.py",
     "tools/export_public.py"
   ]

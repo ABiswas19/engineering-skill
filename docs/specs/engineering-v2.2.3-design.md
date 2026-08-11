@@ -60,6 +60,29 @@ results.
 | R23 | Technical, domain/semantic, and real-consumer outcome acceptance remain distinct; representative-data/outcome gaps fail the acceptance gate, and supplied evidence must resolve to validated completion/check receipts. | Proxy-pass/outcome-fail, unbound-evidence rejection, and audit false-positive trend regressions. |
 | R24 | User input and feedback are seed evidence; the orchestrator reconstructs full available scope before architect/SME dispatch, implementers receive architect-approved scope, and narrow handoffs/results fail independent acceptance. | Signed, commit-bound `scope_handoff` approval, expected-artifact/result regression, and native-host scope-acceptance smoke. |
 | R25 | Historical/advisory traceability debt remains visible; disjoint maintenance may proceed in parallel and overlapping writers serialize, while only checkpoint identity/integrity, required current-contract evidence, or dependent graph/release acceptance blocks. | Maintenance advisory/serialization scenarios; authoritative-ledger and deterministic-overlay parity regression. |
+| R26 | A material redesign, replacement, capability deletion, or simplification reconstructs baseline approved outcomes and maps each one as INCLUDED, REPLACED, DEFERRED, or EXCLUDED before implementation-ready status. REPLACED binds outcome-equivalence decision and verification identities; DEFERRED or EXCLUDED remains possible only inside the exact signed owner-approved scope handoff. | Cooperative-orchestrator-to-stateless-validator regression, complete mapping validation, explicit-exclusion approval, and completion replay. |
+| R27 | Unmanaged, missing-checkpoint, stale, conflicting, or otherwise Unknown traceability permits advisory analysis only and cannot be represented as accepted design or implementation-ready evidence. | Unmanaged and canonical-checkpoint-unavailable preparation regressions with explicit Unknown boundary output. |
+| R28 | Independent design/final acceptance checks original outcome survival in addition to candidate-local technical and semantic correctness. A narrowed contract does not pass by auditing itself. | Signed survival mapping is retained through preparation and completion; missing mapping and missing equivalence evidence fail closed even when candidate-local checks pass. |
+
+## Outcome-survival amendment
+
+The existing project decision ledger and signed `scope_handoff` remain the only
+sources of baseline and approval evidence. A material change carries one bounded
+outcome-survival mapping inside that handoff; no second ledger or task state
+machine is added. Every baseline requirement has one disposition, reason, and
+verification identity. A replacement additionally names replacement identities
+and an outcome-equivalence decision. Deferred and excluded outcomes are not
+silently omitted: the exact mapping is commit-bound to the existing owner-
+approved decision artifact and scope attestation.
+
+Preparation exposes incomplete mappings and the exact Unknown or approval
+boundary. An unmanaged project or unavailable canonical checkpoint may support
+advisory/draft analysis but cannot create completion-ready evidence. Completion
+revalidates the signed mapping and retains it with the exact artifact. Host-
+native design and final auditors must still judge semantic outcome equivalence;
+the deterministic controller ensures that baseline outcomes cannot disappear
+from that review merely because the candidate's narrower contract is internally
+consistent.
 
 ## Migration and Windows host mutation
 
