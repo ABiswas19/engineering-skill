@@ -42,9 +42,9 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
-    def test_release_manifest_is_v2_2_4_with_pinned_graphify(self) -> None:
+    def test_release_manifest_is_v2_2_5_with_pinned_graphify(self) -> None:
         manifest = json.loads((SKILL_ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual("2.2.4", manifest["version"])
+        self.assertEqual("2.2.5", manifest["version"])
         self.assertEqual(1, manifest["controller_schema"])
         self.assertEqual(
             {
