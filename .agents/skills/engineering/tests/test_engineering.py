@@ -2444,6 +2444,217 @@ class Task3ContractTests(unittest.TestCase):
         self.assertIn("features", checkpoint.parts)
         self.assertNotIn("main", checkpoint.parts)
 
+    def test_invalid_checkpoint_is_losslessly_quarantined_before_regeneration(self):
+        module = self.module()
+        root = self.governed_repo("invalid-checkpoint-quarantine")
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        with patch.dict(os.environ, environment, clear=False):
+            first = module.rebuild(root, sys.executable)
+        self.assertEqual("full", first["mode"])
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_path(root, commit)
+        marker = destination.parent / "opaque-preserved.bin"
+        marker.write_bytes(b"synthetic-preserved-bytes\x00")
+        invalid = json.loads(destination.read_text(encoding="utf-8"))
+        invalid["metadata"]["project_identity"] = "0" * 64
+        destination.write_text(json.dumps(invalid), encoding="utf-8")
+        before = {
+            path.relative_to(destination.parent).as_posix(): path.read_bytes()
+            for path in destination.parent.rglob("*")
+            if path.is_file()
+        }
+
+        with patch.dict(os.environ, environment, clear=False):
+            result = module.rebuild(root, sys.executable)
+
+        self.assertEqual("current", result["freshness"])
+        quarantine = result["quarantine"]
+        self.assertEqual("root_binding_mismatch", quarantine["reason"])
+        quarantine_path = module.common_graph_dir(root) / quarantine["relative_path"]
+        self.assertEqual(
+            before,
+            {
+                path.relative_to(quarantine_path).as_posix(): path.read_bytes()
+                for path in quarantine_path.rglob("*")
+                if path.is_file()
+            },
+        )
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+        catalogue = module.graph_checkpoint_catalogue(root)
+        self.assertIn(
+            quarantine["relative_path"],
+            [item["relative_path"] for item in catalogue["quarantined"]],
+        )
+
+    def test_failed_regeneration_rolls_back_quarantined_checkpoint_losslessly(self):
+        module = self.module()
+        root = self.governed_repo("invalid-checkpoint-rollback")
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        with patch.dict(os.environ, environment, clear=False):
+            first = module.rebuild(root, sys.executable)
+        self.assertEqual("full", first["mode"])
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_path(root, commit)
+        invalid = json.loads(destination.read_text(encoding="utf-8"))
+        invalid["metadata"]["project_identity"] = "0" * 64
+        destination.write_text(json.dumps(invalid), encoding="utf-8")
+        before = {
+            path.relative_to(destination.parent).as_posix(): path.read_bytes()
+            for path in destination.parent.rglob("*")
+            if path.is_file()
+        }
+
+        quarantined = module._quarantine_invalid_checkpoint(
+            root, destination, commit, branch="main", kind="canonical"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(
+            {"restored": True, "already_regenerated": False},
+            module._restore_quarantined_checkpoint(root, quarantined),
+        )
+
+        with patch.dict(
+            os.environ, {**environment, "FAKE_GRAPHIFY_FAIL": "1"}, clear=False
+        ):
+            result = module.rebuild(root, sys.executable)
+
+        self.assertEqual("stale", result["freshness"])
+        self.assertIn(result["reason"], {"EngineeringError", "graphify_adapter_failed"})
+        self.assertEqual(
+            before,
+            {
+                path.relative_to(destination.parent).as_posix(): path.read_bytes()
+                for path in destination.parent.rglob("*")
+                if path.is_file()
+            },
+        )
+        catalogue = module.graph_checkpoint_catalogue(root)
+        self.assertTrue(catalogue["quarantined"])
+        self.assertEqual("root_binding_mismatch", catalogue["quarantined"][0]["reason"])
+
+    def test_legacy_rebuild_quarantines_invalid_immutable_address(self):
+        module = self.module()
+        root = self.governed_repo("legacy-invalid-checkpoint-quarantine")
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        commit = self.git(root, "rev-parse", "HEAD")
+        with patch.dict(os.environ, environment, clear=False):
+            first = module.rebuild(root, commit, sys.executable)
+        destination = module._checkpoint_destination(
+            root, commit, branch="main", kind="feature"
+        )
+        self.assertEqual(destination, first)
+        invalid = json.loads(destination.read_text(encoding="utf-8"))
+        invalid["metadata"]["project_identity"] = "0" * 64
+        destination.write_text(json.dumps(invalid), encoding="utf-8")
+
+        with patch.dict(os.environ, environment, clear=False):
+            rebuilt = module.rebuild(root, commit, sys.executable)
+
+        self.assertEqual(destination, rebuilt)
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+
+    def test_recover_checkpoint_returns_machine_recovery_envelope(self):
+        module = self.module()
+        root = self.governed_repo("checkpoint-recovery-command")
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        with patch.dict(os.environ, environment, clear=False):
+            first = module.rebuild(root, sys.executable)
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_path(root, commit)
+        invalid = json.loads(destination.read_text(encoding="utf-8"))
+        invalid["metadata"]["project_identity"] = "0" * 64
+        destination.write_text(json.dumps(invalid), encoding="utf-8")
+
+        with patch.dict(os.environ, environment, clear=False):
+            result = module.recover_checkpoint(root, commit, sys.executable)
+
+        self.assertEqual("engineering.checkpoint-recovery.v1", result["schema"])
+        self.assertEqual("current", result["freshness"])
+        self.assertEqual(commit, result["commit"])
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+
+    def test_recover_checkpoint_targets_canonical_address_in_remote_repo(self):
+        module = self.module()
+        root = self.governed_repo("remote-canonical-recovery")
+        self.git(root, "remote", "add", "origin", "https://example.invalid/engineering.git")
+        self.git(
+            root,
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        )
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        with patch.dict(os.environ, environment, clear=False):
+            first = module.reconcile_canonical(
+                root,
+                refresh_remote=False,
+                allow_cached_remote=True,
+                graphify_python=sys.executable,
+            )
+        self.assertEqual("current", first["freshness"])
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_destination(
+            root, commit, branch="main", kind="canonical"
+        )
+        invalid = json.loads(destination.read_text(encoding="utf-8"))
+        invalid["metadata"]["project_identity"] = "0" * 64
+        destination.write_text(json.dumps(invalid), encoding="utf-8")
+
+        with patch.dict(os.environ, environment, clear=False):
+            result = module.recover_checkpoint(root, commit, sys.executable)
+
+        self.assertEqual("current", result["freshness"])
+        self.assertIn("main", Path(result["checkpoint"]).parts)
+        self.assertNotIn("features", Path(result["checkpoint"]).parts)
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+
+    def test_quarantine_catalogue_rejects_tampered_sidecar_identity(self):
+        module = self.module()
+        root = self.governed_repo("tampered-quarantine-record")
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        with patch.dict(os.environ, environment, clear=False):
+            first = module.rebuild(root, sys.executable)
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_path(root, commit)
+        invalid = json.loads(destination.read_text(encoding="utf-8"))
+        invalid["metadata"]["project_identity"] = "0" * 64
+        destination.write_text(json.dumps(invalid), encoding="utf-8")
+        with patch.dict(os.environ, environment, clear=False):
+            result = module.rebuild(root, sys.executable)
+        quarantine_path = module.common_graph_dir(root) / result["quarantine"]["relative_path"]
+        metadata_path = quarantine_path.with_name(quarantine_path.name + ".json")
+        tampered = json.loads(metadata_path.read_text(encoding="utf-8"))
+        tampered["commit"] = "../escape"
+        metadata_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+        with self.assertRaisesRegex(module.EngineeringError, "record_invalid|identity_invalid"):
+            module.graph_checkpoint_catalogue(root)
+
+    def test_empty_invalid_checkpoint_address_is_quarantined_and_regenerated(self):
+        module = self.module()
+        root = self.governed_repo("empty-invalid-checkpoint")
+        fake = self.write_fake_graphify()
+        environment = self.graphify_environment(fake)
+        with patch.dict(os.environ, environment, clear=False):
+            first = module.rebuild(root, sys.executable)
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_path(root, commit)
+        shutil.rmtree(destination.parent)
+        destination.parent.mkdir(parents=True)
+
+        with patch.dict(os.environ, environment, clear=False):
+            result = module.rebuild(root, sys.executable)
+
+        self.assertEqual("current", result["freshness"])
+        self.assertEqual(0, result["quarantine"]["file_count"])
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+
     def test_exact_checkpoint_hit_skips_graphify_update(self):
         module = self.module()
         root = self.governed_repo()
