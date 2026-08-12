@@ -2973,6 +2973,7 @@ def register_hook_operation(root: Path) -> dict:
         "lock_token": token,
         "phase": "registered",
         "owner_pid": os.getpid(),
+        "owner_identity": _process_identity(os.getpid()),
         "created_at": time.time(),
         **{key: str(_lexical_absolute(value)) for key, value in paths.items()},
     }
@@ -3016,6 +3017,7 @@ def _acquire_repository_lock(record: dict) -> bool:
         "operation_id": record["operation_id"],
         "lock_token": record["lock_token"],
         "owner_pid": os.getpid(),
+        "owner_identity": _process_identity(os.getpid()),
         "created_at": time.time(),
     }
     if "run_id" in record:
@@ -3062,6 +3064,264 @@ def _process_alive(pid: object) -> bool:
     return True
 
 
+def _process_tree_status(record: dict) -> dict:
+    """Return conservative process-tree evidence for an orphan operation."""
+    worker_pid = record.get("worker_pid")
+    expected = record.get("worker_identity")
+    tree = record.get("worker_process_tree")
+    if not isinstance(worker_pid, int) or worker_pid <= 0:
+        return {"state": "dead", "evidence": "no_worker_started"}
+    if not isinstance(expected, dict) or not isinstance(tree, list) or not tree:
+        return {"state": "identity_ambiguous", "evidence": "missing_process_tree_identity"}
+    expected_by_pid = {}
+    for item in tree:
+        if not isinstance(item, dict) or not isinstance(item.get("pid"), int):
+            return {"state": "identity_ambiguous", "evidence": "invalid_process_tree_identity"}
+        if not isinstance(item.get("start_time"), str) or not item["start_time"]:
+            return {"state": "identity_ambiguous", "evidence": "invalid_process_tree_identity"}
+        if item["pid"] in expected_by_pid:
+            return {"state": "identity_ambiguous", "evidence": "duplicate_process_identity"}
+        expected_by_pid[item["pid"]] = item
+    leader = expected_by_pid.get(worker_pid)
+    if leader is None or leader.get("start_time") != expected.get("start_time"):
+        return {"state": "identity_ambiguous", "evidence": "leader_identity_mismatch"}
+    for pid, saved in expected_by_pid.items():
+        if not _process_alive(pid):
+            continue
+        current = _process_identity(pid)
+        if current is None:
+            return {"state": "identity_ambiguous", "evidence": "process_identity_unreadable", "pid": pid}
+        if current.get("start_time") != saved.get("start_time"):
+            return {"state": "identity_ambiguous", "evidence": "pid_reused", "pid": pid}
+        return {"state": "live", "evidence": "saved_process_alive", "pid": pid}
+    return {"state": "dead", "evidence": "saved_process_tree_absent"}
+
+
+def _process_identity(pid: int) -> dict | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+
+        class _FileTime(ctypes.Structure):
+            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetProcessTimes.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(_FileTime), ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime), ctypes.POINTER(_FileTime),
+        )
+        kernel32.GetProcessTimes.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.OpenProcess(0x0400 | 0x1000, False, pid)
+        if not handle:
+            return None
+        creation = _FileTime()
+        exit_time = _FileTime()
+        kernel_time = _FileTime()
+        user_time = _FileTime()
+        try:
+            if not kernel32.GetProcessTimes(
+                handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                ctypes.byref(kernel_time), ctypes.byref(user_time)
+            ):
+                return None
+            start = (int(creation.high) << 32) | int(creation.low)
+            return {"pid": pid, "start_time": str(start)}
+        finally:
+            kernel32.CloseHandle(handle)
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        fields = stat_path.read_text(encoding="utf-8").split()
+        return {"pid": pid, "start_time": fields[21]}
+    except (OSError, IndexError):
+        return None
+
+
+def _windows_process_entries() -> list[dict] | None:
+    """Enumerate Windows processes and parent IDs without a shell command."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class _ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W))
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W))
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        return None
+    entries = []
+    entry = _ProcessEntry32W()
+    entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
+    try:
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return None
+        while True:
+            entries.append(
+                {
+                    "pid": int(entry.th32ProcessID),
+                    "parent_pid": int(entry.th32ParentProcessID),
+                }
+            )
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return entries
+
+
+def _capture_process_tree(pid: int) -> list[dict] | None:
+    """Capture a bounded PID/parent/start-time snapshot without shelling out."""
+    root = _process_identity(pid)
+    if root is None:
+        return [] if not _process_alive(pid) else None
+    if os.name == "nt":
+        raw_entries = _windows_process_entries()
+        if raw_entries is None:
+            return None
+        by_pid = {item["pid"]: item for item in raw_entries}
+        if pid not in by_pid:
+            return [root]
+        selected = []
+        for candidate_pid in by_pid:
+            if candidate_pid == pid or _is_descendant(candidate_pid, by_pid, pid):
+                identity = _process_identity(candidate_pid)
+                if identity is not None:
+                    selected.append({**identity, "parent_pid": by_pid[candidate_pid]["parent_pid"]})
+        return selected or [root]
+    entries = {pid: {**root, "parent_pid": None}}
+    proc_root = Path("/proc")
+    try:
+        candidates = [item for item in proc_root.iterdir() if item.name.isdigit()]
+    except OSError:
+        return [root]
+    for item in candidates:
+        try:
+            fields = (item / "stat").read_text(encoding="utf-8").split()
+            child_pid = int(item.name)
+            parent_pid = int(fields[3])
+            identity = _process_identity(child_pid)
+        except (OSError, ValueError, IndexError):
+            continue
+        if identity is not None:
+            entries[child_pid] = {**identity, "parent_pid": parent_pid}
+    descendants = [item for child_pid, item in entries.items() if child_pid == pid or _is_descendant(child_pid, entries, pid)]
+    return descendants or [root]
+
+
+def _is_descendant(pid: int, entries: dict[int, dict], root_pid: int) -> bool:
+    seen = set()
+    current = pid
+    while current not in seen:
+        seen.add(current)
+        parent = entries.get(current, {}).get("parent_pid")
+        if parent == root_pid:
+            return True
+        if not isinstance(parent, int):
+            return False
+        current = parent
+    return False
+
+
+def orphan_operation_status(root: Path) -> dict:
+    """List durable operation records with conservative process-tree status."""
+    project_root = resolve_project_root(str(root))
+    operations = _common_graph_dir(project_root) / "state" / "operations"
+    result = []
+    if operations.is_dir():
+        for child in sorted(operations.iterdir()):
+            if not child.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", child.name):
+                continue
+            try:
+                record = _read_operation(project_root, child.name)
+                status = _process_tree_status(record)
+            except EngineeringError as error:
+                result.append({"operation_id": child.name, "state": "invalid", "reason": str(error)})
+                continue
+            result.append({
+                "operation_id": child.name,
+                "phase": record.get("phase"),
+                "process_tree": status,
+                "lock": _lock_owner(record),
+            })
+    return {"schema": "engineering.orphan-status.v1", "operations": result}
+
+
+def reap_orphan_operation(root: Path, operation_id: str, *, timeout_seconds: float) -> dict:
+    """Reap one orphan only after fresh, exact process and lock evidence."""
+    project_root = resolve_project_root(str(root))
+    try:
+        record = _read_operation(project_root, operation_id)
+    except EngineeringError as error:
+        return {"completed": False, "reason": str(error), "user_visible": True}
+    if record.get("phase") not in {
+        "orphaned",
+        "registered",
+        "worktree_created",
+        "staging_ready",
+        "validating",
+        "published",
+    }:
+        return {"completed": False, "reason": "operation_not_orphaned", "user_visible": True}
+    owner = _lock_owner(record)
+    if owner is None:
+        return {"completed": False, "reason": "repository_lock_owner_missing", "user_visible": True}
+    if not _orphan_is_old_enough(record, owner):
+        return {"completed": False, "reason": "orphan_too_young", "user_visible": True}
+    status = _process_tree_status(record)
+    if status.get("state") == "live":
+        return {"completed": False, "reason": "live_worker_process_tree", "user_visible": True}
+    if status.get("state") != "dead":
+        return {"completed": False, "reason": "ambiguous_worker_process_identity", "user_visible": True}
+    if (
+        owner.get("operation_id") != operation_id
+        or owner.get("lock_token") != record.get("lock_token")
+    ):
+        return {"completed": False, "reason": "repository_lock_owner_mismatch", "user_visible": True}
+    if owner is not None and record.get("worker_pid") is not None:
+        if owner.get("owner_pid") != record.get("worker_pid"):
+            return {"completed": False, "reason": "repository_lock_owner_mismatch", "user_visible": True}
+        if owner.get("owner_identity") != record.get("worker_identity"):
+            return {"completed": False, "reason": "ambiguous_worker_process_identity", "user_visible": True}
+    status = _process_tree_status(record)
+    if status.get("state") != "dead":
+        return {
+            "completed": False,
+            "reason": "live_worker_process_tree"
+            if status.get("state") == "live"
+            else "ambiguous_worker_process_identity",
+            "user_visible": True,
+        }
+    record["worker_process_tree_dead"] = True
+    record["worker_process_tree_evidence"] = status
+    record["process_tree_reaped_at"] = time.time()
+    _write_operation(record)
+    return cleanup_hook_operation(project_root, operation_id, timeout_seconds=timeout_seconds)
+
+
 def _orphan_is_old_enough(record: dict, owner: dict | None) -> bool:
     now = time.time()
     timestamps = [record.get("created_at")]
@@ -3100,12 +3360,34 @@ def _wait_process_group(
     return True
 
 
+def _saved_process_tree_absent(tree: object) -> tuple[bool, str]:
+    if not isinstance(tree, list) or not tree:
+        return False, "missing_process_tree_identity"
+    for saved in tree:
+        if not isinstance(saved, dict) or not isinstance(saved.get("pid"), int):
+            return False, "invalid_process_tree_identity"
+        if not _process_alive(saved["pid"]):
+            continue
+        current = _process_identity(saved["pid"])
+        if current is None:
+            continue
+        if current.get("start_time") != saved.get("start_time"):
+            return False, "pid_reused"
+        return False, "saved_process_alive"
+    return True, "saved_process_tree_absent"
+
+
 def _terminate_process_tree(
-    process: subprocess.Popen, pgid: int | None = None
+    process: subprocess.Popen,
+    pgid: int | None = None,
+    *,
+    expected_tree: list[dict] | None = None,
 ) -> bool:
     if os.name == "nt":
         if process.poll() is not None:
-            return False
+            if expected_tree is None:
+                return False
+            return _saved_process_tree_absent(expected_tree)[0]
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -3120,6 +3402,8 @@ def _terminate_process_tree(
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=2)
+        if expected_tree is not None:
+            return _saved_process_tree_absent(expected_tree)[0]
         return process.poll() is not None
     if pgid is None:
         if process.poll() is not None:
@@ -3290,6 +3574,19 @@ def _recover_worker_tree_state(
     worker_pid = record.get("worker_pid")
     pgid = record.get("worker_pgid")
     killpg = getattr(os, "killpg", None)
+    if os.name == "nt" and not isinstance(pgid, int):
+        status = _process_tree_status(record)
+        if status.get("state") != "dead":
+            return None
+        paths = _validated_operation_paths(root, operation_id)
+        trusted_record = {
+            **record,
+            **{key: str(value) for key, value in paths.items()},
+            "worker_process_tree_dead": True,
+            "worker_process_tree_evidence": status,
+        }
+        _write_operation(trusted_record)
+        return trusted_record
     if (
         not isinstance(worker_pid, int)
         or worker_pid <= 0
@@ -4094,12 +4391,16 @@ def _run_graph_operation(
             "worker_pid": process.pid,
             "worker_start_pending": False,
             "worker_process_tree_dead": False,
+            "worker_identity": _process_identity(process.pid),
+            "worker_process_tree": _capture_process_tree(process.pid),
         }
     )
     if worker_pgid is not None:
         record["worker_pgid"] = worker_pgid
     else:
         record.pop("worker_pgid", None)
+    if record.get("worker_identity") is None or not record.get("worker_process_tree"):
+        record["worker_process_tree_identity_ambiguous"] = True
     _write_operation(record)
     _atomic_text(
         Path(record["repository_lock_path"]) / "owner.json",
@@ -4108,6 +4409,7 @@ def _run_graph_operation(
                 "operation_id": record["operation_id"],
                 "lock_token": record["lock_token"],
                 "owner_pid": process.pid,
+                "owner_identity": record.get("worker_identity"),
                 "created_at": time.time(),
             },
             indent=2,
@@ -4120,7 +4422,18 @@ def _run_graph_operation(
         process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        worker_process_tree_dead = _terminate_process_tree(process, worker_pgid)
+        if os.name == "nt":
+            refreshed_tree = _capture_process_tree(process.pid)
+            if isinstance(refreshed_tree, list) and refreshed_tree:
+                record["worker_process_tree"] = refreshed_tree
+                _write_operation(record)
+        expected_tree = record.get("worker_process_tree")
+        if isinstance(expected_tree, list) and expected_tree:
+            worker_process_tree_dead = _terminate_process_tree(
+                process, worker_pgid, expected_tree=expected_tree
+            )
+        else:
+            worker_process_tree_dead = _terminate_process_tree(process, worker_pgid)
     else:
         worker_process_tree_dead = (
             process.poll() is not None
@@ -4151,6 +4464,11 @@ def _run_graph_operation(
         }
     latest_record = _read_operation(project_root, operation["operation_id"])
     latest_record["worker_process_tree_dead"] = worker_process_tree_dead
+    latest_record["worker_process_tree_evidence"] = (
+        {"state": "dead", "evidence": "termination_confirmed"}
+        if worker_process_tree_dead
+        else _process_tree_status(latest_record)
+    )
     latest_record["phase"] = "orphaned"
     _write_operation(latest_record)
     record = latest_record
@@ -13060,6 +13378,12 @@ def main() -> int:
     maintain_parser.add_argument("target")
     maintain_parser.add_argument("root", nargs="?")
     maintain_parser.add_argument("--area")
+    orphan_status_parser = commands.add_parser("orphan-status")
+    orphan_status_parser.add_argument("root")
+    orphan_reap_parser = commands.add_parser("orphan-reap")
+    orphan_reap_parser.add_argument("root")
+    orphan_reap_parser.add_argument("operation_id")
+    orphan_reap_parser.add_argument("--timeout-seconds", type=float, default=5.0)
     learning_propose = commands.add_parser("learning-propose")
     learning_propose.add_argument("root")
     learning_propose.add_argument("completion_id")
@@ -13143,6 +13467,16 @@ def main() -> int:
                     raise EngineeringError("Maintenance accepts exactly one project root.")
                 root = resolve_project_root(arguments.target)
                 result = run_maintenance(root, arguments.area)
+        elif arguments.command == "orphan-status":
+            root = resolve_project_root(arguments.root)
+            result = orphan_operation_status(root)
+        elif arguments.command == "orphan-reap":
+            root = resolve_project_root(arguments.root)
+            result = reap_orphan_operation(
+                root,
+                arguments.operation_id,
+                timeout_seconds=arguments.timeout_seconds,
+            )
         elif arguments.command in {"map", "traceability", "traceability-view", "prepare", "setup", "retrospect"}:
             advisory = pre_repository_advisory(arguments.root)
             if advisory is not None:
@@ -13321,7 +13655,7 @@ def main() -> int:
                 _load_checkpoint(root, git(root, "rev-parse", arguments.commit_a)),
                 _load_checkpoint(root, git(root, "rev-parse", arguments.commit_b)),
             )
-        elif arguments.command != "maintain":
+        elif arguments.command not in {"maintain", "orphan-status", "orphan-reap"}:
             commit = git(root, "rev-parse", arguments.commit or "HEAD")
             checkpoint = _load_checkpoint(root, commit)
             if arguments.command == "status":
