@@ -2383,6 +2383,7 @@ def validate_checkpoint(
 def _checkpoint_destination(
     root: Path, commit: str, *, branch: str, kind: str
 ) -> Path:
+    _validate_checkpoint_address(commit, branch, kind)
     graph_dir = _common_graph_dir(root)
     if kind == "canonical":
         return graph_dir / "main" / commit / "checkpoint.json"
@@ -2393,6 +2394,22 @@ def _checkpoint_destination(
         / commit
         / "checkpoint.json"
     )
+
+
+def _validate_checkpoint_address(commit: object, branch: object, kind: object) -> None:
+    if (
+        not isinstance(commit, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", commit)
+        or not isinstance(kind, str)
+        or kind not in {"canonical", "feature"}
+        or not isinstance(branch, str)
+        or not branch
+        or len(branch) > 255
+        or any(ord(character) < 32 or ord(character) == 127 for character in branch)
+        or any(part in {"", ".", ".."} for part in PurePosixPath(branch).parts)
+        or "\\" in branch
+    ):
+        raise EngineeringError("checkpoint_quarantine_identity_invalid")
 
 
 def _checkpoint_tree_digest(path: Path, boundary: Path) -> tuple[str, int]:
@@ -2463,11 +2480,9 @@ def _quarantine_invalid_checkpoint(
     kind: str,
 ) -> dict | None:
     """Move one invalid immutable address aside, preserving every byte."""
-    if kind not in {"canonical", "feature"} or not re.fullmatch(
-        r"[0-9a-f]{40}", commit
-    ) or not isinstance(branch, str) or not branch:
-        raise EngineeringError("checkpoint_quarantine_identity_invalid")
+    _validate_checkpoint_address(commit, branch, kind)
     graph_dir = _common_graph_dir(root).absolute()
+    _reject_reparse_ancestors(Path(destination).absolute(), graph_dir)
     source = Path(destination).absolute().parent
     if not source.exists():
         return None
@@ -2575,25 +2590,51 @@ def _restore_quarantined_checkpoint(root: Path, record: dict) -> dict:
     relative = record.get("relative_path")
     digest = record.get("digest")
     if (
-        not isinstance(commit, str)
-        or not isinstance(branch, str)
-        or not isinstance(kind, str)
-        or not isinstance(relative, str)
+        not isinstance(relative, str)
         or not isinstance(digest, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        or not isinstance(record.get("file_count"), int)
+        or record["file_count"] < 0
+    ):
+        raise EngineeringError("checkpoint_quarantine_record_invalid")
+    _validate_checkpoint_address(commit, branch, kind)
+    identity = record.get("identity")
+    if (
+        not isinstance(identity, dict)
+        or identity.get("status") not in {"matched", "mismatch", "unavailable"}
+        or any(
+            value is not None and not isinstance(value, str)
+            for value in (identity.get("observed"), identity.get("expected"))
+        )
     ):
         raise EngineeringError("checkpoint_quarantine_record_invalid")
     graph_dir = _common_graph_dir(root).absolute()
     quarantine = _checkpoint_quarantine_record_path(graph_dir, relative)
+    destination = _checkpoint_destination(root, commit, branch=branch, kind=kind)
+    _reject_reparse_ancestors(destination, graph_dir)
+    original = destination.parent
+    expected_original = original.relative_to(graph_dir).as_posix()
+    expected_relative = PurePosixPath(
+        "quarantine",
+        kind,
+        quote(branch, safe=""),
+        commit,
+        digest.removeprefix("sha256:"),
+    ).as_posix()
+    if (
+        record.get("original_relative_path") != expected_original
+        or relative != expected_relative
+    ):
+        raise EngineeringError("checkpoint_quarantine_record_invalid")
     if not quarantine.exists():
-        destination = _checkpoint_destination(root, commit, branch=branch, kind=kind)
         if destination.is_file() and validate_checkpoint(root, destination, commit)["valid"]:
             return {"restored": True, "already_regenerated": True}
         raise EngineeringError("checkpoint_quarantine_payload_missing")
-    actual_digest, _ = _checkpoint_tree_digest(quarantine, graph_dir)
+    actual_digest, actual_file_count = _checkpoint_tree_digest(quarantine, graph_dir)
     if actual_digest != digest:
         raise EngineeringError("checkpoint_quarantine_digest_mismatch")
-    destination = _checkpoint_destination(root, commit, branch=branch, kind=kind)
-    original = destination.parent
+    if actual_file_count != record["file_count"]:
+        raise EngineeringError("checkpoint_quarantine_file_count_mismatch")
     if original.exists():
         if destination.is_file() and validate_checkpoint(root, destination, commit)["valid"]:
             return {"restored": False, "reason": "regenerated_checkpoint_present"}
@@ -2629,6 +2670,12 @@ def _checkpoint_quarantine_records(root: Path) -> list[dict]:
     if not quarantine_root.exists():
         return []
     _reject_reparse_ancestors(quarantine_root, graph_dir)
+    for current, directories, files in os.walk(quarantine_root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        _reject_reparse_ancestors(current_path, graph_dir)
+        for name in [*directories, *files]:
+            candidate = current_path / name
+            _reject_reparse_ancestors(candidate, graph_dir)
     records: list[dict] = []
     for metadata_path in sorted(quarantine_root.glob("*/*/*/*.json")):
         if metadata_path.is_symlink() or _is_reparse_point(metadata_path) or not metadata_path.is_file():
@@ -2639,18 +2686,62 @@ def _checkpoint_quarantine_records(root: Path) -> list[dict]:
             raise EngineeringError("checkpoint_quarantine_record_invalid") from error
         if not isinstance(payload, dict) or payload.get("schema") != CHECKPOINT_QUARANTINE_SCHEMA:
             raise EngineeringError("checkpoint_quarantine_record_invalid")
+        _validate_checkpoint_address(
+            payload.get("commit"), payload.get("branch"), payload.get("kind")
+        )
+        identity = payload.get("identity")
+        if (
+            not isinstance(identity, dict)
+            or identity.get("status") not in {"matched", "mismatch", "unavailable"}
+            or any(
+                value is not None and not isinstance(value, str)
+                for value in (identity.get("observed"), identity.get("expected"))
+            )
+        ):
+            raise EngineeringError("checkpoint_quarantine_record_invalid")
         relative = payload.get("relative_path")
-        if not isinstance(relative, str):
+        if (
+            not isinstance(relative, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", payload.get("digest", ""))
+            or not isinstance(payload.get("file_count"), int)
+            or payload["file_count"] < 0
+        ):
+            raise EngineeringError("checkpoint_quarantine_record_invalid")
+        expected_relative = PurePosixPath(
+            "quarantine",
+            payload["kind"],
+            quote(payload["branch"], safe=""),
+            payload["commit"],
+            payload["digest"].removeprefix("sha256:"),
+        ).as_posix()
+        if relative != expected_relative:
             raise EngineeringError("checkpoint_quarantine_record_invalid")
         quarantine = _checkpoint_quarantine_record_path(graph_dir, relative)
+        if metadata_path.absolute() != quarantine.with_name(quarantine.name + ".json").absolute():
+            raise EngineeringError("checkpoint_quarantine_record_invalid")
+        destination = _checkpoint_destination(
+            root,
+            payload["commit"],
+            branch=payload["branch"],
+            kind=payload["kind"],
+        )
+        _reject_reparse_ancestors(destination, graph_dir)
+        if (
+            payload.get("original_relative_path")
+            != destination.parent.relative_to(graph_dir).as_posix()
+        ):
+            raise EngineeringError("checkpoint_quarantine_record_invalid")
         reason = payload.get("reason", "invalid_checkpoint")
         try:
-            digest, _ = _checkpoint_tree_digest(quarantine, graph_dir)
+            digest, file_count = _checkpoint_tree_digest(quarantine, graph_dir)
         except EngineeringError:
             digest = None
+            file_count = None
             reason = "checkpoint_quarantine_payload_invalid"
         if digest is not None and digest != payload.get("digest"):
             reason = "checkpoint_quarantine_digest_mismatch"
+        if file_count is not None and file_count != payload["file_count"]:
+            reason = "checkpoint_quarantine_file_count_mismatch"
         records.append(
             {
                 "commit": payload.get("commit"),
@@ -4169,7 +4260,64 @@ def recover_checkpoint(
     """Regenerate one exact checkpoint after losslessly quarantining an invalid address."""
     project_root = resolve_project_root(str(root))
     commit = git(project_root, "rev-parse", requested_commit)
-    result = rebuild(project_root, graphify_python, target_commit=commit)
+    manifest_name = _tracked_manifest_name_at(project_root, commit)
+    if manifest_name is None:
+        raise EngineeringError("manifest_not_tracked")
+    manifest = _json_at(project_root, commit, manifest_name)
+    default_branch = manifest.get("project", {}).get("default_branch")
+    if not isinstance(default_branch, str) or not default_branch:
+        raise EngineeringError("invalid_manifest: project.default_branch")
+    current_branch = git(project_root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    canonical_destination = _checkpoint_destination(
+        project_root, commit, branch=default_branch, kind="canonical"
+    )
+    feature_destination = _checkpoint_destination(
+        project_root, commit, branch=current_branch, kind="feature"
+    )
+    canonical_ref = None
+    for ref in (f"refs/remotes/origin/{default_branch}", f"refs/heads/{default_branch}"):
+        try:
+            canonical_ref = git(project_root, "rev-parse", "--verify", ref)
+        except EngineeringError:
+            continue
+        break
+    quarantined_targets = [
+        record
+        for record in _checkpoint_quarantine_records(project_root)
+        if record.get("commit") == commit
+    ]
+    if len(quarantined_targets) > 1:
+        raise EngineeringError("checkpoint_recovery_target_ambiguous")
+    quarantined_target = quarantined_targets[0] if quarantined_targets else None
+    if quarantined_target is not None and (
+        quarantined_target.get("kind") == "feature"
+        and quarantined_target.get("branch") != current_branch
+    ):
+        raise EngineeringError("checkpoint_recovery_target_mismatch")
+    canonical_present = canonical_destination.parent.exists()
+    feature_present = feature_destination.parent.exists()
+    if canonical_present and feature_present and canonical_destination.parent != feature_destination.parent:
+        raise EngineeringError("checkpoint_recovery_target_ambiguous")
+    canonical_target = (
+        (quarantined_target is not None and quarantined_target.get("kind") == "canonical")
+        or canonical_present
+        or (
+        not feature_present and canonical_ref == commit
+        )
+    )
+    if canonical_target:
+        result = reconcile_canonical(
+            project_root,
+            refresh_remote=False,
+            allow_cached_remote=True,
+            graphify_python=graphify_python,
+        )
+        if result.get("commit") not in {None, commit}:
+            raise EngineeringError("checkpoint_recovery_target_mismatch")
+    else:
+        result = rebuild(project_root, graphify_python, target_commit=commit)
+    if result.get("freshness") == "not_configured" and result.get("checkpoint"):
+        result = {**result, "freshness": "current"}
     if isinstance(result, Path):
         return {
             "schema": "engineering.checkpoint-recovery.v1",
@@ -4542,6 +4690,7 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
     graph_dir = _common_graph_dir(project_root)
     current: dict | None = None
     features_by_commit: dict[str, dict] = {}
+    quarantined = _checkpoint_quarantine_records(project_root)
     for checkpoint in sorted(graph_dir.glob("main/*/checkpoint.json")):
         commit = checkpoint.parent.name
         validation = validate_checkpoint(project_root, checkpoint, commit)
@@ -4549,6 +4698,8 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
         if not validation["valid"]:
             item["state"] = "quarantined"
             item["reason"] = validation["reason"]
+            item["relative_path"] = checkpoint.relative_to(graph_dir).as_posix()
+            quarantined.append(item)
         if item["state"] == "current":
             current = item
     for checkpoint in sorted(graph_dir.glob("features/*/*/checkpoint.json")):
@@ -4558,6 +4709,8 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
         item = {"commit": commit, "branch": branch, "state": "archived"}
         if not validation["valid"]:
             item.update(state="quarantined", reason=validation["reason"])
+            item["relative_path"] = checkpoint.relative_to(graph_dir).as_posix()
+            quarantined.append(item)
         elif _is_ancestor_or_equal(project_root, commit, canonical_commit):
             item["state"] = "historical"
         else:
@@ -4571,7 +4724,6 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
         priority = {"active": 3, "historical": 2, "archived": 1, "quarantined": 0}
         if previous is None or priority[item["state"]] > priority[previous["state"]]:
             features_by_commit[commit] = item
-    quarantined = _checkpoint_quarantine_records(project_root)
     return {
         "canonical": current,
         "features": [features_by_commit[key] for key in sorted(features_by_commit)],
