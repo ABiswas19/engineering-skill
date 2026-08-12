@@ -39,6 +39,7 @@ DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS = 30.0
 ASSURANCE_SCHEMA = "engineering.capability-assurance.v1"
 TRACEABILITY_VIEW_SCHEMA = "engineering.traceability-view.v2"
 TRACEABILITY_RECEIPTS_SCHEMA = "engineering.traceability-receipts.v2"
+CHECKPOINT_QUARANTINE_SCHEMA = "engineering.checkpoint-quarantine.v1"
 # A process-local capability used only after detached host-attestation
 # verification.  It is intentionally not serializable or caller-forgeable via
 # JSON, so a literal field in a receipt can never become live authority.
@@ -1944,21 +1945,36 @@ def construct_checkpoint(
     destination, checkpoint = _checkpoint_candidate(
         root, requested_commit, previous_commit
     )
-    if destination.exists():
-        existing = json.loads(destination.read_text(encoding="utf-8"))
-        if not _same_checkpoint(existing, checkpoint):
-            raise TraceabilityError(
-                "Immutable checkpoint already exists with different content: "
-                f"{checkpoint['metadata']['commit']}"
-            )
-        return destination
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8"
+    commit = checkpoint["metadata"]["commit"]
+    branch = checkpoint["metadata"]["branch"]
+    kind = checkpoint["metadata"]["kind"]
+    quarantine = _quarantine_invalid_checkpoint(
+        root,
+        destination,
+        commit,
+        branch=branch,
+        kind=kind,
     )
-    os.replace(temporary, destination)
-    return destination
+    try:
+        if destination.exists():
+            existing = json.loads(destination.read_text(encoding="utf-8"))
+            if not _same_checkpoint(existing, checkpoint):
+                raise TraceabilityError(
+                    "Immutable checkpoint already exists with different content: "
+                    f"{checkpoint['metadata']['commit']}"
+                )
+            return destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, destination)
+        return destination
+    except Exception:
+        if quarantine is not None:
+            _restore_quarantined_checkpoint(root, quarantine)
+        raise
 
 
 def _legacy_rebuild(
@@ -1982,6 +1998,13 @@ def _legacy_rebuild(
         manifest_name=selected,
     )
     final_dir = destination.parent
+    quarantine = _quarantine_invalid_checkpoint(
+        root,
+        destination,
+        commit,
+        branch=branch,
+        kind="feature",
+    )
     if final_dir.exists():
         if (
             not destination.is_file()
@@ -1989,10 +2012,15 @@ def _legacy_rebuild(
         ):
             raise TraceabilityError(
                 f"Immutable checkpoint directory is incomplete: {final_dir}"
-            )
+        )
         return destination
 
-    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        if quarantine is not None:
+            _restore_quarantined_checkpoint(root, quarantine)
+        raise
     stage = Path(
         tempfile.mkdtemp(
             prefix=".engineering-", dir=str(final_dir.parent)
@@ -2064,6 +2092,10 @@ def _legacy_rebuild(
                     raise
                 time.sleep(0.1 * (attempt + 1))
         return final_dir / "checkpoint.json"
+    except Exception:
+        if quarantine is not None:
+            _restore_quarantined_checkpoint(root, quarantine)
+        raise
     finally:
         if added:
             try:
@@ -2361,6 +2393,277 @@ def _checkpoint_destination(
         / commit
         / "checkpoint.json"
     )
+
+
+def _checkpoint_tree_digest(path: Path, boundary: Path) -> tuple[str, int]:
+    """Hash a checkpoint tree without following links or leaving its graph root."""
+    path = Path(path).absolute()
+    boundary = Path(boundary).absolute()
+    try:
+        _reject_reparse_ancestors(path, boundary)
+    except EngineeringError as error:
+        raise EngineeringError("checkpoint_quarantine_boundary_invalid") from error
+    if not path.is_dir() or _is_reparse_point(path):
+        raise EngineeringError("checkpoint_quarantine_boundary_invalid")
+    entries: list[tuple[str, int, int, str]] = []
+    for candidate in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+        if _is_reparse_point(candidate):
+            raise EngineeringError("checkpoint_quarantine_boundary_invalid")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            raise EngineeringError("checkpoint_quarantine_boundary_invalid")
+        relative = candidate.relative_to(path).as_posix()
+        if not relative or relative.startswith("../") or "\\" in relative:
+            raise EngineeringError("checkpoint_quarantine_boundary_invalid")
+        digest = hashlib.sha256()
+        size = 0
+        with candidate.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+        entries.append(
+            (relative, stat.S_IMODE(candidate.stat().st_mode), size, digest.hexdigest())
+        )
+    manifest = "\n".join(
+        f"{relative}\0{mode:o}\0{size}\0{digest}"
+        for relative, mode, size, digest in entries
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(manifest).hexdigest(), len(entries)
+
+
+def _checkpoint_quarantine_record_path(graph_dir: Path, relative: str) -> Path:
+    parsed = PurePosixPath(relative)
+    if (
+        parsed.is_absolute()
+        or "\\" in relative
+        or ".." in parsed.parts
+        or not parsed.parts
+        or parsed.parts[0] != "quarantine"
+    ):
+        raise EngineeringError("checkpoint_quarantine_boundary_invalid")
+    path = graph_dir.joinpath(*parsed.parts)
+    try:
+        _reject_reparse_ancestors(path, graph_dir)
+        path.resolve().relative_to(graph_dir.resolve())
+    except (EngineeringError, ValueError) as error:
+        raise EngineeringError("checkpoint_quarantine_boundary_invalid") from error
+    return path
+
+
+def _quarantine_invalid_checkpoint(
+    root: Path,
+    destination: Path,
+    commit: str,
+    *,
+    branch: str,
+    kind: str,
+) -> dict | None:
+    """Move one invalid immutable address aside, preserving every byte."""
+    if kind not in {"canonical", "feature"} or not re.fullmatch(
+        r"[0-9a-f]{40}", commit
+    ) or not isinstance(branch, str) or not branch:
+        raise EngineeringError("checkpoint_quarantine_identity_invalid")
+    graph_dir = _common_graph_dir(root).absolute()
+    source = Path(destination).absolute().parent
+    if not source.exists():
+        return None
+    if not source.is_dir() or _is_reparse_point(source):
+        raise EngineeringError("checkpoint_quarantine_boundary_invalid")
+    try:
+        validation = (
+            validate_checkpoint(root, destination, commit)
+            if destination.is_file()
+            else {"valid": False, "reason": "missing_checkpoint"}
+        )
+    except (EngineeringError, OSError):
+        validation = {"valid": False, "reason": "invalid_checkpoint"}
+    if validation.get("valid"):
+        return None
+    digest, file_count = _checkpoint_tree_digest(source, graph_dir)
+    try:
+        original_relative = source.relative_to(graph_dir).as_posix()
+    except ValueError as error:
+        raise EngineeringError("checkpoint_quarantine_boundary_invalid") from error
+    try:
+        expected_identity = checkpoint_identity(root, commit)
+    except EngineeringError:
+        expected_identity = None
+    observed_identity = None
+    try:
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+        observed_identity = payload.get("metadata", {}).get("project_identity")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        pass
+    identity_status = (
+        "matched"
+        if isinstance(expected_identity, str)
+        and expected_identity
+        and observed_identity == expected_identity
+        else "mismatch"
+        if observed_identity is not None
+        else "unavailable"
+    )
+    relative = PurePosixPath(
+        "quarantine",
+        kind,
+        quote(branch, safe=""),
+        commit,
+        digest.removeprefix("sha256:"),
+    )
+    quarantine = _checkpoint_quarantine_record_path(graph_dir, relative.as_posix())
+    metadata_path = quarantine.with_name(quarantine.name + ".json")
+    try:
+        _reject_reparse_ancestors(quarantine.parent, graph_dir)
+        if quarantine.exists() or metadata_path.exists():
+            raise EngineeringError("checkpoint_quarantine_collision")
+        quarantine.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_ancestors(quarantine.parent, graph_dir)
+    except EngineeringError:
+        raise
+    record = {
+        "schema": CHECKPOINT_QUARANTINE_SCHEMA,
+        "commit": commit,
+        "branch": branch,
+        "kind": kind,
+        "reason": validation.get("reason", "invalid_checkpoint"),
+        "digest": digest,
+        "file_count": file_count,
+        "original_relative_path": original_relative,
+        "relative_path": relative.as_posix(),
+        "identity": {
+            "status": identity_status,
+            "observed": observed_identity,
+            "expected": expected_identity,
+        },
+        "quarantined_at": datetime.now(timezone.utc).isoformat(),
+    }
+    moved = False
+    try:
+        os.replace(source, quarantine)
+        moved = True
+        _atomic_text(metadata_path, json.dumps(record, indent=2) + "\n")
+        return record
+    except Exception as error:
+        temporary_metadata = metadata_path.with_name(
+            f".{metadata_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            if temporary_metadata.is_file() and not _is_reparse_point(temporary_metadata):
+                temporary_metadata.unlink()
+            if metadata_path.exists() and not _is_reparse_point(metadata_path):
+                metadata_path.unlink()
+            if moved and quarantine.exists() and not source.exists():
+                os.replace(quarantine, source)
+        except Exception as rollback_error:
+            raise EngineeringError(
+                "checkpoint_quarantine_rollback_failed"
+            ) from rollback_error
+        raise EngineeringError("checkpoint_quarantine_failed") from error
+
+
+def _restore_quarantined_checkpoint(root: Path, record: dict) -> dict:
+    """Restore a quarantined tree only when its exact preimage is unchanged."""
+    if not isinstance(record, dict) or record.get("schema") != CHECKPOINT_QUARANTINE_SCHEMA:
+        raise EngineeringError("checkpoint_quarantine_record_invalid")
+    commit = record.get("commit")
+    branch = record.get("branch")
+    kind = record.get("kind")
+    relative = record.get("relative_path")
+    digest = record.get("digest")
+    if (
+        not isinstance(commit, str)
+        or not isinstance(branch, str)
+        or not isinstance(kind, str)
+        or not isinstance(relative, str)
+        or not isinstance(digest, str)
+    ):
+        raise EngineeringError("checkpoint_quarantine_record_invalid")
+    graph_dir = _common_graph_dir(root).absolute()
+    quarantine = _checkpoint_quarantine_record_path(graph_dir, relative)
+    if not quarantine.exists():
+        destination = _checkpoint_destination(root, commit, branch=branch, kind=kind)
+        if destination.is_file() and validate_checkpoint(root, destination, commit)["valid"]:
+            return {"restored": True, "already_regenerated": True}
+        raise EngineeringError("checkpoint_quarantine_payload_missing")
+    actual_digest, _ = _checkpoint_tree_digest(quarantine, graph_dir)
+    if actual_digest != digest:
+        raise EngineeringError("checkpoint_quarantine_digest_mismatch")
+    destination = _checkpoint_destination(root, commit, branch=branch, kind=kind)
+    original = destination.parent
+    if original.exists():
+        if destination.is_file() and validate_checkpoint(root, destination, commit)["valid"]:
+            return {"restored": False, "reason": "regenerated_checkpoint_present"}
+        if original.is_dir() and not _is_reparse_point(original):
+            try:
+                empty = not any(original.iterdir())
+            except OSError as error:
+                raise EngineeringError("checkpoint_quarantine_restore_conflict") from error
+            if empty:
+                original.rmdir()
+            else:
+                raise EngineeringError("checkpoint_quarantine_restore_conflict")
+        else:
+            raise EngineeringError("checkpoint_quarantine_restore_conflict")
+    try:
+        _reject_reparse_ancestors(original, graph_dir)
+        original.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_ancestors(original.parent, graph_dir)
+        os.replace(quarantine, original)
+        metadata_path = quarantine.with_name(quarantine.name + ".json")
+        if metadata_path.is_file() and not _is_reparse_point(metadata_path):
+            metadata_path.unlink()
+    except EngineeringError:
+        raise
+    except OSError as error:
+        raise EngineeringError("checkpoint_quarantine_restore_failed") from error
+    return {"restored": True, "already_regenerated": False}
+
+
+def _checkpoint_quarantine_records(root: Path) -> list[dict]:
+    graph_dir = _common_graph_dir(root).absolute()
+    quarantine_root = graph_dir / "quarantine"
+    if not quarantine_root.exists():
+        return []
+    _reject_reparse_ancestors(quarantine_root, graph_dir)
+    records: list[dict] = []
+    for metadata_path in sorted(quarantine_root.glob("*/*/*/*.json")):
+        if metadata_path.is_symlink() or _is_reparse_point(metadata_path) or not metadata_path.is_file():
+            raise EngineeringError("checkpoint_quarantine_boundary_invalid")
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EngineeringError("checkpoint_quarantine_record_invalid") from error
+        if not isinstance(payload, dict) or payload.get("schema") != CHECKPOINT_QUARANTINE_SCHEMA:
+            raise EngineeringError("checkpoint_quarantine_record_invalid")
+        relative = payload.get("relative_path")
+        if not isinstance(relative, str):
+            raise EngineeringError("checkpoint_quarantine_record_invalid")
+        quarantine = _checkpoint_quarantine_record_path(graph_dir, relative)
+        reason = payload.get("reason", "invalid_checkpoint")
+        try:
+            digest, _ = _checkpoint_tree_digest(quarantine, graph_dir)
+        except EngineeringError:
+            digest = None
+            reason = "checkpoint_quarantine_payload_invalid"
+        if digest is not None and digest != payload.get("digest"):
+            reason = "checkpoint_quarantine_digest_mismatch"
+        records.append(
+            {
+                "commit": payload.get("commit"),
+                "branch": payload.get("branch"),
+                "kind": payload.get("kind"),
+                "state": "quarantined",
+                "reason": reason,
+                "digest": payload.get("digest"),
+                "relative_path": relative,
+                "identity": payload.get("identity"),
+            }
+        )
+    return records
 
 
 def _select_exact_checkpoint(
@@ -3328,6 +3631,8 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
     result_path = Path(record["result_path"])
     commit = record["commit"]
     empty_hooks = Path(record["operation_root"]) / "hooks"
+    quarantine = None
+    quarantine_rollback = None
     try:
         removed_environment = {
             key: os.environ.pop(key)
@@ -3378,6 +3683,19 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                 + "\n",
             )
             return 0
+        destination = _checkpoint_destination(
+            project_root,
+            commit,
+            branch=record["branch"],
+            kind=record["kind"],
+        )
+        quarantine = _quarantine_invalid_checkpoint(
+            project_root,
+            destination,
+            commit,
+            branch=record["branch"],
+            kind=record["kind"],
+        )
         run(
             [
                 "git",
@@ -3519,6 +3837,7 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                     "staged_graphify_out": True,
                     "previous_checkpoint_preserved": ancestor is not None,
                     "argv": [],
+                    **({"quarantine": quarantine} if quarantine is not None else {}),
                 },
                 indent=2,
             )
@@ -3526,6 +3845,13 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
         )
         return 0
     except Exception as error:
+        if quarantine is not None:
+            try:
+                quarantine_rollback = _restore_quarantined_checkpoint(
+                    project_root, quarantine
+                )
+            except Exception as rollback_error:
+                error = EngineeringError("checkpoint_quarantine_rollback_failed")
         try:
             _queue_graph_worker_stale(project_root, operation_id)
         except Exception as maintenance_error:
@@ -3546,6 +3872,12 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                         _compatible_ancestor(
                             project_root, commit, GRAPHIFY_VERSION
                         )
+                    ),
+                    **({"quarantine": quarantine} if quarantine is not None else {}),
+                    **(
+                        {"quarantine_rollback": quarantine_rollback}
+                        if quarantine_rollback is not None
+                        else {}
                     ),
                 }
             )
@@ -3829,6 +4161,23 @@ def rebuild(
         cleanup_timeout_seconds=cleanup_timeout_seconds,
         authority=authority,
     )
+
+
+def recover_checkpoint(
+    root: Path, requested_commit: str, graphify_python: str = sys.executable
+) -> dict:
+    """Regenerate one exact checkpoint after losslessly quarantining an invalid address."""
+    project_root = resolve_project_root(str(root))
+    commit = git(project_root, "rev-parse", requested_commit)
+    result = rebuild(project_root, graphify_python, target_commit=commit)
+    if isinstance(result, Path):
+        return {
+            "schema": "engineering.checkpoint-recovery.v1",
+            "freshness": "current",
+            "commit": commit,
+            "checkpoint": str(result),
+        }
+    return {"schema": "engineering.checkpoint-recovery.v1", **result}
 
 
 def _validated_fetch_mapping(
@@ -4222,9 +4571,11 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
         priority = {"active": 3, "historical": 2, "archived": 1, "quarantined": 0}
         if previous is None or priority[item["state"]] > priority[previous["state"]]:
             features_by_commit[commit] = item
+    quarantined = _checkpoint_quarantine_records(project_root)
     return {
         "canonical": current,
         "features": [features_by_commit[key] for key in sorted(features_by_commit)],
+        "quarantined": quarantined,
         "state": "managed",
     }
 
@@ -12480,6 +12831,11 @@ def main() -> int:
     checkpoint_parser.add_argument("root")
     checkpoint_parser.add_argument("--commit", required=True)
     checkpoint_parser.add_argument("--previous")
+    for name in ("recover-checkpoint", "checkpoint-recover"):
+        recovery_parser = commands.add_parser(name)
+        recovery_parser.add_argument("root")
+        recovery_parser.add_argument("--commit", required=True)
+        recovery_parser.add_argument("--graphify-python", default=sys.executable)
     rebuild_parser = commands.add_parser("rebuild")
     rebuild_parser.add_argument("root")
     rebuild_parser.add_argument("--commit", required=True)
@@ -12755,6 +13111,8 @@ def main() -> int:
         elif arguments.command == "checkpoint":
             path = construct_checkpoint(root, arguments.commit, arguments.previous)
             result = {"checkpoint": str(path)}
+        elif arguments.command in {"recover-checkpoint", "checkpoint-recover"}:
+            result = recover_checkpoint(root, arguments.commit, arguments.graphify_python)
         elif arguments.command == "rebuild":
             path = rebuild(root, arguments.commit, arguments.graphify_python)
             result = {"checkpoint": str(path)}
