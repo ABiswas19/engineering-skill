@@ -10256,7 +10256,7 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
                 first = module.render_map(root, open_output=False)
                 second = module.render_map(root, open_output=False)
             self.assertFalse(first["cached"])
-            self.assertTrue(second["cached"])
+            self.assertFalse(second["cached"])
             self.assertTrue(Path(second["output"]).is_file())
             process.assert_not_called()
 
@@ -11186,6 +11186,275 @@ class Task10ContractTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, contract)
+
+class TraceabilityViewV225ContractTests(unittest.TestCase):
+    """Regression coverage for the v2.2.5 query-only traceability projection."""
+
+    def module(self):
+        if engineering is None:
+            self.fail("scripts/engineering.py must exist")
+        return engineering
+
+    def manifest(self):
+        return {
+            "schema": "engineering.capability-assurance.v1",
+            "capabilities": [{
+                "id": "orders", "criticality": "material",
+                "required_cells": ["eu", "us"],
+                "required_interfaces": ["api"], "required_roles": ["owner"],
+                "topology": {"artifacts_or_configurations": ["orders-image-1"], "routes": ["orders-route"], "schedules": ["on-demand"]},
+            }],
+            "cells": [{"id": "eu", "production": True}, {"id": "us", "production": True}],
+            "obligations": [],
+        }
+
+    def receipt(self, **changes):
+        value = {
+            "receipt_id": "receipt-1", "project_id": "project-1", "worktree_id": "worktree-1", "commit": "a" * 40, "checkpoint": "checkpoint-1", "kind": "deployment", "result": "passed", "capability_id": "orders",
+            "cell_id": "eu", "release": "r1", "interface": "api",
+            "artifact": "orders-image-1", "route": "orders-route", "schedule": "on-demand",
+            "observed_at": "2026-08-12T10:00:00Z", "valid_until": "2026-08-13T10:00:00Z",
+            "admission": "host_attested",
+        }
+        value.update(changes)
+        return value
+
+    def duplicate(self, receipt, **changes):
+        value = dict(receipt)
+        value.update(changes)
+        return value
+
+    def live_receipts(self, **changes):
+        base = self.receipt(**changes)
+        kinds = ("intent", "requirement", "decision", "plan", "implementation", "code", "test", "artifact", "release", "installation", "configuration", "route", "schedule", "interface", "runtime", "deployment", "synthetic", "availability")
+        receipts = [self.duplicate(base, receipt_id=f"receipt-{index + 1}", kind=kind) for index, kind in enumerate(kinds)]
+        receipts.append(self.duplicate(base, receipt_id="receipt-acceptance", kind="feedback", result="accepted", role="owner"))
+        return receipts
+
+    def test_reducer_isolates_cell_release_and_scoped_incident_availability_acceptance(self):
+        module = self.module()
+        receipts = self.live_receipts() + [
+            self.receipt(receipt_id="receipt-5", cell_id="us", release="r2", kind="incident", result="failed", severity="severe"),
+            self.receipt(receipt_id="receipt-6", cell_id="us", release="r2", kind="availability", result="failed"),
+            self.receipt(receipt_id="receipt-7", cell_id="us", release="r2", kind="feedback", result="rejected", role="owner"),
+        ]
+        eu = module.reduce_traceability_receipts(self.manifest(), "orders", "eu", receipts, "2026-08-12T12:00:00Z")
+        us = module.reduce_traceability_receipts(self.manifest(), "orders", "us", receipts, "2026-08-12T12:00:00Z")
+        self.assertEqual("unknown", eu["state"])
+        self.assertEqual("not_live", us["state"])
+        self.assertEqual("r1", eu["release"])
+        self.assertEqual("r2", us["release"])
+
+    def test_required_cell_aggregation_and_lifecycle_gaps_are_explicit(self):
+        module = self.module()
+        view = module.compose_traceability_view(
+            self.manifest(), self.live_receipts(),
+            {"project": {"identity": "sha256:" + "1" * 64}, "worktree": {"branch": "feature/v225"}, "commit": "a" * 40, "checkpoint": {"kind": "feature", "digest": "sha256:" + "2" * 64}, "graphify": {"commit": module.GRAPHIFY_COMMIT, "status": "pinned"}, "overlay": {"digest": "sha256:" + "3" * 64}, "assurance": {"digest": "sha256:" + "4" * 64}, "dirty_coverage": {"state": "unknown"}, "authority": {"state": "unknown", "reasons": ["no_live_authority"]}, "freshness": "current", "paths": ["docs/engineering/links.json"], "gaps": ["implementation"], "provenance": "synthetic"}, "2026-08-12T12:00:00Z",
+        )
+        capability = view["capabilities"][0]
+        self.assertEqual("unknown", capability["aggregate"]["state"])
+        self.assertIn("us", capability["aggregate"]["missing_required_cells"])
+        self.assertIn("implementation", capability["aggregate"]["lifecycle_gaps"])
+
+    def test_latest_receipt_replaces_stale_same_scope_evidence_and_legacy_is_not_verified_live(self):
+        module = self.module()
+        old = self.receipt(observed_at="2026-08-10T10:00:00Z", valid_until="2026-08-11T10:00:00Z")
+        current = self.receipt(receipt_id="receipt-2", observed_at="2026-08-12T11:00:00Z", valid_until="2026-08-13T11:00:00Z")
+        legacy = {key: value for key, value in current.items() if key != "admission"}
+        reduced = module.reduce_traceability_receipts(self.manifest(), "orders", "eu", [old, current], "2026-08-12T12:00:00Z")
+        self.assertEqual("current", reduced["freshness"])
+        self.assertEqual("2026-08-12T11:00:00Z", reduced["receipts"]["deployment"]["observed_at"])
+        legacy_reduced = module.reduce_traceability_receipts(self.manifest(), "orders", "eu", [legacy, self.receipt(receipt_id="receipt-3", kind="synthetic"), self.receipt(receipt_id="receipt-4", kind="availability"), self.receipt(receipt_id="receipt-5", kind="feedback", result="accepted", role="owner")], "2026-08-12T12:00:00Z")
+        self.assertNotEqual("verified_live", legacy_reduced["state"])
+        self.assertIn("unadmitted_evidence", legacy_reduced["gaps"])
+
+    def test_authority_and_freshness_gaps_do_not_upgrade_claimed_live_receipts(self):
+        module = self.module()
+        forged = self.receipt(admission="caller_claimed", claimed_state="verified_live")
+        reduced = module.reduce_traceability_receipts(self.manifest(), "orders", "eu", [forged], "2026-08-12T12:00:00Z")
+        self.assertEqual("unknown", reduced["state"])
+        self.assertIn("authority", reduced["gaps"])
+        stale = module.reduce_traceability_receipts(self.manifest(), "orders", "eu", [self.receipt(valid_until="2026-08-12T11:00:00Z")], "2026-08-12T12:00:00Z")
+        self.assertEqual("stale", stale["freshness"])
+
+    def test_query_compatibility_and_html_use_the_identical_view_digest(self):
+        module = self.module()
+        view = module.compose_traceability_view(self.manifest(), [], {"commit": "b" * 40, "graphify": {"commit": module.GRAPHIFY_COMMIT}}, "2026-08-12T12:00:00Z")
+        rendered = module.render_traceability_view_html(view)
+        self.assertIn(view["digest"], rendered)
+        self.assertIn("<main", rendered)
+        self.assertIn("<table", rendered)
+        self.assertEqual({"requirements": []}, module.query_result("coverage", {"nodes": [], "edges": []}))
+        self.assertEqual("engineering.traceability-view.v2", view["schema"])
+
+    def test_traceability_view_cli_is_machine_readable_and_html_receipt_repeats_the_view_digest(self):
+        module = self.module()
+        view = {"schema": "engineering.traceability-view.v2", "digest": "sha256:" + "a" * 64}
+        for command in ("traceability", "traceability-view"):
+            output = io.StringIO()
+            with self.subTest(command=command):
+                with (
+                    patch.object(sys, "argv", ["engineering", command, ".", "--html"]),
+                    patch.object(module, "resolve_project_root", return_value=Path(".")),
+                    patch.object(module, "traceability_view", return_value=view),
+                    patch.object(module, "write_traceability_view_html", return_value={"output": "synthetic.html", "digest": view["digest"]}),
+                    contextlib.redirect_stdout(output),
+                ):
+                    self.assertEqual(0, module.main())
+            result = json.loads(output.getvalue())
+            self.assertEqual(view["digest"], result["view"]["digest"])
+            self.assertEqual(view["digest"], result["html"]["digest"])
+
+    def test_traceability_cli_forwards_focus_commit_and_as_of_to_canonical_view(self):
+        module = self.module()
+        view = {"schema": "engineering.traceability-view.v2", "digest": "sha256:" + "c" * 64}
+        target_commit = "d" * 40
+        for command in ("traceability", "traceability-view"):
+            with self.subTest(command=command):
+                with (
+                    patch.object(sys, "argv", [
+                        "engineering", command, ".", "--focus", "code-1",
+                        "--commit", target_commit, "--as-of", "2026-08-12T12:00:00Z",
+                    ]),
+                    patch.object(module, "resolve_project_root", return_value=Path(".")),
+                    patch.object(module, "traceability_view", return_value=view) as view_mock,
+                    patch("sys.stdout", new_callable=io.StringIO),
+                ):
+                    self.assertEqual(0, module.main())
+                self.assertEqual(
+                    {"as_of": "2026-08-12T12:00:00Z", "focus": "code-1", "commit": target_commit},
+                    view_mock.call_args.kwargs,
+                )
+
+    def test_v2_receipt_requires_a_stable_identity_and_complete_scope(self):
+        module = self.module()
+        for changed in (
+            {"receipt_id": None}, {"capability_id": None}, {"cell_id": None},
+            {"release": None}, {"artifact": None}, {"route": None}, {"schedule": None},
+        ):
+            receipt = self.receipt(**changed)
+            receipt = {key: value for key, value in receipt.items() if value is not None}
+            with self.subTest(changed=changed), self.assertRaisesRegex(module.EngineeringError, "receipt"):
+                module._traceability_receipt(receipt, module._assurance_timestamp("2026-08-12T12:00:00Z"))
+        configured = self.receipt(receipt_id="receipt-config", artifact=None, configuration="config-1")
+        self.assertEqual("config-1", module._traceability_receipt(configured, module._assurance_timestamp("2026-08-12T12:00:00Z"))["configuration"])
+
+    def test_view_envelope_and_renderer_expose_governed_unknowns_without_private_paths(self):
+        module = self.module()
+        context = {
+            "project": {"identity": "sha256:" + "1" * 64}, "worktree": {"branch": "feature/v225"},
+            "commit": "c" * 40, "checkpoint": {"kind": "feature", "digest": "sha256:" + "2" * 64},
+            "graphify": {"commit": module.GRAPHIFY_COMMIT, "status": "pinned"},
+            "overlay": {"digest": "sha256:" + "3" * 64}, "assurance": {"digest": "sha256:" + "4" * 64},
+            "dirty_coverage": {"state": "unknown"}, "authority": {"state": "unknown", "reasons": ["no_live_authority"]},
+            "freshness": "stale", "paths": ["docs/engineering/links.json"], "gaps": ["checkpoint_freshness"], "provenance": "synthetic",
+        }
+        view = module.compose_traceability_view(self.manifest(), [], context, "2026-08-12T12:00:00Z")
+        for required in ("project", "worktree", "commit", "checkpoint", "graphify", "overlay", "assurance", "dirty_coverage", "authority", "freshness", "paths", "gaps", "provenance"):
+            self.assertIn(required, view["envelope"])
+        document = module.render_traceability_view_html(view)
+        for required in ("Authority", "Freshness", "Lifecycle matrix", "Unknown", "Relationship paths"):
+            self.assertIn(required, document)
+        self.assertNotIn("C:\\", document)
+
+    def test_verified_live_requires_all_declared_lifecycle_stages_and_one_complete_scope_key(self):
+        module = self.module()
+        incomplete = self.live_receipts()
+        incomplete = [item for item in incomplete if item["kind"] != "installation"]
+        result = module.reduce_traceability_receipts(self.manifest(), "orders", "eu", incomplete, "2026-08-12T12:00:00Z")
+        self.assertNotEqual("verified_live", result["state"])
+
+    def test_plural_interface_and_role_requirements_cannot_be_satisfied_by_one_receipt_set(self):
+        module = self.module()
+        manifest = self.manifest()
+        capability = manifest["capabilities"][0]
+        capability["required_interfaces"] = ["api", "admin"]
+        capability["required_roles"] = ["owner", "security"]
+        capability["topology"]["artifacts_or_configurations"].append("orders-image-2")
+        result = module.reduce_traceability_receipts(
+            manifest, "orders", "eu", self.live_receipts(), "2026-08-12T12:00:00Z"
+        )
+        self.assertNotEqual("verified_live", result["state"])
+        self.assertIn("interfaces", result["gaps"])
+        self.assertIn("roles", result["gaps"])
+        self.assertIn("intent", result["lifecycle_gaps"])
+
+    def test_complete_trusted_lifecycle_aggregates_multiple_roles_on_one_interface(self):
+        module = self.module()
+        manifest = self.manifest()
+        manifest["capabilities"][0]["required_roles"] = ["owner", "security"]
+        receipts = self.live_receipts() + [
+            self.duplicate(
+                self.receipt(receipt_id="receipt-security", kind="feedback", result="accepted", role="security"),
+                observed_at="2026-08-12T11:00:00Z",
+            )
+        ]
+        trusted = [dict(item, _traceability_trust_token=module._TRACEABILITY_TRUST_TOKEN) for item in receipts]
+        result = module.reduce_traceability_receipts(
+            manifest, "orders", "eu", trusted, "2026-08-12T12:00:00Z",
+            identity={"project_id": "project-1", "worktree_id": "worktree-1", "commit": "a" * 40, "checkpoint": "checkpoint-1"},
+        )
+        self.assertEqual("verified_live", result["state"])
+        self.assertEqual([], result["lifecycle_gaps"])
+        self.assertNotIn("roles", result["gaps"])
+
+    def test_exact_identity_binding_rejects_a_valid_receipt_from_another_checkpoint(self):
+        module = self.module()
+        result = module.reduce_traceability_receipts(
+            self.manifest(), "orders", "eu", self.live_receipts(), "2026-08-12T12:00:00Z",
+            identity={"project_id": "project-2", "worktree_id": "worktree-1", "commit": "a" * 40, "checkpoint": "checkpoint-1"},
+        )
+        self.assertEqual("unknown", result["state"])
+        self.assertIn("intent", result["lifecycle_gaps"])
+        self.assertIn("installation", result["lifecycle_gaps"])
+        mixed = self.live_receipts()
+        mixed[-1] = self.duplicate(mixed[-1], artifact="orders-image-2")
+        result = module.reduce_traceability_receipts(self.manifest(), "orders", "eu", mixed, "2026-08-12T12:00:00Z")
+        self.assertNotEqual("verified_live", result["state"])
+
+    def test_signed_receipt_payload_rejects_tampering_on_load(self):
+        module = self.module()
+        receipt = self.receipt()
+        key = b"a" * 32
+        payload = module._signed_traceability_receipt_payload([receipt], key)
+        self.assertEqual("unadmitted", module._load_signed_traceability_receipts_payload(payload, key)[0]["admission"])
+        payload["receipts"][0]["receipt"]["route"] = "other-route"
+        with self.assertRaisesRegex(module.EngineeringError, "admission|receipt"):
+            module._load_signed_traceability_receipts_payload(payload, key)
+
+    def test_map_uses_the_canonical_view_and_digest_matched_renderer(self):
+        module = self.module()
+        view = {"schema": module.TRACEABILITY_VIEW_SCHEMA, "digest": "sha256:" + "b" * 64, "envelope": {"commit": "d" * 40}}
+        with (
+            patch.object(module, "traceability_view", return_value=view),
+            patch.object(module, "write_traceability_view_html", return_value={"output": "view.html", "digest": view["digest"]}),
+        ):
+            result = module.render_map(Path("."), open_output=False)
+        self.assertEqual("engineering.map.v1", result["schema"])
+        self.assertEqual(view["digest"], result["view_digest"])
+
+    def test_relationship_projection_and_focus_include_upstream_downstream_only(self):
+        module = self.module()
+        checkpoint = {
+            "nodes": [{"id": "intent-1"}, {"id": "code-1"}, {"id": "test-1"}, {"id": "unrelated"}],
+            "edges": [
+                {"from": "intent-1", "type": "refines", "to": "code-1", "provenance": "direct"},
+                {"from": "code-1", "type": "verifies", "to": "test-1", "provenance": "derived"},
+                {"from": "unrelated", "type": "refines", "to": None, "provenance": "missing"},
+            ],
+        }
+        relationships, paths = module._traceability_relationships(checkpoint, "code-1")
+        self.assertEqual(["code-1", "intent-1", "test-1"], paths)
+        self.assertEqual(
+            {("intent-1", "code-1"), ("code-1", "test-1")},
+            {(item["from"], item["to"]) for item in relationships},
+        )
+        self.assertNotIn("unrelated", json.dumps(relationships))
+        context = {"commit": "c" * 40, "relationships": relationships, "paths": paths, "focus": "code-1"}
+        view = module.compose_traceability_view(self.manifest(), [], context, "2026-08-12T12:00:00Z")
+        document = module.render_traceability_view_html(view)
+        self.assertIn("From, type, to, and provenance", document)
+        self.assertIn("intent-1", document)
 
 
 if __name__ == "__main__":

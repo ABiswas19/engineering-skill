@@ -37,6 +37,12 @@ ORPHAN_MINIMUM_AGE_SECONDS = 30.0
 DEFAULT_CONTEXT_TOKEN_BUDGET = 1000
 DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS = 30.0
 ASSURANCE_SCHEMA = "engineering.capability-assurance.v1"
+TRACEABILITY_VIEW_SCHEMA = "engineering.traceability-view.v2"
+TRACEABILITY_RECEIPTS_SCHEMA = "engineering.traceability-receipts.v2"
+# A process-local capability used only after detached host-attestation
+# verification.  It is intentionally not serializable or caller-forgeable via
+# JSON, so a literal field in a receipt can never become live authority.
+_TRACEABILITY_TRUST_TOKEN = object()
 EXECUTION_CONTEXT_SCHEMA = "engineering.execution-context.v1"
 TASK_AUTHORITY_SCHEMA = "engineering.task-authority.v2"
 SCOPED_AUTHORITY_SCHEMA = "engineering.scoped-authority.v1"
@@ -47,6 +53,9 @@ NATIVE_APPROVAL_REQUIREMENTS = {"connector", "credential", "destructive", "syste
 MAX_SCOPED_AUTHORITIES = 256
 MAX_AUTHORITY_AUDITS = 512
 ASSURANCE_EVIDENCE_KINDS = {
+    "intent", "requirement", "decision", "plan", "implementation", "code", "test", "artifact",
+    "release", "installation", "configuration", "route", "schedule", "interface",
+    "runtime",
     "implementation",
     "deployment",
     "availability",
@@ -1783,50 +1792,20 @@ def _map_cache_key(checkpoint: dict, assurance: list[dict], options: dict) -> st
 
 
 def render_map(root: Path, *, open_output: bool = True, focus: str | None = None) -> dict:
-    """Render the exact checkpoint locally; rendering never invokes Graphify."""
+    """Compatibility map payload over the exact canonical traceability view."""
     project_root = resolve_project_root(str(root))
-    commit = git(project_root, "rev-parse", "HEAD")
-    checkpoint = _load_checkpoint(project_root, commit)
-    assurance = _load_assurance_overlay(project_root)
-    options = {"focus": focus or "", "aggregate": len(checkpoint["nodes"]) > 5000}
-    cache_key = _map_cache_key(checkpoint, assurance, options)
-    destination = _common_graph_dir(project_root) / "maps" / cache_key / "index.html"
-    cached = destination.is_file()
-    if not cached:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        nodes = checkpoint["nodes"]
-        if focus:
-            node_ids = set(_reachable(checkpoint, focus, exact=False)) | {focus}
-            nodes = [node for node in nodes if node["id"] in node_ids]
-        if options["aggregate"]:
-            rows = sorted({str(node["type"]) for node in nodes})
-            body = "".join(
-                f"<tr><td>{html.escape(kind)}</td><td>{sum(node['type'] == kind for node in nodes)}</td></tr>"
-                for kind in rows
-            )
-            table = "<table><thead><tr><th>Type</th><th>Nodes</th></tr></thead><tbody>" + body + "</tbody></table>"
-        else:
-            body = "".join(
-                f"<tr><td>{html.escape(str(node['id']))}</td><td>{html.escape(str(node['type']))}</td></tr>"
-                for node in sorted(nodes, key=lambda item: item["id"])
-            )
-            table = "<table><thead><tr><th>Node</th><th>Type</th></tr></thead><tbody>" + body + "</tbody></table>"
-        document = (
-            "<!doctype html><meta charset='utf-8'><title>Engineering map</title>"
-            "<main><h1>Engineering map</h1>"
-            f"<p>Commit {html.escape(commit)}. {len(nodes)} nodes; {len(checkpoint['edges'])} deterministic links.</p>"
-            f"{table}</main>"
-        )
-        _atomic_text(destination, document)
+    view = traceability_view(project_root, focus=focus)
+    rendered = write_traceability_view_html(project_root, view)
     if open_output:
-        webbrowser.open(destination.resolve().as_uri())
+        webbrowser.open(Path(rendered["output"]).resolve().as_uri())
     return {
         "schema": "engineering.map.v1",
-        "commit": commit,
-        "output": str(destination),
-        "cached": cached,
-        "aggregate": options["aggregate"],
+        "commit": view["envelope"]["commit"],
+        "output": rendered["output"],
+        "cached": False,
+        "aggregate": bool(view.get("envelope", {}).get("aggregate", False)),
         "opened": open_output,
+        "view_digest": rendered["digest"],
     }
 
 
@@ -4354,6 +4333,52 @@ def _reachable(checkpoint: dict, start: str, *, reverse: bool = False, exact: bo
                 result.append(target)
                 queue.append(target)
     return result
+
+
+def _traceability_relationships(checkpoint: dict, focus: str | None = None) -> tuple[list[dict], list[str]]:
+    """Return a bounded, privacy-safe relationship projection and focused paths.
+
+    The graph checkpoint is already commit-bound and validated by the normal
+    checkpoint loader.  The machine view exposes only stable node/edge
+    identifiers and provenance; source locations and filesystem paths remain
+    outside this projection.
+    """
+    edges = checkpoint.get("edges", [])
+    if not isinstance(edges, list):
+        raise EngineeringError("Engineering traceability checkpoint edges are invalid.")
+    node_ids = {
+        node.get("id")
+        for node in checkpoint.get("nodes", [])
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    }
+    paths: list[str] = []
+    focused_ids: set[str] | None = None
+    if focus is not None:
+        if focus not in node_ids:
+            raise EngineeringError("Engineering traceability focus is unknown.")
+        upstream = _reachable(checkpoint, focus, reverse=True, exact=False)
+        downstream = _reachable(checkpoint, focus, exact=False)
+        paths = [focus, *upstream, *downstream]
+        focused_ids = set(paths)
+    relationships: list[dict] = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        source, target = edge.get("from"), edge.get("to")
+        if not isinstance(source, str) or not isinstance(edge.get("type"), str):
+            continue
+        if focused_ids is not None and source not in focused_ids and target not in focused_ids:
+            continue
+        relationships.append({
+            "from": source,
+            "type": edge["type"],
+            "to": target if isinstance(target, str) else None,
+            "provenance": edge.get("provenance", "unknown"),
+        })
+    relationships.sort(key=lambda item: (
+        item["from"], item["type"], item["to"] or "", item["provenance"]
+    ))
+    return relationships, paths
 
 
 def coverage(checkpoint: dict, *, source_paths: set[str] | None = None) -> list[dict]:
@@ -7736,6 +7761,21 @@ def _assurance_id(value: object, label: str) -> str:
     return value
 
 
+def _traceability_identity(value: object, label: str) -> str:
+    """Validate receipt identity values, allowing ordinary slash branches."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 256
+        or "\\" in value
+        or ".." in PurePosixPath(value).parts
+        or value.startswith("/")
+        or _contains_credential(value)
+    ):
+        raise EngineeringError(f"Engineering traceability {label} is invalid.")
+    return value
+
+
 def _assurance_timestamp(value: object) -> datetime:
     if not isinstance(value, str):
         raise EngineeringError("Engineering assurance timestamp is invalid.")
@@ -7777,9 +7817,8 @@ def validate_assurance_manifest(value: object) -> dict:
         raise EngineeringError("Engineering capability assurance cell is invalid.")
     normalized_capabilities = []
     for capability in capabilities:
-        if not isinstance(capability, dict) or set(capability) != {
-            "id", "criticality", "required_cells", "required_interfaces", "required_roles"
-        }:
+        base_fields = {"id", "criticality", "required_cells", "required_interfaces", "required_roles"}
+        if not isinstance(capability, dict) or set(capability) not in (base_fields, base_fields | {"topology"}):
             raise EngineeringError("Engineering capability assurance capability is invalid.")
         if capability["criticality"] not in {"routine", "material", "critical"}:
             raise EngineeringError("Engineering capability assurance capability is invalid.")
@@ -7798,6 +7837,18 @@ def validate_assurance_manifest(value: object) -> dict:
             raise EngineeringError("Engineering capability assurance capability is invalid.")
         if not set(normalized["required_cells"]).issubset(cell_ids):
             raise EngineeringError("Engineering capability assurance capability is invalid.")
+        topology_declared = "topology" in capability
+        topology = capability.get("topology", {"artifacts_or_configurations": [], "routes": [], "schedules": []})
+        if not isinstance(topology, dict) or set(topology) != {"artifacts_or_configurations", "routes", "schedules"}:
+            raise EngineeringError("Engineering capability assurance capability is invalid.")
+        normalized["topology"] = {}
+        for field in ("artifacts_or_configurations", "routes", "schedules"):
+            items = topology[field]
+            if not isinstance(items, list) or len(items) > 64:
+                raise EngineeringError("Engineering capability assurance capability is invalid.")
+            normalized["topology"][field] = [_assurance_id(item, field) for item in items]
+            if len(set(normalized["topology"][field])) != len(normalized["topology"][field]):
+                raise EngineeringError("Engineering capability assurance capability is invalid.")
         normalized_capabilities.append(normalized)
     capability_ids = {item["id"] for item in normalized_capabilities}
     if len(capability_ids) != len(normalized_capabilities):
@@ -8022,6 +8073,593 @@ def assurance_status(root: Path, capability_id: str, cell_id: str, as_of: str | 
         _load_assurance_overlay(project_root),
         as_of or _utc_now(),
     )
+
+
+def _traceability_receipt(value: object, now: datetime) -> dict:
+    """Validate one bounded, non-secret receipt without trusting its live claim."""
+    trusted = isinstance(value, dict) and value.get("_traceability_trust_token") is _TRACEABILITY_TRUST_TOKEN
+    if trusted:
+        value = {key: item for key, item in value.items() if key != "_traceability_trust_token"}
+    allowed = {
+        "receipt_id", "project_id", "worktree_id", "commit", "checkpoint", "kind", "result", "capability_id", "cell_id", "release", "interface",
+        "artifact", "configuration", "route", "schedule", "observed_at", "valid_until",
+        "role", "severity", "obligation_id", "admission", "claimed_state", "legacy",
+    }
+    if not isinstance(value, dict) or not set(value).issubset(allowed):
+        raise EngineeringError("Engineering traceability receipt is invalid.")
+    if value.get("kind") == "missing":
+        obligation = value.get("obligation_id")
+        return {"kind": "missing", "obligation_id": _assurance_id(obligation, "obligation"), "admission": "unadmitted", "legacy": True}
+    required = {"kind", "result", "release", "interface", "observed_at", "valid_until"}
+    if not required.issubset(value):
+        raise EngineeringError("Engineering traceability receipt is invalid.")
+    if value["kind"] not in ASSURANCE_EVIDENCE_KINDS - {"missing"} or value["result"] not in {"passed", "failed", "accepted", "rejected"}:
+        raise EngineeringError("Engineering traceability receipt is invalid.")
+    identity_fields = {"receipt_id", "project_id", "worktree_id", "commit", "checkpoint", "capability_id", "cell_id"}
+    present_identity_fields = identity_fields.intersection(value)
+    legacy = not present_identity_fields
+    if present_identity_fields and present_identity_fields != identity_fields:
+        raise EngineeringError("Engineering traceability receipt is invalid.")
+    if not legacy and not {"route", "schedule"}.issubset(value):
+        raise EngineeringError("Engineering traceability receipt is invalid.")
+    normalized = {key: value[key] for key in required}
+    for key in ("release", "interface"):
+        normalized[key] = _assurance_id(normalized[key], key)
+    for key in ("receipt_id", "project_id", "checkpoint", "capability_id", "cell_id", "role", "severity", "route", "schedule"):
+        if key in value:
+            normalized[key] = _assurance_id(value[key], key)
+    if "worktree_id" in value:
+        normalized["worktree_id"] = _traceability_identity(value["worktree_id"], "worktree_id")
+    artifact = value.get("artifact")
+    configuration = value.get("configuration")
+    if not legacy:
+        if bool(artifact) == bool(configuration):
+            raise EngineeringError("Engineering traceability receipt is invalid.")
+        normalized["artifact" if artifact else "configuration"] = _assurance_id(
+            artifact if artifact else configuration, "artifact or configuration"
+        )
+    observed_at = _assurance_timestamp(normalized["observed_at"])
+    valid_until = _assurance_timestamp(normalized["valid_until"])
+    if valid_until < observed_at or observed_at > now + timedelta(minutes=5):
+        raise EngineeringError("Engineering traceability receipt is invalid.")
+    if not legacy:
+        commit = value.get("commit")
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise EngineeringError("Engineering traceability receipt is invalid.")
+        normalized["commit"] = commit
+    # Caller labels are non-authoritative. Only the signed-loader path upgrades this.
+    normalized["admission"] = "host_attested" if trusted else "unadmitted"
+    normalized["legacy"] = legacy
+    return normalized
+
+
+def reduce_traceability_receipts(
+    manifest: object, capability_id: str, cell_id: str, receipts: object, as_of: str,
+    *, identity: dict | None = None,
+) -> dict:
+    """Pure, scope-isolated v2 reducer.  It never widens legacy evidence."""
+    assurance = validate_assurance_manifest(manifest)
+    capability = next((item for item in assurance["capabilities"] if item["id"] == capability_id), None)
+    if capability is None or cell_id not in capability["required_cells"]:
+        raise EngineeringError("Engineering assurance capability or cell is invalid.")
+    now = _assurance_timestamp(as_of)
+    if not isinstance(receipts, list) or len(receipts) > 2048:
+        raise EngineeringError("Engineering traceability receipts are invalid.")
+    normalized = []
+    for item in receipts:
+        normalized.append(_traceability_receipt(item, now))
+    scoped = [item for item in normalized if item.get("capability_id") == capability_id and item.get("cell_id") == cell_id]
+    if identity is not None:
+        expected = {key: identity.get(key) for key in ("project_id", "worktree_id", "commit", "checkpoint")}
+        scoped = [item for item in scoped if all(item.get(key) == value for key, value in expected.items())]
+    legacy = [item for item in normalized if "capability_id" not in item or "cell_id" not in item]
+    # Select one complete deployment scope.  Interface is deliberately not a
+    # grouping key: a capability declaring api + admin must aggregate both
+    # interfaces within the same release/artifact/route/schedule scope rather
+    # than silently selecting whichever interface was observed most recently.
+    def scope_key(item: dict) -> tuple[str, str, str, str]:
+        return (
+            item["release"], item.get("artifact", item.get("configuration", "")),
+            item.get("route", ""), item.get("schedule", ""),
+        )
+    groups: dict[tuple[str, str, str, str], list[dict]] = {}
+    for item in scoped:
+        groups.setdefault(scope_key(item), []).append(item)
+    selected_key = max(
+        groups,
+        key=lambda key: (max(_assurance_timestamp(item["observed_at"]) for item in groups[key]), key),
+    ) if groups else None
+    scoped = groups.get(selected_key, [])
+    release = selected_key[0] if selected_key else None
+    latest_by_scope: dict[tuple[str, str, str | None], dict] = {}
+    for item in scoped:
+        key = (
+            item["kind"],
+            item["interface"],
+            item.get("role") if item["kind"] == "feedback" else None,
+        )
+        prior = latest_by_scope.get(key)
+        if prior is None or _assurance_timestamp(item["observed_at"]) > _assurance_timestamp(prior["observed_at"]):
+            latest_by_scope[key] = item
+    current_by_scope = {
+        key: item for key, item in latest_by_scope.items()
+        if _assurance_timestamp(item["valid_until"]) >= now
+    }
+    # Keep the legacy-friendly kind keyed receipt summary while reducing over
+    # the full per-interface set above.
+    latest: dict[str, dict] = {}
+    for item in latest_by_scope.values():
+        prior = latest.get(item["kind"])
+        if prior is None or _assurance_timestamp(item["observed_at"]) > _assurance_timestamp(prior["observed_at"]):
+            latest[item["kind"]] = item
+    current = {
+        kind: item for kind, item in latest.items()
+        if _assurance_timestamp(item["valid_until"]) >= now
+    }
+    expired = bool(latest_by_scope) and not current_by_scope
+    interfaces = set(capability["required_interfaces"])
+    topology = capability["topology"]
+    required_stages = (
+        "intent", "requirement", "decision", "plan", "implementation", "code", "test",
+        "artifact", "release", "installation", "configuration", "route", "schedule",
+        "interface", "runtime", "deployment", "synthetic", "availability", "feedback",
+    )
+    gaps = []
+    if legacy:
+        gaps.append("legacy_unscoped_evidence")
+    if any(item["admission"] != "host_attested" for item in current_by_scope.values()):
+        gaps.append("authority")
+        gaps.append("unadmitted_evidence")
+    stale_evidence = expired or any(item not in current_by_scope.values() for item in latest_by_scope.values())
+    if stale_evidence:
+        gaps.append("freshness")
+    artifact_or_configuration = selected_key[1] if selected_key else ""
+    if not selected_key or artifact_or_configuration not in topology["artifacts_or_configurations"] or selected_key[2] not in topology["routes"] or selected_key[3] not in topology["schedules"]:
+        gaps.append("topology")
+    lifecycle_gaps = []
+    for stage in required_stages:
+        expected = "accepted" if stage == "feedback" else "passed"
+        if any(
+            not any(
+                item["result"] == expected
+                for (kind, item_interface, _role), item in current_by_scope.items()
+                if kind == stage and item_interface == interface
+            )
+            for interface in interfaces
+        ):
+            lifecycle_gaps.append(stage)
+    feedback = [item for (kind, _, _), item in current_by_scope.items() if kind == "feedback"]
+    feedback_roles = {item.get("role") for item in feedback}
+    if capability["required_roles"] and not set(capability["required_roles"]).issubset(feedback_roles):
+        gaps.append("acceptance")
+    current_interfaces = {item.get("interface") for item in current_by_scope.values()}
+    if current_interfaces != interfaces:
+        gaps.append("interfaces")
+    if capability["required_roles"] and not set(capability["required_roles"]).issubset(feedback_roles):
+        gaps.append("roles")
+    if lifecycle_gaps:
+        gaps.extend(lifecycle_gaps)
+    failed = any(item["result"] in {"failed", "rejected"} for item in current_by_scope.values())
+    admissible = bool(current_by_scope) and all(item["admission"] == "host_attested" for item in current_by_scope.values())
+    ready = not gaps and not lifecycle_gaps and admissible
+    state = "not_live" if failed else "verified_live" if ready and admissible else "unknown"
+    return {
+        "capability_id": capability_id,
+        "cell_id": cell_id,
+        "release": release,
+        "state": state,
+        "freshness": "stale" if stale_evidence else "current" if current_by_scope else "unknown",
+        "receipts": latest,
+        "gaps": sorted(set(gaps)),
+        "lifecycle_gaps": lifecycle_gaps,
+        "provenance": "host_attested" if admissible else "legacy_or_unadmitted",
+    }
+
+
+def compose_traceability_view(
+    manifest: object, receipts: object, context: object, as_of: str
+) -> dict:
+    """Compose the machine view once; both the CLI and HTML consume its digest."""
+    assurance = validate_assurance_manifest(manifest)
+    if not isinstance(context, dict) or not isinstance(context.get("commit"), str):
+        raise EngineeringError("Engineering traceability view context is invalid.")
+    identity = context.get("identity")
+    trusted_input = isinstance(receipts, list) and any(
+        isinstance(item, dict) and item.get("_traceability_trust_token") is _TRACEABILITY_TRUST_TOKEN
+        for item in receipts
+    )
+    if trusted_input and (
+        not isinstance(identity, dict) or any(
+            not isinstance(identity.get(key), str) or not identity.get(key)
+            for key in ("project_id", "worktree_id", "commit", "checkpoint")
+        )
+    ):
+        raise EngineeringError("Engineering traceability view identity is required for trusted evidence.")
+    cells = {item["id"]: item for item in assurance["cells"]}
+    capabilities = []
+    for capability in assurance["capabilities"]:
+        states = [reduce_traceability_receipts(assurance, capability["id"], cell_id, receipts, as_of, identity=identity) for cell_id in capability["required_cells"]]
+        verified = [item for item in states if item["state"] == "verified_live"]
+        aggregate = {
+            "state": "not_live" if any(item["state"] == "not_live" for item in states) else "verified_live" if len(verified) == len(states) else "partial" if verified else "unknown",
+            "required_cells": [item["cell_id"] for item in states],
+            "missing_required_cells": [item["cell_id"] for item in states if item["state"] != "verified_live"],
+            "lifecycle_gaps": sorted({gap for item in states for gap in item["lifecycle_gaps"]}),
+        }
+        capabilities.append({
+            "id": capability["id"], "criticality": capability["criticality"],
+            "required_cells": list(capability["required_cells"]),
+            "required_interfaces": list(capability["required_interfaces"]),
+            "required_roles": list(capability["required_roles"]),
+            "topology": capability["topology"],
+            "cells": [{**item, "production": cells[item["cell_id"]]["production"]} for item in states],
+            "aggregate": aggregate,
+        })
+    paths = context.get("paths", [])
+    if not isinstance(paths, list) or any(
+        not isinstance(path, str) or not path or Path(path).is_absolute() or "\\" in path
+        or ".." in PurePosixPath(path).parts or re.search(r"(?i)(?:^|/)(?:users|home)(?:/|$)", path)
+        for path in paths
+    ):
+        raise EngineeringError("Engineering traceability view paths are invalid.")
+    relationships = context.get("relationships", [])
+    if not isinstance(relationships, list) or len(relationships) > 4096:
+        raise EngineeringError("Engineering traceability relationships are invalid.")
+    for relationship in relationships:
+        if not isinstance(relationship, dict) or set(relationship) != {"from", "type", "to", "provenance"}:
+            raise EngineeringError("Engineering traceability relationships are invalid.")
+        for key in ("from", "type", "provenance"):
+            value = relationship[key]
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 256
+                or "\\" in value
+                or Path(value).is_absolute()
+                or ".." in PurePosixPath(value).parts
+            ):
+                raise EngineeringError("Engineering traceability relationships are invalid.")
+        target = relationship["to"]
+        if target is not None and (
+            not isinstance(target, str)
+            or not target
+            or len(target) > 256
+            or "\\" in target
+            or Path(target).is_absolute()
+            or ".." in PurePosixPath(target).parts
+        ):
+            raise EngineeringError("Engineering traceability relationships are invalid.")
+    envelope = {
+        "project": context.get("project", {}), "worktree": context.get("worktree", {}),
+        "commit": context["commit"], "checkpoint": context.get("checkpoint", {}),
+        "graphify": context.get("graphify", {"commit": GRAPHIFY_COMMIT}),
+        "overlay": context.get("overlay", {"digest": "unknown"}),
+        "assurance": context.get("assurance", {"digest": _json_digest(assurance)}),
+        "dirty_coverage": context.get("dirty_coverage", "unknown"),
+        "authority": context.get("authority", "unknown"),
+        "freshness": context.get("freshness", "unknown"),
+        "paths": paths, "gaps": context.get("gaps", []),
+        "stage_gaps": sorted({gap for capability in capabilities for gap in capability["aggregate"]["lifecycle_gaps"]}),
+        "relationships": relationships,
+        "focus": context.get("focus", "all"), "aggregate": context.get("aggregate", False),
+        "provenance": "deterministic_composition",
+    }
+    unsigned = {"schema": TRACEABILITY_VIEW_SCHEMA, "as_of": as_of, "envelope": envelope, "capabilities": capabilities}
+    return {**unsigned, "digest": _json_digest(unsigned)}
+
+
+def render_traceability_view_html(view: object) -> str:
+    if not isinstance(view, dict) or view.get("schema") != TRACEABILITY_VIEW_SCHEMA or view.get("digest") != _json_digest({key: value for key, value in view.items() if key != "digest"}):
+        raise EngineeringError("Engineering traceability view is invalid.")
+    rows = "".join(
+        f"<tr><th scope='row'>{html.escape(capability['id'])}</th><td>{html.escape(cell['cell_id'])}</td><td>{html.escape(cell['state'])}</td><td>{html.escape(cell['provenance'])}</td><td>{html.escape(', '.join(cell['receipts']) or 'Unknown')}</td><td>{html.escape(', '.join(cell['gaps']) or 'none')}</td></tr>"
+        for capability in view["capabilities"] for cell in capability["cells"]
+    ) or "<tr><td colspan='6'>No declared capabilities.</td></tr>"
+    relationship_rows = "".join(
+        f"<tr><td>{html.escape(str(item['from']))}</td><td>{html.escape(str(item['type']))}</td><td>{html.escape(str(item['to']) if item['to'] is not None else 'Unknown')}</td><td>{html.escape(str(item['provenance']))}</td></tr>"
+        for item in view["envelope"].get("relationships", [])
+    ) or "<tr><td colspan='4'>No declared relationships.</td></tr>"
+    authority = view["envelope"]["authority"]
+    authority_state = authority.get("state", authority) if isinstance(authority, dict) else authority
+    return (
+        "<!doctype html><html lang='en'><meta charset='utf-8'><title>Engineering traceability</title>"
+        "<main><h1>Engineering traceability</h1>"
+        f"<p>View digest <code>{html.escape(view['digest'])}</code></p>"
+        f"<section aria-label='Evidence banner'><p>Authority: {html.escape(str(authority_state))}</p>"
+        f"<p>Freshness: {html.escape(str(view['envelope']['freshness']))}</p></section>"
+        "<h2>Lifecycle matrix</h2><table><caption>Capability lifecycle evidence</caption><thead><tr><th>Capability</th><th>Cell</th><th>State</th><th>Provenance</th><th>Receipts</th><th>Gaps</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table><h2>Envelope</h2><dl><dt>Checkpoint</dt><dd>{html.escape(str(view['envelope']['checkpoint']))}</dd><dt>Graphify</dt><dd>{html.escape(str(view['envelope']['graphify']))}</dd><dt>Overlay</dt><dd>{html.escape(str(view['envelope']['overlay']))}</dd><dt>Dirty coverage</dt><dd>{html.escape(str(view['envelope']['dirty_coverage']))}</dd></dl>"
+        f"<h2>Relationships</h2><table><caption>From, type, to, and provenance</caption><thead><tr><th>From</th><th>Type</th><th>To</th><th>Provenance</th></tr></thead><tbody>{relationship_rows}</tbody></table>"
+        f"<h2>Relationship paths</h2><p>Focused upstream/downstream paths: {html.escape(', '.join(view['envelope']['paths']) or 'Unknown')}</p><p>Focus: {html.escape(str(view['envelope'].get('focus', 'all')))}; aggregate: {html.escape(str(view['envelope'].get('aggregate', False)))}</p>"
+        f"<h2>Unknowns and gaps</h2><p>{html.escape(', '.join(view['envelope']['gaps']) or 'Unknown')}</p></main></html>"
+    )
+
+
+def _traceability_receipts_path(root: Path) -> Path:
+    return _project_controller_dir(root) / "traceability-receipts.json"
+
+
+def _receipt_admission_material(receipt: object) -> bytes:
+    if not isinstance(receipt, dict):
+        raise EngineeringError("Engineering traceability receipt is invalid.")
+    unsigned = {key: value for key, value in receipt.items() if key not in {"admission", "claimed_state"}}
+    return _canonical_json({"schema": "engineering.traceability-receipt-admission.v1", "receipt_digest": _json_digest(unsigned)})
+
+
+def _traceability_host_claims(receipt: dict) -> dict:
+    """Build the exact detached claims a trusted runtime host must sign."""
+    return {
+        "receipt_digest": _json_digest(receipt),
+        "project_id": receipt.get("project_id"),
+        "worktree_id": receipt.get("worktree_id"),
+        "commit": receipt.get("commit"),
+        "checkpoint": receipt.get("checkpoint"),
+    }
+
+
+def _verify_traceability_host_attestation(root: Path, receipt: dict, approval: object) -> str:
+    """Verify a detached host/adapter signature; local HMAC is never enough."""
+    required = {"schema", "approver", "claims", "signature"}
+    if (
+        not isinstance(approval, dict)
+        or set(approval) != required
+        or approval.get("schema") != "engineering.traceability-host-attestation.v1"
+        or approval.get("claims") != _traceability_host_claims(receipt)
+        or not isinstance(approval.get("signature"), str)
+        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(approval["signature"]) > 16384
+    ):
+        raise EngineeringError("Engineering traceability host attestation is invalid.")
+    approver = _assurance_id(approval.get("approver"), "traceability host approver")
+    try:
+        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering traceability host approver trust is unavailable.") from error
+    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
+        raise EngineeringError("Engineering traceability host approver trust is invalid.")
+    material = _canonical_json({
+        "schema": "engineering.traceability-host-claims.v1",
+        "claims": approval["claims"],
+    })
+    with tempfile.TemporaryDirectory(prefix="engineering-traceability-host-") as temporary:
+        allowed_path = Path(temporary) / "allowed_signers"
+        signature_path = Path(temporary) / "traceability.sig"
+        allowed_path.write_bytes(allowed)
+        signature_path.write_text(approval["signature"], encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen", "-Y", "verify", "-f", str(allowed_path),
+                    "-I", approver, "-n", "engineering-traceability",
+                    "-s", str(signature_path),
+                ],
+                input=material,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EngineeringError("Engineering traceability host attestation verification is unavailable.") from error
+    if verified.returncode != 0:
+        raise EngineeringError("Engineering traceability host attestation signature is invalid.")
+    return "approval-" + hashlib.sha256(_canonical_json(approval)).hexdigest()[:32]
+
+
+def _signed_traceability_receipt_payload(
+    receipts: object, key: bytes, *, host_attestations: dict[str, dict] | None = None
+) -> dict:
+    if not isinstance(receipts, list) or len(receipts) > 256:
+        raise EngineeringError("Engineering traceability receipt ingestion is invalid.")
+    normalized = [
+        _traceability_receipt(item, _assurance_timestamp(item["observed_at"]) + timedelta(minutes=5))
+        for item in receipts
+        if isinstance(item, dict) and isinstance(item.get("observed_at"), str)
+    ]
+    if len(normalized) != len(receipts):
+        raise EngineeringError("Engineering traceability receipt ingestion is invalid.")
+    signed = []
+    for receipt in normalized:
+        material = _receipt_admission_material(receipt)
+        digest = json.loads(material.decode("utf-8"))["receipt_digest"]
+        admission = {
+            "schema": "engineering.traceability-receipt-admission.v1",
+            "receipt_digest": digest,
+            "signature": "hmac-sha256:" + hmac.new(key, material, hashlib.sha256).hexdigest(),
+        }
+        if host_attestations and digest in host_attestations:
+            admission["host_attestation"] = host_attestations[digest]
+        signed.append({
+            "receipt": receipt,
+            "admission": admission,
+        })
+    return {"schema": TRACEABILITY_RECEIPTS_SCHEMA, "receipts": signed}
+
+
+def _load_signed_traceability_receipts_payload(
+    payload: object, key: bytes, *, root: Path | None = None
+) -> list[dict]:
+    if not isinstance(payload, dict) or set(payload) != {"schema", "receipts"} or payload.get("schema") != TRACEABILITY_RECEIPTS_SCHEMA or not isinstance(payload["receipts"], list) or len(payload["receipts"]) > 256:
+        raise EngineeringError("Engineering traceability receipts are invalid.")
+    retained = []
+    for item in payload["receipts"]:
+        if not isinstance(item, dict) or set(item) != {"receipt", "admission"} or not isinstance(item["admission"], dict):
+            raise EngineeringError("Engineering traceability receipt admission is invalid.")
+        if not isinstance(item["receipt"], dict) or not isinstance(item["receipt"].get("observed_at"), str):
+            raise EngineeringError("Engineering traceability receipts are invalid.")
+        receipt = _traceability_receipt(item["receipt"], _assurance_timestamp(item["receipt"]["observed_at"]) + timedelta(minutes=5))
+        material = _receipt_admission_material(receipt)
+        admission = item["admission"]
+        expected = "hmac-sha256:" + hmac.new(key, material, hashlib.sha256).hexdigest()
+        if (
+            set(admission) - {"schema", "receipt_digest", "signature", "host_attestation"}
+            or admission.get("schema") != "engineering.traceability-receipt-admission.v1"
+            or admission.get("receipt_digest") != json.loads(material.decode("utf-8"))["receipt_digest"]
+            or not isinstance(admission.get("signature"), str)
+            or not hmac.compare_digest(admission["signature"], expected)
+        ):
+            raise EngineeringError("Engineering traceability receipt admission is invalid.")
+        # Controller HMAC protects local storage integrity only. A detached
+        # host/adapter proof is required before this process-local token is
+        # attached and the receipt can participate in verified-live reduction.
+        host_attestation = admission.get("host_attestation")
+        if host_attestation is not None:
+            if root is None:
+                raise EngineeringError("Engineering traceability host attestation requires a project root.")
+            _verify_traceability_host_attestation(root, receipt, host_attestation)
+            receipt["_traceability_trust_token"] = _TRACEABILITY_TRUST_TOKEN
+        retained.append(receipt)
+    return retained
+
+
+def issue_traceability_receipt_admission(
+    root: Path, receipt: object, host_attestation: object | None = None
+) -> dict:
+    """Bind storage integrity to a detached, trusted host/adapter signature.
+
+    This helper deliberately does not mint host authority.  The detached
+    signature must already be produced by an approver in the repository's
+    `.engineering-host-approvers` trust route.
+    """
+    project_root = resolve_project_root(str(root))
+    normalized = _traceability_receipt(receipt, datetime.now(timezone.utc))
+    if host_attestation is None:
+        raise EngineeringError("Engineering traceability host attestation is required.")
+    _verify_traceability_host_attestation(project_root, normalized, host_attestation)
+    key = _controller_key(_project_controller_dir(project_root), required=True)
+    assert key is not None
+    material = _receipt_admission_material(normalized)
+    return {
+        "schema": "engineering.traceability-receipt-admission.v1",
+        "receipt_digest": json.loads(material.decode("utf-8"))["receipt_digest"],
+        "signature": "hmac-sha256:" + hmac.new(key, material, hashlib.sha256).hexdigest(),
+        "host_attestation": host_attestation,
+    }
+
+
+def ingest_traceability_receipts(root: Path, receipts: object, admissions: object) -> dict:
+    """Persist only bounded host-attested receipts; caller status labels are ignored."""
+    project_root = resolve_project_root(str(root))
+    if not isinstance(receipts, list) or not isinstance(admissions, list) or len(receipts) > 256 or len(admissions) > 256:
+        raise EngineeringError("Engineering traceability receipt ingestion is invalid.")
+    key = _controller_key(_project_controller_dir(project_root), required=True)
+    assert key is not None
+    admissions_by_digest: dict[str, dict] = {}
+    for admission in admissions:
+        if (
+            not isinstance(admission, dict)
+            or set(admission) - {"schema", "receipt_digest", "signature", "host_attestation"}
+            or admission.get("schema") != "engineering.traceability-receipt-admission.v1"
+            or not isinstance(admission.get("receipt_digest"), str)
+            or not isinstance(admission.get("signature"), str)
+        ):
+            raise EngineeringError("Engineering traceability receipt admission is invalid.")
+        admissions_by_digest[admission["receipt_digest"]] = admission
+    normalized = []
+    host_attestations: dict[str, dict] = {}
+    now = datetime.now(timezone.utc)
+    for raw in receipts:
+        receipt = _traceability_receipt(raw, now)
+        material = _receipt_admission_material(receipt)
+        digest = json.loads(material.decode("utf-8"))["receipt_digest"]
+        admission = admissions_by_digest.get(digest)
+        expected = "hmac-sha256:" + hmac.new(key, material, hashlib.sha256).hexdigest()
+        if admission is None or not hmac.compare_digest(admission.get("signature", ""), expected):
+            raise EngineeringError("Engineering traceability receipt admission is invalid.")
+        host_attestation = admission.get("host_attestation")
+        if host_attestation is not None:
+            _verify_traceability_host_attestation(project_root, receipt, host_attestation)
+            host_attestations[digest] = host_attestation
+        normalized.append(receipt)
+    payload = _signed_traceability_receipt_payload(normalized, key, host_attestations=host_attestations)
+    path = _traceability_receipts_path(project_root)
+    _private_atomic_bytes(path, _canonical_json(payload))
+    return {"schema": TRACEABILITY_RECEIPTS_SCHEMA, "accepted": len(normalized), "digest": _json_digest(payload)}
+
+
+def _load_traceability_receipts(root: Path) -> list[dict]:
+    path = _traceability_receipts_path(root)
+    if not path.is_file():
+        return []
+    _verify_owner_private(path, directory=False)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering traceability receipts are invalid.") from error
+    key = _controller_key(_project_controller_dir(root), required=True)
+    assert key is not None
+    return _load_signed_traceability_receipts_payload(payload, key, root=root)
+
+
+def traceability_view(
+    root: Path,
+    *,
+    as_of: str | None = None,
+    focus: str | None = None,
+    commit: str | None = None,
+) -> dict:
+    """Return the canonical v2 machine view without changing project state."""
+    project_root = resolve_project_root(str(root))
+    target_commit = git(project_root, "rev-parse", commit or "HEAD")
+    if commit is None:
+        # Preserve the established live-worktree path for compatibility with
+        # legacy map/status callers; an explicit --commit is the historical
+        # revision path and resolves its manifest from that revision.
+        config = load_project_config(project_root)
+    else:
+        manifest_name = _tracked_manifest_name_at(project_root, target_commit)
+        if manifest_name is None:
+            raise EngineeringError("manifest_not_tracked")
+        config = _json_at(project_root, target_commit, manifest_name)
+        config["source_path"] = Path(manifest_name)
+    declared = config.get("assurance")
+    if declared is None:
+        declared = {"schema": ASSURANCE_SCHEMA, "capabilities": [], "cells": [], "obligations": []}
+    checkpoint = _load_checkpoint(project_root, target_commit)
+    current_status = status(project_root, target_commit=target_commit)
+    metadata = checkpoint.get("metadata", {})
+    assurance_digest = _json_digest(declared)
+    status_lines = git(project_root, "status", "--porcelain", "--untracked-files=all").splitlines()
+    dirty_paths = []
+    for line in status_lines[:256]:
+        path = line[3:] if len(line) >= 4 else line
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        dirty_paths.append(path.replace("\\", "/"))
+    context = {
+        "project": {"identity": metadata.get("project_identity", metadata.get("project", "unknown"))},
+        "worktree": {"branch": metadata.get("branch", "unknown")},
+        "commit": target_commit,
+        "checkpoint": {"kind": metadata.get("kind", "unknown"), "digest": metadata.get("graph_digest", "unknown")},
+        "graphify": {"version": GRAPHIFY_VERSION, "commit": GRAPHIFY_COMMIT, "status": "pinned"},
+        "overlay": {"digest": metadata.get("input_digest", "unknown")},
+        "assurance": {"digest": assurance_digest},
+        "dirty_coverage": {"state": "dirty" if status_lines else "clean", "count": len(status_lines), "paths": dirty_paths, "truncated": len(status_lines) > len(dirty_paths)},
+        "authority": {"state": "unknown", "reasons": ["query_does_not_grant_live_authority"]},
+        "freshness": current_status.get("freshness", "unknown"),
+        "paths": [str(config["source_path"].name).replace("\\", "/")],
+        "gaps": [] if current_status.get("freshness") == "current" else ["checkpoint_freshness"],
+        "provenance": "local_deterministic_query",
+    }
+    relationships, focused_paths = _traceability_relationships(checkpoint, focus)
+    context["relationships"] = relationships
+    context["focus"] = focus or "all"
+    context["aggregate"] = focus is None
+    if focus:
+        context["paths"] = focused_paths
+    # v2.2.4 observations remain readable but have no capability/cell scope and
+    # therefore cannot establish the v2 verified-live state.
+    receipts = _load_traceability_receipts(project_root) + _load_assurance_overlay(project_root)
+    context["identity"] = {"project_id": context["project"]["identity"], "worktree_id": context["worktree"]["branch"], "commit": target_commit, "checkpoint": context["checkpoint"]["digest"]}
+    return compose_traceability_view(declared, receipts, context, as_of or _utc_now())
+
+
+def write_traceability_view_html(root: Path, view: object) -> dict:
+    project_root = resolve_project_root(str(root))
+    document = render_traceability_view_html(view)
+    destination = _common_graph_dir(project_root) / "traceability-views" / view["digest"].replace(":", "-") / "index.html"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_text(destination, document)
+    return {"output": str(destination), "digest": view["digest"]}
 
 
 def build_execution_context(
@@ -11850,6 +12488,13 @@ def main() -> int:
     map_parser.add_argument("root", nargs="?", default=".")
     map_parser.add_argument("--no-open", action="store_true")
     map_parser.add_argument("--focus")
+    for name in ("traceability", "traceability-view"):
+        traceability_view_parser = commands.add_parser(name)
+        traceability_view_parser.add_argument("root", nargs="?", default=".")
+        traceability_view_parser.add_argument("--focus")
+        traceability_view_parser.add_argument("--commit")
+        traceability_view_parser.add_argument("--as-of")
+        traceability_view_parser.add_argument("--html", action="store_true")
     retrospective_parser = commands.add_parser("retrospect")
     retrospective_parser.add_argument("root", nargs="?", default=".")
     retrospective_parser.add_argument("--scope", action="append")
@@ -11990,7 +12635,7 @@ def main() -> int:
                     raise EngineeringError("Maintenance accepts exactly one project root.")
                 root = resolve_project_root(arguments.target)
                 result = run_maintenance(root, arguments.area)
-        elif arguments.command in {"map", "prepare", "setup", "retrospect"}:
+        elif arguments.command in {"map", "traceability", "traceability-view", "prepare", "setup", "retrospect"}:
             advisory = pre_repository_advisory(arguments.root)
             if advisory is not None:
                 if arguments.command == "map":
@@ -11998,6 +12643,13 @@ def main() -> int:
                         "schema": "engineering.map.v1",
                         "status": "unavailable",
                         "reason": "canonical_map_unavailable_until_local_version_control_exists",
+                        "advisory": advisory,
+                    }
+                elif arguments.command in {"traceability", "traceability-view"}:
+                    result = {
+                        "schema": TRACEABILITY_VIEW_SCHEMA,
+                        "status": "unavailable",
+                        "reason": "canonical_checkpoint_unavailable_until_local_version_control_exists",
                         "advisory": advisory,
                     }
                 elif arguments.command == "prepare":
@@ -12110,6 +12762,15 @@ def main() -> int:
             result = render_map(
                 root, open_output=not arguments.no_open, focus=arguments.focus
             )
+        elif arguments.command in {"traceability", "traceability-view"}:
+            result = traceability_view(
+                root,
+                as_of=arguments.as_of,
+                focus=arguments.focus,
+                commit=arguments.commit,
+            )
+            if arguments.html:
+                result = {"view": result, "html": write_traceability_view_html(root, result)}
         elif arguments.command == "retrospect":
             if arguments.preview_digest is None:
                 result = retrospective_preview(
