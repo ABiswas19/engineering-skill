@@ -5327,16 +5327,42 @@ class Task3AmendedContractTests(unittest.TestCase):
         with (
             patch.object(module.os, "name", "nt"),
             patch.object(module.subprocess, "run") as run,
+            patch.object(
+                module,
+                "_saved_process_tree_absent",
+                return_value=(True, "saved_process_tree_absent"),
+            ) as saved_tree_absent,
         ):
-            terminated = module._terminate_process_tree(process)
+            terminated = module._terminate_process_tree(
+                process,
+                expected_tree=[{"pid": 4242, "start_time": "saved-start"}],
+            )
 
         self.assertTrue(terminated)
+        saved_tree_absent.assert_called_once_with(
+            [{"pid": 4242, "start_time": "saved-start"}],
+        )
         run.assert_called_once_with(
             ["taskkill", "/PID", "4242", "/T", "/F"],
             capture_output=True,
             text=True,
             timeout=2,
         )
+
+    def test_windows_timeout_without_saved_tree_stays_unconfirmed(self):
+        module = self.module()
+        process = Mock()
+        process.pid = 4242
+        process.poll.side_effect = [None, 0]
+        process.wait.return_value = 0
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.subprocess, "run"),
+        ):
+            terminated = module._terminate_process_tree(process)
+
+        self.assertFalse(terminated)
 
     def test_windows_first_poll_exited_keeps_process_tree_unconfirmed(self):
         module = self.module()
