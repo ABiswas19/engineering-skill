@@ -5311,9 +5311,16 @@ class Task3AmendedContractTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertTrue(child_pid_path.is_file())
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        expected_tree = (
+            module._capture_process_tree(process.pid) if os.name == "nt" else None
+        )
+        if os.name == "nt":
+            self.assertTrue(expected_tree)
 
         terminated = module._terminate_process_tree(
-            process, process.pid if os.name != "nt" else None
+            process,
+            process.pid if os.name != "nt" else None,
+            expected_tree=expected_tree,
         )
         process.communicate(timeout=5)
 
