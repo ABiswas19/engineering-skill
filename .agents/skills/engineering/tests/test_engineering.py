@@ -208,7 +208,7 @@ class SkillShapeTests(unittest.TestCase):
                     "test_material_replacement_rejects_candidate_local_success_without_equivalence",
                     "test_outcome_survival_lists_each_missing_baseline_mapping",
                     "test_unmanaged_material_redesign_is_advisory_and_never_accepted",
-                    "test_managed_material_redesign_blocks_with_exact_mapping_boundary",
+                    "test_managed_material_redesign_without_owner_intent_blocks_with_external_boundary",
                     "test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown",
                 ),
             ),
@@ -5786,7 +5786,7 @@ class Task5ContractTests(unittest.TestCase):
         self.assertFalse(prepared["outcome_survival"]["accepted"])
         self.assertFalse(prepared["outcome_survival"]["implementation_ready"])
 
-    def test_managed_material_redesign_blocks_with_exact_mapping_boundary(self):
+    def test_managed_material_redesign_without_owner_intent_blocks_with_external_boundary(self):
         root, _ = self.prepared_repo("managed-outcome-survival")
         self.module().approve_checks(root)
 
@@ -5801,14 +5801,12 @@ class Task5ContractTests(unittest.TestCase):
         )
 
         self.assertEqual("blocked", prepared["readiness"])
+        self.assertEqual([], prepared["outcome_survival"]["missing_baseline_mappings"])
         self.assertEqual(
-            ["baseline_reconstruction_required"],
-            prepared["outcome_survival"]["missing_baseline_mappings"],
-        )
-        self.assertEqual(
-            "signed_scope_handoff_required",
+            "external_owner_intent_required",
             prepared["outcome_survival"]["approval_boundary"],
         )
+        self.assertEqual("owner_intent_unknown", prepared["owner_intent"]["state"])
 
 
     def test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown(self):
