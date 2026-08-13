@@ -4217,7 +4217,7 @@ class Task3AmendedContractTests(unittest.TestCase):
         record.pop("worker_process_tree_dead", None)
         module._write_operation(record)
 
-        with patch.object(module, "_process_alive", return_value=False):
+        with patch.object(module, "_process_state", return_value="dead"):
             result = module.cleanup_hook_operation(
                 root, operation["operation_id"], timeout_seconds=30
             )
@@ -6352,7 +6352,7 @@ class Task5ContractTests(unittest.TestCase):
                 owner["created_at"] = timestamp
                 owner_path.write_text(json.dumps(owner), encoding="utf-8")
 
-                with patch.object(module, "_process_alive", return_value=False):
+                with patch.object(module, "_process_state", return_value="dead"):
                     result = module.reconcile_orphaned_operations(
                         root, timeout_seconds=5
                     )
