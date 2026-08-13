@@ -3967,7 +3967,7 @@ def cleanup_hook_operation(
         ):
             if not (
                 allow_replaced_completion_lock
-                and record.get("kind") == "completion"
+                and record.get("controller_owned_completion") is True
                 and not isinstance(record.get("worker_pid"), int)
             ):
                 return _orphan_cleanup_result(

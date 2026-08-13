@@ -5622,6 +5622,7 @@ class Task3AmendedContractTests(unittest.TestCase):
 
 class Task5ContractTests(unittest.TestCase):
     init_repo = Task2ContractTests.init_repo
+    governed_repo = Task3ContractTests.governed_repo
     git = Task2ContractTests.git
     commit_all = Task2ContractTests.commit_all
     run_cli = Task2ContractTests.run_cli
@@ -6440,6 +6441,130 @@ class Task5ContractTests(unittest.TestCase):
         self.assertEqual(record["lock_token"], owner["lock_token"])
         self.assertEqual(os.getpid(), owner["owner_pid"])
         self.assertIsInstance(owner["created_at"], float)
+
+    def test_controller_completion_cleanup_preserves_replacement_lock(self):
+        module = self.module()
+        root = self.governed_repo("completion-replaced-lock")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            kind="completion",
+            phase="orphaned",
+            worker_process_tree_dead=True,
+            controller_owned_completion=True,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        replacement_owner = {
+            "operation_id": "newer-operation",
+            "lock_token": "newer-token",
+            "owner_pid": os.getpid(),
+            "owner_identity": module._process_identity(os.getpid()),
+            "created_at": time.time(),
+        }
+        owner_path = Path(record["repository_lock_path"]) / "owner.json"
+        owner_path.write_text(json.dumps(replacement_owner), encoding="utf-8")
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+        ):
+            result = module.cleanup_hook_operation(
+                root,
+                operation["operation_id"],
+                timeout_seconds=5,
+                allow_replaced_completion_lock=True,
+            )
+
+        self.assertTrue(result["completed"], result)
+        self.assertFalse(Path(record["record_path"]).exists())
+        self.assertEqual(
+            replacement_owner,
+            json.loads(owner_path.read_text(encoding="utf-8")),
+        )
+
+    def test_replaced_lock_bypass_requires_controller_completion_marker(self):
+        module = self.module()
+        root = self.governed_repo("completion-replaced-lock-marker")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(kind="completion", phase="orphaned", worker_process_tree_dead=True)
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner_path = Path(record["repository_lock_path"]) / "owner.json"
+        replacement_owner = {
+            "operation_id": "newer-operation",
+            "lock_token": "newer-token",
+            "owner_pid": os.getpid(),
+            "owner_identity": module._process_identity(os.getpid()),
+            "created_at": time.time(),
+        }
+        owner_path.write_text(json.dumps(replacement_owner), encoding="utf-8")
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+        ):
+            result = module.cleanup_hook_operation(
+                root,
+                operation["operation_id"],
+                timeout_seconds=5,
+                allow_replaced_completion_lock=True,
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("repository_lock_owner_mismatch", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertEqual(
+            replacement_owner,
+            json.loads(owner_path.read_text(encoding="utf-8")),
+        )
+
+    def test_replaced_lock_bypass_rejects_worker_operation(self):
+        module = self.module()
+        root = self.governed_repo("worker-replaced-lock")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            kind="hook",
+            phase="orphaned",
+            worker_pid=4242,
+            worker_process_tree_dead=True,
+            controller_owned_completion=True,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner_path = Path(record["repository_lock_path"]) / "owner.json"
+        replacement_owner = {
+            "operation_id": "newer-operation",
+            "lock_token": "newer-token",
+            "owner_pid": os.getpid(),
+            "owner_identity": module._process_identity(os.getpid()),
+            "created_at": time.time(),
+        }
+        owner_path.write_text(json.dumps(replacement_owner), encoding="utf-8")
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+        ):
+            result = module.cleanup_hook_operation(
+                root,
+                operation["operation_id"],
+                timeout_seconds=5,
+                allow_replaced_completion_lock=True,
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("repository_lock_owner_mismatch", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertEqual(
+            replacement_owner,
+            json.loads(owner_path.read_text(encoding="utf-8")),
+        )
 
     def test_concurrent_live_repository_lock_blocks_without_replacing_owner(self):
         module = self.module()
