@@ -3064,6 +3064,88 @@ def _process_alive(pid: object) -> bool:
     return True
 
 
+def _windows_process_state(pid: int) -> str:
+    """Distinguish an exited Windows PID from an inaccessible live PID."""
+    if os.name != "nt":
+        return "unknown"
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint32,
+    )
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    handle = kernel32.OpenProcess(0x1000 | 0x0400, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        return "dead" if error in (87, 1168) else "unknown"
+    exit_code = ctypes.c_uint32()
+    try:
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return "unknown"
+        return "live" if exit_code.value == 259 else "dead"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_state(pid: object) -> str:
+    """Return live/dead/unknown without treating access denial as death."""
+    if not isinstance(pid, int) or pid <= 0:
+        return "dead"
+    if _process_alive(pid):
+        return "live"
+    if os.name == "nt":
+        return _windows_process_state(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "unknown"
+    except OSError:
+        return "unknown"
+    return "live"
+
+
+def _owner_process_state(owner: dict | None) -> str:
+    """Conservatively validate a durable lock owner's PID and start identity."""
+    if not isinstance(owner, dict):
+        return "dead"
+    pid = owner.get("owner_pid")
+    expected = owner.get("owner_identity")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(expected, dict):
+        return "ambiguous"
+    state = _process_state(pid)
+    current = _process_identity(pid)
+    if state == "live":
+        if current is None:
+            return "ambiguous"
+        if current.get("start_time") != expected.get("start_time"):
+            return "ambiguous"
+        return "live"
+    if state == "dead":
+        if current is not None and current.get("start_time") != expected.get("start_time"):
+            return "ambiguous"
+        return "dead"
+    return "ambiguous"
+
+
+def _same_process_identity(current: dict | None, expected: dict) -> bool:
+    return (
+        isinstance(current, dict)
+        and current.get("pid") == expected.get("pid")
+        and current.get("start_time") == expected.get("start_time")
+    )
+
+
 def _process_tree_status(record: dict) -> dict:
     """Return conservative process-tree evidence for an orphan operation."""
     worker_pid = record.get("worker_pid")
@@ -3072,6 +3154,13 @@ def _process_tree_status(record: dict) -> dict:
     if not isinstance(worker_pid, int) or worker_pid <= 0:
         return {"state": "dead", "evidence": "no_worker_started"}
     if not isinstance(expected, dict) or not isinstance(tree, list) or not tree:
+        if (
+            os.name != "nt"
+            and record.get("worker_process_tree_dead") is True
+            and isinstance(record.get("worker_process_tree_evidence"), dict)
+            and record["worker_process_tree_evidence"].get("state") == "dead"
+        ):
+            return {"state": "dead", "evidence": "termination_confirmed"}
         return {"state": "identity_ambiguous", "evidence": "missing_process_tree_identity"}
     expected_by_pid = {}
     for item in tree:
@@ -3085,13 +3174,40 @@ def _process_tree_status(record: dict) -> dict:
     leader = expected_by_pid.get(worker_pid)
     if leader is None or leader.get("start_time") != expected.get("start_time"):
         return {"state": "identity_ambiguous", "evidence": "leader_identity_mismatch"}
+    if record.get("worker_process_tree_complete") is False:
+        return {"state": "identity_ambiguous", "evidence": "incomplete_process_tree_snapshot"}
+    fresh_tree = _capture_process_tree(worker_pid)
+    if fresh_tree is None:
+        return {"state": "identity_ambiguous", "evidence": "fresh_process_tree_unavailable"}
+    for current in fresh_tree:
+        if not isinstance(current, dict) or not isinstance(current.get("pid"), int):
+            return {"state": "identity_ambiguous", "evidence": "invalid_fresh_process_tree"}
+        saved = expected_by_pid.get(current["pid"])
+        if saved is None:
+            return {
+                "state": "live",
+                "evidence": "fresh_process_tree_child",
+                "pid": current["pid"],
+            }
+        if not _same_process_identity(current, saved):
+            return {
+                "state": "identity_ambiguous",
+                "evidence": "pid_reused",
+                "pid": current["pid"],
+            }
     for pid, saved in expected_by_pid.items():
-        if not _process_alive(pid):
+        state = _process_state(pid)
+        if state == "unknown":
+            return {"state": "identity_ambiguous", "evidence": "process_state_unknown", "pid": pid}
+        if state == "dead":
+            identity = _process_identity(pid)
+            if identity is not None and not _same_process_identity(identity, saved):
+                return {"state": "identity_ambiguous", "evidence": "pid_reused", "pid": pid}
             continue
         current = _process_identity(pid)
         if current is None:
             return {"state": "identity_ambiguous", "evidence": "process_identity_unreadable", "pid": pid}
-        if current.get("start_time") != saved.get("start_time"):
+        if not _same_process_identity(current, saved):
             return {"state": "identity_ambiguous", "evidence": "pid_reused", "pid": pid}
         return {"state": "live", "evidence": "saved_process_alive", "pid": pid}
     return {"state": "dead", "evidence": "saved_process_tree_absent"}
@@ -3209,10 +3325,14 @@ def _capture_process_tree(pid: int) -> list[dict] | None:
         for candidate_pid in by_pid:
             if candidate_pid == pid or _is_descendant(candidate_pid, by_pid, pid):
                 identity = _process_identity(candidate_pid)
-                if identity is not None:
-                    selected.append({**identity, "parent_pid": by_pid[candidate_pid]["parent_pid"]})
+                if identity is None:
+                    if _process_state(candidate_pid) != "dead":
+                        return None
+                    continue
+                selected.append({**identity, "parent_pid": by_pid[candidate_pid]["parent_pid"]})
         return selected or [root]
     entries = {pid: {**root, "parent_pid": None}}
+    parent_by_pid = {pid: None}
     proc_root = Path("/proc")
     try:
         candidates = [item for item in proc_root.iterdir() if item.name.isdigit()]
@@ -3226,9 +3346,15 @@ def _capture_process_tree(pid: int) -> list[dict] | None:
             identity = _process_identity(child_pid)
         except (OSError, ValueError, IndexError):
             continue
+        parent_by_pid[child_pid] = parent_pid
         if identity is not None:
             entries[child_pid] = {**identity, "parent_pid": parent_pid}
-    descendants = [item for child_pid, item in entries.items() if child_pid == pid or _is_descendant(child_pid, entries, pid)]
+    for child_pid, parent_pid in parent_by_pid.items():
+        if child_pid == pid or _is_descendant(child_pid, parent_by_pid, pid):
+            if child_pid not in entries:
+                if _process_state(child_pid) != "dead":
+                    return None
+    descendants = [item for child_pid, item in entries.items() if child_pid == pid or _is_descendant(child_pid, parent_by_pid, pid)]
     return descendants or [root]
 
 
@@ -3237,7 +3363,8 @@ def _is_descendant(pid: int, entries: dict[int, dict], root_pid: int) -> bool:
     current = pid
     while current not in seen:
         seen.add(current)
-        parent = entries.get(current, {}).get("parent_pid")
+        item = entries.get(current)
+        parent = item.get("parent_pid") if isinstance(item, dict) else item
         if parent == root_pid:
             return True
         if not isinstance(parent, int):
@@ -3264,6 +3391,8 @@ def orphan_operation_status(root: Path) -> dict:
             result.append({
                 "operation_id": child.name,
                 "phase": record.get("phase"),
+                "worker_identity": record.get("worker_identity"),
+                "worker_process_tree": record.get("worker_process_tree"),
                 "process_tree": status,
                 "lock": _lock_owner(record),
             })
@@ -3291,6 +3420,19 @@ def reap_orphan_operation(root: Path, operation_id: str, *, timeout_seconds: flo
         return {"completed": False, "reason": "repository_lock_owner_missing", "user_visible": True}
     if not _orphan_is_old_enough(record, owner):
         return {"completed": False, "reason": "orphan_too_young", "user_visible": True}
+    if record.get("worker_start_pending") is True:
+        return {"completed": False, "reason": "live_hook_operation", "user_visible": True}
+    owner_pid = owner.get("owner_pid")
+    owner_identity = owner.get("owner_identity")
+    if not isinstance(owner_pid, int) or not isinstance(owner_identity, dict):
+        return {"completed": False, "reason": "ambiguous_worker_process_identity", "user_visible": True}
+    owner_state = _owner_process_state(owner)
+    if owner_state == "live":
+        if record.get("worker_pid") is None:
+            return {"completed": False, "reason": "live_hook_operation", "user_visible": True}
+        return {"completed": False, "reason": "live_hook_operation", "user_visible": True}
+    if owner_state != "dead":
+        return {"completed": False, "reason": "ambiguous_worker_process_identity", "user_visible": True}
     status = _process_tree_status(record)
     if status.get("state") == "live":
         return {"completed": False, "reason": "live_worker_process_tree", "user_visible": True}
@@ -3366,11 +3508,17 @@ def _saved_process_tree_absent(tree: object) -> tuple[bool, str]:
     for saved in tree:
         if not isinstance(saved, dict) or not isinstance(saved.get("pid"), int):
             return False, "invalid_process_tree_identity"
-        if not _process_alive(saved["pid"]):
+        state = _process_state(saved["pid"])
+        if state == "unknown":
+            return False, "process_state_unknown"
+        if state == "dead":
+            identity = _process_identity(saved["pid"])
+            if identity is not None and identity.get("start_time") != saved.get("start_time"):
+                return False, "pid_reused"
             continue
         current = _process_identity(saved["pid"])
         if current is None:
-            continue
+            return False, "process_identity_unreadable"
         if current.get("start_time") != saved.get("start_time"):
             return False, "pid_reused"
         return False, "saved_process_alive"
@@ -3569,8 +3717,20 @@ def _recover_worker_tree_state(
 ) -> dict | None:
     if record.get("worker_start_pending") is True:
         return None
-    if "worker_pid" not in record or record.get("worker_process_tree_dead") is True:
+    if "worker_pid" not in record:
         return record
+    if record.get("worker_process_tree_dead") is True:
+        status = _process_tree_status(record)
+        if status.get("state") != "dead":
+            return None
+        paths = _validated_operation_paths(root, operation_id)
+        trusted_record = {
+            **record,
+            **{key: str(value) for key, value in paths.items()},
+            "worker_process_tree_evidence": status,
+        }
+        _write_operation(trusted_record)
+        return trusted_record
     worker_pid = record.get("worker_pid")
     pgid = record.get("worker_pgid")
     killpg = getattr(os, "killpg", None)
@@ -3662,7 +3822,7 @@ def cleanup_hook_operation(
     record = recovered_record
     cleanup_pid = record.get("cleanup_pid")
     if cleanup_pid is not None:
-        if _process_alive(cleanup_pid):
+        if _process_state(cleanup_pid) != "dead":
             return {
                 "completed": False,
                 "reason": "live_cleanup_process",
@@ -3674,8 +3834,12 @@ def cleanup_hook_operation(
         _write_operation(record)
     if (
         record.get("phase") == "registered"
-        and _process_alive(record.get("owner_pid"))
-        and not record.get("worker_process_tree_dead")
+        and _owner_process_state(
+            {
+                "owner_pid": record.get("owner_pid"),
+                "owner_identity": record.get("owner_identity"),
+            }
+        ) == "live"
     ):
         return {
             "completed": False,
@@ -3687,21 +3851,29 @@ def cleanup_hook_operation(
     if paths is None:
         return invalid_boundary()
     owner = _lock_owner({**record, **{key: str(value) for key, value in paths.items()}})
-    if owner is not None and (
-        owner.get("operation_id") != operation_id
-        or owner.get("lock_token") != record.get("lock_token")
-        or (
-            _process_alive(owner.get("owner_pid"))
-            and not record.get("worker_process_tree_dead")
-        )
-    ):
-        return _orphan_cleanup_result(
-            project_root,
-            operation_id,
-            record,
-            "repository_lock_owner_mismatch",
-            started,
-        )
+    if owner is not None:
+        if (
+            owner.get("operation_id") != operation_id
+            or owner.get("lock_token") != record.get("lock_token")
+        ):
+            return _orphan_cleanup_result(
+                project_root,
+                operation_id,
+                record,
+                "repository_lock_owner_mismatch",
+                started,
+            )
+        owner_state = _owner_process_state(owner)
+        if owner_state != "dead":
+            return _orphan_cleanup_result(
+                project_root,
+                operation_id,
+                record,
+                "repository_lock_owner_mismatch"
+                if owner_state == "live"
+                else "ambiguous_worker_process_identity",
+                started,
+            )
     paths = trusted_paths()
     if paths is None:
         return invalid_boundary()
@@ -3869,12 +4041,22 @@ def reconcile_orphaned_operations(
             unresolved.append(child.name)
             continue
         if (
-            _process_alive(
-                owner.get("owner_pid") if owner is not None else record.get("owner_pid")
-            )
-            and not record.get("worker_process_tree_dead")
+            owner is None
+            and record.get("worker_process_tree_dead") is True
+            and not isinstance(record.get("worker_pid"), int)
         ):
+            # Legacy records with no lock and no worker have no live resource
+            # owner left to protect; the durable dead marker is sufficient.
+            owner_state = "dead"
+        else:
+            owner_state = _owner_process_state(owner) if owner is not None else _owner_process_state(
+                {"owner_pid": record.get("owner_pid"), "owner_identity": record.get("owner_identity")}
+            )
+        if owner_state == "live":
             live.append(child.name)
+            continue
+        if owner_state == "ambiguous":
+            unresolved.append(child.name)
             continue
         if not _orphan_is_old_enough(record, owner):
             unresolved.append(child.name)
@@ -4316,13 +4498,11 @@ def _run_graph_operation(
                 continue
             if owner is not None and (
                 owner.get("operation_id") != unresolved_id
-                or owner.get("lock_token")
-                != unresolved_record.get("lock_token")
-                or (
-                    _process_alive(owner.get("owner_pid"))
-                    and not unresolved_record.get("worker_process_tree_dead")
-                )
+                or owner.get("lock_token") != unresolved_record.get("lock_token")
             ):
+                reason = "repository_lock_owner_mismatch"
+                break
+            if owner is not None and _owner_process_state(owner) == "live":
                 reason = "repository_lock_owner_mismatch"
                 break
         return {
@@ -4395,6 +4575,7 @@ def _run_graph_operation(
             "worker_process_tree": _capture_process_tree(process.pid),
         }
     )
+    record["worker_process_tree_complete"] = bool(record.get("worker_process_tree"))
     if worker_pgid is not None:
         record["worker_pgid"] = worker_pgid
     else:
@@ -4426,7 +4607,10 @@ def _run_graph_operation(
             refreshed_tree = _capture_process_tree(process.pid)
             if isinstance(refreshed_tree, list) and refreshed_tree:
                 record["worker_process_tree"] = refreshed_tree
-                _write_operation(record)
+                record["worker_process_tree_complete"] = True
+            elif refreshed_tree is None:
+                record["worker_process_tree_complete"] = False
+            _write_operation(record)
         expected_tree = record.get("worker_process_tree")
         if isinstance(expected_tree, list) and expected_tree:
             worker_process_tree_dead = _terminate_process_tree(

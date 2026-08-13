@@ -4411,6 +4411,114 @@ class Task3AmendedContractTests(unittest.TestCase):
         self.assertEqual("repository_lock_owner_mismatch", result["reason"])
         self.assertTrue(Path(record["record_path"]).exists())
 
+    def test_orphan_reap_never_removes_live_pre_worker_registration(self):
+        module = self.module()
+        root = self.governed_repo("orphan-live-registration")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            phase="registered",
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner = json.loads(
+            Path(record["repository_lock_path"], "owner.json").read_text(encoding="utf-8")
+        )
+        owner["created_at"] = record["created_at"]
+        Path(record["repository_lock_path"], "owner.json").write_text(
+            json.dumps(owner), encoding="utf-8"
+        )
+        with patch.object(module, "_process_tree_status", return_value={"state": "dead"}), patch.object(
+            module, "_process_alive", return_value=True
+        ):
+            result = module.reap_orphan_operation(
+                root, operation["operation_id"], timeout_seconds=30
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("live_hook_operation", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertEqual(owner["lock_token"], module._lock_owner(record)["lock_token"])
+
+    def test_orphan_status_exposes_saved_identity_and_tree_evidence(self):
+        module = self.module()
+        root = self.governed_repo("orphan-status-evidence")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        identity = {"pid": 4242, "start_time": "worker-start"}
+        tree = [
+            {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"},
+            {"pid": 4343, "parent_pid": 4242, "start_time": "child-start"},
+        ]
+        record.update(worker_pid=4242, worker_identity=identity, worker_process_tree=tree)
+        module._write_operation(record)
+        with patch.object(module, "_process_tree_status", return_value={"state": "unknown"}):
+            result = module.orphan_operation_status(root)
+        item = result["operations"][0]
+        self.assertEqual(identity, item["worker_identity"])
+        self.assertEqual(tree, item["worker_process_tree"])
+
+    def test_process_tree_status_rejects_fresh_unrecorded_child(self):
+        module = self.module()
+        identity = {"pid": 4242, "start_time": "worker-start"}
+        tree = [{"pid": 4242, "parent_pid": 1, "start_time": "worker-start"}]
+        record = {
+            "worker_pid": 4242,
+            "worker_identity": identity,
+            "worker_process_tree": tree,
+            "worker_process_tree_complete": True,
+        }
+        with (
+            patch.object(
+                module,
+                "_capture_process_tree",
+                return_value=tree + [
+                    {"pid": 4343, "parent_pid": 4242, "start_time": "child-start"}
+                ],
+            ),
+            patch.object(module, "_same_process_identity", side_effect=lambda current, expected: current.get("pid") == expected.get("pid") and current.get("start_time") == expected.get("start_time")),
+        ):
+            status = module._process_tree_status(record)
+        self.assertEqual("live", status["state"])
+        self.assertEqual("fresh_process_tree_child", status["evidence"])
+        self.assertEqual(4343, status["pid"])
+
+    def test_dead_marker_rechecks_live_lock_owner_before_reconcile(self):
+        module = self.module()
+        root = self.governed_repo("orphan-dead-marker-live-owner")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            owner_pid=4242,
+            owner_identity={"pid": 4242, "start_time": "owner-start"},
+            worker_pid=4242,
+            worker_identity={"pid": 4242, "start_time": "worker-start"},
+            worker_process_tree=[
+                {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"}
+            ],
+            worker_process_tree_dead=True,
+            phase="orphaned",
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner_path = Path(record["repository_lock_path"], "owner.json")
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        owner.update(
+            owner_pid=4242,
+            owner_identity=record["owner_identity"],
+            created_at=record["created_at"],
+        )
+        owner_path.write_text(json.dumps(owner), encoding="utf-8")
+        with (
+            patch.object(module, "_process_tree_status", return_value={"state": "dead", "evidence": "confirmed"}),
+            patch.object(module, "_owner_process_state", return_value="live"),
+        ):
+            result = module.reconcile_orphaned_operations(root, timeout_seconds=30)
+        self.assertEqual([operation["operation_id"]], result["live"])
+        self.assertTrue(Path(record["record_path"]).exists())
+
     def test_orphan_status_and_reap_cli_are_supported_controller_commands(self):
         module = self.module()
         root = self.governed_repo("orphan-cli")
@@ -5447,6 +5555,14 @@ class Task3AmendedContractTests(unittest.TestCase):
         self.assertEqual("unresolved_hook_worker_orphan", first["reason"])
         self.assertEqual("blocked", blocked["readiness"])
         self.assertEqual("unresolved_hook_worker_orphan", blocked["reason"])
+        if os.name == "nt":
+            # A synthetic PID with no Windows identity/tree evidence must stay
+            # durable and blocked; only a supported identity-attested reap may
+            # remove the operation.
+            self.assertEqual("blocked", recovered.get("readiness"))
+            self.assertEqual("unresolved_hook_worker_orphan", recovered.get("reason"))
+            self.assertTrue(record.exists())
+            return
         self.assertTrue(recovered["orphan_reconciled_before_worker"])
         self.assertEqual("current", recovered["freshness"])
         self.assertFalse(record.exists())
