@@ -3588,7 +3588,8 @@ def _terminate_process_tree(
         if expected_tree is not None:
             proven = _saved_process_tree_absent(expected_tree)[0]
         else:
-            proven = process.poll() is not None
+            # A leader exit without a saved tree is not whole-tree proof.
+            proven = False
         setattr(process, "_engineering_tree_proven", proven)
         return proven
     if pgid is None:
