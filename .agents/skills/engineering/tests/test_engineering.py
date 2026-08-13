@@ -5122,7 +5122,11 @@ class Task3AmendedContractTests(unittest.TestCase):
             patch.object(
                 module,
                 "_terminate_process_tree",
-                side_effect=lambda process, _pgid: (process.kill(), True)[1],
+                side_effect=lambda process, _pgid, **_kwargs: (
+                    process.kill(),
+                    setattr(process, "_engineering_tree_proven", True),
+                    True,
+                )[-1],
             ),
             patch.object(
                 module,

@@ -3121,20 +3121,23 @@ def _owner_process_state(owner: dict | None) -> str:
         return "dead"
     pid = owner.get("owner_pid")
     expected = owner.get("owner_identity")
-    if not isinstance(pid, int) or pid <= 0 or not isinstance(expected, dict):
+    if not isinstance(pid, int) or pid <= 0:
         return "ambiguous"
     state = _process_state(pid)
     current = _process_identity(pid)
+    if state == "dead":
+        if current is not None:
+            if not isinstance(expected, dict) or current.get("start_time") != expected.get("start_time"):
+                return "ambiguous"
+        return "dead"
+    if not isinstance(expected, dict):
+        return "ambiguous"
     if state == "live":
         if current is None:
             return "ambiguous"
         if current.get("start_time") != expected.get("start_time"):
             return "ambiguous"
         return "live"
-    if state == "dead":
-        if current is not None and current.get("start_time") != expected.get("start_time"):
-            return "ambiguous"
-        return "dead"
     return "ambiguous"
 
 
@@ -3155,10 +3158,13 @@ def _process_tree_status(record: dict) -> dict:
         return {"state": "dead", "evidence": "no_worker_started"}
     if not isinstance(expected, dict) or not isinstance(tree, list) or not tree:
         if (
-            os.name != "nt"
-            and record.get("worker_process_tree_dead") is True
+            record.get("worker_process_tree_dead") is True
             and isinstance(record.get("worker_process_tree_evidence"), dict)
             and record["worker_process_tree_evidence"].get("state") == "dead"
+            and (
+                os.name != "nt"
+                or record.get("worker_process_tree_authoritative") is True
+            )
         ):
             return {"state": "dead", "evidence": "termination_confirmed"}
         return {"state": "identity_ambiguous", "evidence": "missing_process_tree_identity"}
@@ -3560,8 +3566,11 @@ def _terminate_process_tree(
     if os.name == "nt":
         if process.poll() is not None:
             if expected_tree is None:
+                setattr(process, "_engineering_tree_proven", False)
                 return False
-            return _saved_process_tree_absent(expected_tree)[0]
+            proven = _saved_process_tree_absent(expected_tree)[0]
+            setattr(process, "_engineering_tree_proven", proven)
+            return proven
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -3577,8 +3586,11 @@ def _terminate_process_tree(
             process.kill()
             process.wait(timeout=2)
         if expected_tree is not None:
-            return _saved_process_tree_absent(expected_tree)[0]
-        return process.poll() is not None
+            proven = _saved_process_tree_absent(expected_tree)[0]
+        else:
+            proven = process.poll() is not None
+        setattr(process, "_engineering_tree_proven", proven)
+        return proven
     if pgid is None:
         if process.poll() is not None:
             return True
@@ -4677,6 +4689,10 @@ def _run_graph_operation(
         }
     latest_record = _read_operation(project_root, operation["operation_id"])
     latest_record["worker_process_tree_dead"] = worker_process_tree_dead
+    latest_record["worker_process_tree_authoritative"] = bool(
+        os.name != "nt"
+        or getattr(process, "_engineering_tree_proven", False)
+    )
     latest_record["worker_process_tree_evidence"] = (
         {"state": "dead", "evidence": "termination_confirmed"}
         if worker_process_tree_dead
