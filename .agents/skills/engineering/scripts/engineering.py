@@ -7867,6 +7867,11 @@ def _end_completion(root: Path, record: dict) -> None:
     current = _read_operation(root, record["operation_id"])
     current.update(phase="orphaned", worker_process_tree_dead=True)
     _write_operation(current)
+    # Completion/maintenance operations are owned by this controller process.
+    # Release that exact lock before the orphan cleanup guard checks for live
+    # owners; worker-operation cleanup must still refuse any live owner.
+    if not _release_failed_start_lock(current):
+        raise EngineeringError("Engineering completion lock ownership is ambiguous.")
     result = cleanup_hook_operation(root, current["operation_id"], timeout_seconds=30)
     if not result["completed"]:
         raise EngineeringError(f"Engineering completion cleanup failed: {result['reason']}")
