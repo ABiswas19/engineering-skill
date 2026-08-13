@@ -4132,7 +4132,10 @@ class Task3AmendedContractTests(unittest.TestCase):
                 swapped = True
             return value
 
-        with patch.object(Path, "unlink", new=unlink_then_swap):
+        with (
+            patch.object(module, "_process_state", return_value="dead"),
+            patch.object(Path, "unlink", new=unlink_then_swap),
+        ):
             try:
                 result = module.cleanup_hook_operation(
                     root, operation["operation_id"], timeout_seconds=30
@@ -4706,7 +4709,7 @@ class Task3AmendedContractTests(unittest.TestCase):
             owner["created_at"] = retained["created_at"]
             owner_path.write_text(json.dumps(owner), encoding="utf-8")
 
-        with patch.object(module, "_process_alive", return_value=False):
+        with patch.object(module, "_process_state", return_value="dead"):
             recovered = module.reconcile_orphaned_operations(
                 root, timeout_seconds=30
             )
@@ -6322,7 +6325,7 @@ class Task5ContractTests(unittest.TestCase):
         record = module._read_operation(root, operation["operation_id"])
         self.assertTrue(module._acquire_repository_lock(record))
 
-        with patch.object(module, "_process_alive", return_value=False):
+        with patch.object(module, "_process_state", return_value="dead"):
             result = module.reconcile_orphaned_operations(root, timeout_seconds=5)
 
         self.assertEqual([operation["operation_id"]], result["unresolved"])
