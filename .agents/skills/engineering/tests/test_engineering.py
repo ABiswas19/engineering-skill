@@ -4132,7 +4132,10 @@ class Task3AmendedContractTests(unittest.TestCase):
                 swapped = True
             return value
 
-        with patch.object(Path, "unlink", new=unlink_then_swap):
+        with (
+            patch.object(module, "_process_state", return_value="dead"),
+            patch.object(Path, "unlink", new=unlink_then_swap),
+        ):
             try:
                 result = module.cleanup_hook_operation(
                     root, operation["operation_id"], timeout_seconds=30
@@ -4217,7 +4220,7 @@ class Task3AmendedContractTests(unittest.TestCase):
         record.pop("worker_process_tree_dead", None)
         module._write_operation(record)
 
-        with patch.object(module, "_process_alive", return_value=False):
+        with patch.object(module, "_process_state", return_value="dead"):
             result = module.cleanup_hook_operation(
                 root, operation["operation_id"], timeout_seconds=30
             )
@@ -4225,6 +4228,325 @@ class Task3AmendedContractTests(unittest.TestCase):
         self.assertFalse(result["completed"])
         self.assertEqual("live_worker_process_tree", result["reason"])
         self.assertTrue(Path(record["record_path"]).is_file())
+
+    def test_timed_out_recovery_persists_process_tree_evidence_for_supported_reap(self):
+        module = self.module()
+        root = self.governed_repo("timed-out-recovery-orphan")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            owner_pid=4242,
+            worker_pid=4242,
+            phase="orphaned",
+            commit=self.git(root, "rev-parse", "HEAD"),
+            branch="main",
+            kind="canonical",
+            worker_process_tree_dead=False,
+            worker_identity={"pid": 4242, "start_time": "worker-start"},
+            worker_process_tree=[
+                {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"}
+            ],
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        Path(record["repository_lock_path"], "owner.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": operation["operation_id"],
+                    "lock_token": record["lock_token"],
+                    "owner_pid": record["worker_pid"],
+                    "owner_identity": record["worker_identity"],
+                    "created_at": record["created_at"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+            create=True,
+        ):
+            status = module.orphan_operation_status(root)
+            reap = module.reap_orphan_operation(
+                root, operation["operation_id"], timeout_seconds=30
+            )
+
+        self.assertEqual("dead", status["operations"][0]["process_tree"]["state"])
+        self.assertTrue(reap["completed"], reap)
+        self.assertFalse(Path(record["operation_root"]).exists())
+
+    def test_orphan_reap_preserves_live_child_and_exact_lock(self):
+        module = self.module()
+        root = self.governed_repo("orphan-live-child")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            owner_pid=4242,
+            worker_pid=4242,
+            phase="orphaned",
+            worker_process_tree_dead=False,
+            worker_identity={"pid": 4242, "start_time": "worker-start"},
+            worker_process_tree=[
+                {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"},
+                {"pid": 4343, "parent_pid": 4242, "start_time": "child-start"},
+            ],
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        Path(record["repository_lock_path"], "owner.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": operation["operation_id"],
+                    "lock_token": record["lock_token"],
+                    "owner_pid": record["worker_pid"],
+                    "owner_identity": record["worker_identity"],
+                    "created_at": record["created_at"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "live", "evidence": "saved_child_alive"},
+            create=True,
+        ):
+            result = module.reap_orphan_operation(
+                root, operation["operation_id"], timeout_seconds=30
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("live_worker_process_tree", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertTrue(Path(record["repository_lock_path"]).exists())
+
+    def test_orphan_reap_rejects_windows_pid_reuse_as_identity_ambiguous(self):
+        module = self.module()
+        root = self.governed_repo("orphan-pid-reuse")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            owner_pid=4242,
+            worker_pid=4242,
+            phase="orphaned",
+            worker_process_tree_dead=False,
+            worker_identity={"pid": 4242, "start_time": "old-start"},
+            worker_process_tree=[
+                {"pid": 4242, "parent_pid": 1, "start_time": "old-start"}
+            ],
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        Path(record["repository_lock_path"], "owner.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": operation["operation_id"],
+                    "lock_token": record["lock_token"],
+                    "owner_pid": record["worker_pid"],
+                    "owner_identity": record["worker_identity"],
+                    "created_at": record["created_at"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "identity_ambiguous", "evidence": "pid_reused"},
+            create=True,
+        ):
+            result = module.reap_orphan_operation(
+                root, operation["operation_id"], timeout_seconds=30
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("ambiguous_worker_process_identity", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertTrue(Path(record["repository_lock_path"]).exists())
+
+    def test_orphan_reap_rejects_exact_lock_token_mismatch(self):
+        module = self.module()
+        root = self.governed_repo("orphan-lock-mismatch")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            owner_pid=4242,
+            worker_pid=4242,
+            phase="orphaned",
+            worker_process_tree_dead=False,
+            worker_identity={"pid": 4242, "start_time": "worker-start"},
+            worker_process_tree=[
+                {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"}
+            ],
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        Path(record["repository_lock_path"], "owner.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": operation["operation_id"],
+                    "lock_token": "wrong-token",
+                    "owner_pid": record["worker_pid"],
+                    "owner_identity": record["worker_identity"],
+                    "created_at": record["created_at"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+            create=True,
+        ):
+            result = module.reap_orphan_operation(
+                root, operation["operation_id"], timeout_seconds=30
+            )
+        self.assertFalse(result["completed"])
+        self.assertEqual("repository_lock_owner_mismatch", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+
+    def test_orphan_reap_never_removes_live_pre_worker_registration(self):
+        module = self.module()
+        root = self.governed_repo("orphan-live-registration")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            phase="registered",
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner = json.loads(
+            Path(record["repository_lock_path"], "owner.json").read_text(encoding="utf-8")
+        )
+        owner["created_at"] = record["created_at"]
+        Path(record["repository_lock_path"], "owner.json").write_text(
+            json.dumps(owner), encoding="utf-8"
+        )
+        with patch.object(module, "_process_tree_status", return_value={"state": "dead"}), patch.object(
+            module, "_process_alive", return_value=True
+        ):
+            result = module.reap_orphan_operation(
+                root, operation["operation_id"], timeout_seconds=30
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertIn(
+            result["reason"],
+            {"live_hook_operation", "ambiguous_worker_process_identity"},
+        )
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertEqual(owner["lock_token"], module._lock_owner(record)["lock_token"])
+
+    def test_orphan_status_exposes_saved_identity_and_tree_evidence(self):
+        module = self.module()
+        root = self.governed_repo("orphan-status-evidence")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        identity = {"pid": 4242, "start_time": "worker-start"}
+        tree = [
+            {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"},
+            {"pid": 4343, "parent_pid": 4242, "start_time": "child-start"},
+        ]
+        record.update(worker_pid=4242, worker_identity=identity, worker_process_tree=tree)
+        module._write_operation(record)
+        with patch.object(module, "_process_tree_status", return_value={"state": "unknown"}):
+            result = module.orphan_operation_status(root)
+        item = result["operations"][0]
+        self.assertEqual(identity, item["worker_identity"])
+        self.assertEqual(tree, item["worker_process_tree"])
+
+    def test_process_tree_status_rejects_fresh_unrecorded_child(self):
+        module = self.module()
+        identity = {"pid": 4242, "start_time": "worker-start"}
+        tree = [{"pid": 4242, "parent_pid": 1, "start_time": "worker-start"}]
+        record = {
+            "worker_pid": 4242,
+            "worker_identity": identity,
+            "worker_process_tree": tree,
+            "worker_process_tree_complete": True,
+        }
+        with (
+            patch.object(
+                module,
+                "_capture_process_tree",
+                return_value=tree + [
+                    {"pid": 4343, "parent_pid": 4242, "start_time": "child-start"}
+                ],
+            ),
+            patch.object(module, "_same_process_identity", side_effect=lambda current, expected: current.get("pid") == expected.get("pid") and current.get("start_time") == expected.get("start_time")),
+        ):
+            status = module._process_tree_status(record)
+        self.assertEqual("live", status["state"])
+        self.assertEqual("fresh_process_tree_child", status["evidence"])
+        self.assertEqual(4343, status["pid"])
+
+    def test_dead_marker_rechecks_live_lock_owner_before_reconcile(self):
+        module = self.module()
+        root = self.governed_repo("orphan-dead-marker-live-owner")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            owner_pid=4242,
+            owner_identity={"pid": 4242, "start_time": "owner-start"},
+            worker_pid=4242,
+            worker_identity={"pid": 4242, "start_time": "worker-start"},
+            worker_process_tree=[
+                {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"}
+            ],
+            worker_process_tree_dead=True,
+            phase="orphaned",
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner_path = Path(record["repository_lock_path"], "owner.json")
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        owner.update(
+            owner_pid=4242,
+            owner_identity=record["owner_identity"],
+            created_at=record["created_at"],
+        )
+        owner_path.write_text(json.dumps(owner), encoding="utf-8")
+        with (
+            patch.object(module, "_process_tree_status", return_value={"state": "dead", "evidence": "confirmed"}),
+            patch.object(module, "_owner_process_state", return_value="live"),
+        ):
+            result = module.reconcile_orphaned_operations(root, timeout_seconds=30)
+        self.assertEqual([operation["operation_id"]], result["live"])
+        self.assertTrue(Path(record["record_path"]).exists())
+
+    def test_orphan_status_and_reap_cli_are_supported_controller_commands(self):
+        module = self.module()
+        root = self.governed_repo("orphan-cli")
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["engineering", "orphan-status", str(root)],
+            ),
+            patch.object(
+                module,
+                "orphan_operation_status",
+                return_value={"schema": "engineering.orphan-status.v1", "operations": []},
+            ) as status,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        status.assert_called_once_with(module.resolve_project_root(str(root)))
+        self.assertEqual(
+            "engineering.orphan-status.v1", json.loads(output.getvalue())["schema"]
+        )
 
     def test_posix_recovery_blocks_while_saved_group_exists(self):
         module = self.module()
@@ -4387,7 +4709,7 @@ class Task3AmendedContractTests(unittest.TestCase):
             owner["created_at"] = retained["created_at"]
             owner_path.write_text(json.dumps(owner), encoding="utf-8")
 
-        with patch.object(module, "_process_alive", return_value=False):
+        with patch.object(module, "_process_state", return_value="dead"):
             recovered = module.reconcile_orphaned_operations(
                 root, timeout_seconds=30
             )
@@ -4803,7 +5125,11 @@ class Task3AmendedContractTests(unittest.TestCase):
             patch.object(
                 module,
                 "_terminate_process_tree",
-                side_effect=lambda process, _pgid: (process.kill(), True)[1],
+                side_effect=lambda process, _pgid, **_kwargs: (
+                    process.kill(),
+                    setattr(process, "_engineering_tree_proven", True),
+                    True,
+                )[-1],
             ),
             patch.object(
                 module,
@@ -4985,9 +5311,16 @@ class Task3AmendedContractTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertTrue(child_pid_path.is_file())
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        expected_tree = (
+            module._capture_process_tree(process.pid) if os.name == "nt" else None
+        )
+        if os.name == "nt":
+            self.assertTrue(expected_tree)
 
         terminated = module._terminate_process_tree(
-            process, process.pid if os.name != "nt" else None
+            process,
+            process.pid if os.name != "nt" else None,
+            expected_tree=expected_tree,
         )
         process.communicate(timeout=5)
 
@@ -5004,16 +5337,42 @@ class Task3AmendedContractTests(unittest.TestCase):
         with (
             patch.object(module.os, "name", "nt"),
             patch.object(module.subprocess, "run") as run,
+            patch.object(
+                module,
+                "_saved_process_tree_absent",
+                return_value=(True, "saved_process_tree_absent"),
+            ) as saved_tree_absent,
         ):
-            terminated = module._terminate_process_tree(process)
+            terminated = module._terminate_process_tree(
+                process,
+                expected_tree=[{"pid": 4242, "start_time": "saved-start"}],
+            )
 
         self.assertTrue(terminated)
+        saved_tree_absent.assert_called_once_with(
+            [{"pid": 4242, "start_time": "saved-start"}],
+        )
         run.assert_called_once_with(
             ["taskkill", "/PID", "4242", "/T", "/F"],
             capture_output=True,
             text=True,
             timeout=2,
         )
+
+    def test_windows_timeout_without_saved_tree_stays_unconfirmed(self):
+        module = self.module()
+        process = Mock()
+        process.pid = 4242
+        process.poll.side_effect = [None, 0]
+        process.wait.return_value = 0
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.subprocess, "run"),
+        ):
+            terminated = module._terminate_process_tree(process)
+
+        self.assertFalse(terminated)
 
     def test_windows_first_poll_exited_keeps_process_tree_unconfirmed(self):
         module = self.module()
@@ -5239,6 +5598,14 @@ class Task3AmendedContractTests(unittest.TestCase):
         self.assertEqual("unresolved_hook_worker_orphan", first["reason"])
         self.assertEqual("blocked", blocked["readiness"])
         self.assertEqual("unresolved_hook_worker_orphan", blocked["reason"])
+        if os.name == "nt":
+            # A synthetic PID with no Windows identity/tree evidence must stay
+            # durable and blocked; only a supported identity-attested reap may
+            # remove the operation.
+            self.assertEqual("blocked", recovered.get("readiness"))
+            self.assertEqual("unresolved_hook_worker_orphan", recovered.get("reason"))
+            self.assertTrue(record.exists())
+            return
         self.assertTrue(recovered["orphan_reconciled_before_worker"])
         self.assertEqual("current", recovered["freshness"])
         self.assertFalse(record.exists())
@@ -5262,6 +5629,7 @@ class Task3AmendedContractTests(unittest.TestCase):
 
 class Task5ContractTests(unittest.TestCase):
     init_repo = Task2ContractTests.init_repo
+    governed_repo = Task3ContractTests.governed_repo
     git = Task2ContractTests.git
     commit_all = Task2ContractTests.commit_all
     run_cli = Task2ContractTests.run_cli
@@ -5965,7 +6333,7 @@ class Task5ContractTests(unittest.TestCase):
         record = module._read_operation(root, operation["operation_id"])
         self.assertTrue(module._acquire_repository_lock(record))
 
-        with patch.object(module, "_process_alive", return_value=False):
+        with patch.object(module, "_process_state", return_value="dead"):
             result = module.reconcile_orphaned_operations(root, timeout_seconds=5)
 
         self.assertEqual([operation["operation_id"]], result["unresolved"])
@@ -5995,7 +6363,7 @@ class Task5ContractTests(unittest.TestCase):
                 owner["created_at"] = timestamp
                 owner_path.write_text(json.dumps(owner), encoding="utf-8")
 
-                with patch.object(module, "_process_alive", return_value=False):
+                with patch.object(module, "_process_state", return_value="dead"):
                     result = module.reconcile_orphaned_operations(
                         root, timeout_seconds=5
                     )
@@ -6080,6 +6448,130 @@ class Task5ContractTests(unittest.TestCase):
         self.assertEqual(record["lock_token"], owner["lock_token"])
         self.assertEqual(os.getpid(), owner["owner_pid"])
         self.assertIsInstance(owner["created_at"], float)
+
+    def test_controller_completion_cleanup_preserves_replacement_lock(self):
+        module = self.module()
+        root = self.governed_repo("completion-replaced-lock")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            kind="completion",
+            phase="orphaned",
+            worker_process_tree_dead=True,
+            controller_owned_completion=True,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        replacement_owner = {
+            "operation_id": "newer-operation",
+            "lock_token": "newer-token",
+            "owner_pid": os.getpid(),
+            "owner_identity": module._process_identity(os.getpid()),
+            "created_at": time.time(),
+        }
+        owner_path = Path(record["repository_lock_path"]) / "owner.json"
+        owner_path.write_text(json.dumps(replacement_owner), encoding="utf-8")
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+        ):
+            result = module.cleanup_hook_operation(
+                root,
+                operation["operation_id"],
+                timeout_seconds=5,
+                allow_replaced_completion_lock=True,
+            )
+
+        self.assertTrue(result["completed"], result)
+        self.assertFalse(Path(record["record_path"]).exists())
+        self.assertEqual(
+            replacement_owner,
+            json.loads(owner_path.read_text(encoding="utf-8")),
+        )
+
+    def test_replaced_lock_bypass_requires_controller_completion_marker(self):
+        module = self.module()
+        root = self.governed_repo("completion-replaced-lock-marker")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(kind="completion", phase="orphaned", worker_process_tree_dead=True)
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner_path = Path(record["repository_lock_path"]) / "owner.json"
+        replacement_owner = {
+            "operation_id": "newer-operation",
+            "lock_token": "newer-token",
+            "owner_pid": os.getpid(),
+            "owner_identity": module._process_identity(os.getpid()),
+            "created_at": time.time(),
+        }
+        owner_path.write_text(json.dumps(replacement_owner), encoding="utf-8")
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+        ):
+            result = module.cleanup_hook_operation(
+                root,
+                operation["operation_id"],
+                timeout_seconds=5,
+                allow_replaced_completion_lock=True,
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("repository_lock_owner_mismatch", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertEqual(
+            replacement_owner,
+            json.loads(owner_path.read_text(encoding="utf-8")),
+        )
+
+    def test_replaced_lock_bypass_rejects_worker_operation(self):
+        module = self.module()
+        root = self.governed_repo("worker-replaced-lock")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            kind="hook",
+            phase="orphaned",
+            worker_pid=4242,
+            worker_process_tree_dead=True,
+            controller_owned_completion=True,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner_path = Path(record["repository_lock_path"]) / "owner.json"
+        replacement_owner = {
+            "operation_id": "newer-operation",
+            "lock_token": "newer-token",
+            "owner_pid": os.getpid(),
+            "owner_identity": module._process_identity(os.getpid()),
+            "created_at": time.time(),
+        }
+        owner_path.write_text(json.dumps(replacement_owner), encoding="utf-8")
+
+        with patch.object(
+            module,
+            "_process_tree_status",
+            return_value={"state": "dead", "evidence": "saved_identity_absent"},
+        ):
+            result = module.cleanup_hook_operation(
+                root,
+                operation["operation_id"],
+                timeout_seconds=5,
+                allow_replaced_completion_lock=True,
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("repository_lock_owner_mismatch", result["reason"])
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertEqual(
+            replacement_owner,
+            json.loads(owner_path.read_text(encoding="utf-8")),
+        )
 
     def test_concurrent_live_repository_lock_blocks_without_replacing_owner(self):
         module = self.module()

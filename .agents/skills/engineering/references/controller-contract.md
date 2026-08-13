@@ -292,6 +292,13 @@ record and blocks recovery until it dies. The
 controller never prunes worktrees or broadly scans deletion
 targets. Incomplete cleanup remains a durable orphan that blocks later workers
 until exact bounded recovery succeeds; mismatched or live locks are preserved.
+The supported `orphan-status <root>` command reports each durable operation's
+saved leader/descendant PID identities, process-tree state, and lock owner.
+`orphan-reap <root> <operation-id>` rechecks that snapshot against canonical
+process start identities and the exact operation/token lock owner immediately
+before marking the tree dead and entering bounded cleanup. A live, reused PID,
+missing identity, young orphan, missing lock, or mismatched lock remains
+blocked; no caller-supplied status claim can authorize release.
 
 Canonical reconciliation resolves one configured remote and default branch,
 then validates one fetch mapping whose destination is exactly
