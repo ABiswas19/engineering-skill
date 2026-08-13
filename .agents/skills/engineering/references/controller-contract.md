@@ -418,17 +418,75 @@ caller scope as complete authority.
 commit-bound attestation; a handoff completion supplies `--result-scope`, and
 the retained completion manifest records that exact result for replay.
 
-A material `redesign`, `replacement`, `capability_deletion`, or
-`simplification` also carries `outcome_survival` inside that same signed
-handoff. It enumerates the reconstructed baseline IDs and maps every one to
-`INCLUDED`, `REPLACED`, `DEFERRED`, or `EXCLUDED`, with a bounded reason and
-verification identities. `REPLACED` additionally requires replacement
-identities and an outcome-equivalence decision inside architect/result scope.
-`DEFERRED` and `EXCLUDED` carry no replacement claim; their exact mapping is
-permitted only because the existing commit-bound decision artifact and scope
-attestation record owner authority. Missing and duplicate mappings list the
-affected baseline IDs and fail closed. The mapping is retained through
-completion and replay; no second decision ledger is created.
+## Owner intent and exact-artifact release gate
+
+An intent-impacting scope is bound to an external, owner-private
+`engineering.owner-intent.v1` before it reaches the signed scope handoff. The
+binding contains only a repository lineage digest, authority epoch, opaque
+source-evidence identities and digests, and owner outcomes. Each outcome names
+its criticality, statement digest, and required evidence class, interface, and
+environment. Intent bodies, approvals, credentials, and runtime evidence are
+never stored in Git. `engineering intent-bind <root> --binding-file <path|->
+--approval-file <path|->` verifies a distinct `engineering-owner-intent` SSH
+signature against the committed host signer list, then retains a signed private
+controller record. Engineering does not mint approval. `engineering
+intent-status <root> [--authority-id <intent-id>]` is read-only and returns
+only `bound` or `owner_intent_unknown` plus opaque identity facts.
+
+For v2 handoffs, `engineering approve-scope <root> --decision-id <id>
+--handoff-file <path|-> --owner-intent-id <intent-id>` requires that exact
+active owner intent ID. `engineering.outcome-survival.v2` carries an owner
+intent ID and digest plus
+candidate mapping proposals, but no candidate baseline. The controller injects
+the complete baseline from the active owner intent and rejects an omitted,
+narrowed, duplicated, or substituted list. Every owner outcome maps exactly
+once to `INCLUDED`, `REPLACED`, `DEFERRED`, or `EXCLUDED`. `REPLACED` requires
+a replacement identity and `engineering.outcome-equivalence.v1` evidence from
+a reviewer distinct from architect, implementer, and writer. `DEFERRED` and
+`EXCLUDED` require their own externally verified
+`engineering.host-owner-exception.v1` signature bound to the exact intent,
+outcome, and disposition. The normalized mapping digest remains in scope
+handoff, preparation, completion, and replay records.
+
+`engineering outcome-accept <root> <completion-id> --input-file <path|->`
+retains `engineering.outcome-acceptance.v1` only after it verifies the exact
+terminal completion and artifact digest, active owner-intent and mapping
+digests, a canonical evidence-matrix digest, and a separate
+`engineering-independent-audit` signature. The auditor
+is distinct from architect, implementer, and writer and signs a comparison to
+the original owner intent. Each core outcome is `accepted`, `failed`, or
+`unknown`; all three states remain distinct. Evidence entries are ordered as
+`design`, `proxy`, `unit`, `integration`, `end_to_end`, and `real_outcome`.
+Only an equal-or-higher class at the exact required interface and environment
+satisfies an owner requirement; a policy kernel, proxy, or unit result cannot
+stand in for an executable native harness.
+Each harness requiring native dispatch or wake must have its own explicitly
+required interface and corresponding runtime evidence. Capability negotiation,
+authenticated IPC, anti-replay, idempotent effects, bounded retry/cycle
+detection, and distinct completion states are likewise separate requirement
+interfaces when the owner intent names them; hooks or MCP availability alone
+are not proof of any such runtime fact.
+
+For an intent-impacting preparation, the retained execution context also carries
+the active owner intent ID, digest, and authority epoch. Its own digest covers
+those facts. A resumed or compacted handoff whose intent digest changes is not a
+valid continuation and fails closed before execution.
+
+`engineering release-gate <root> <completion-id> --acceptance-id <id>` emits
+one signed opaque `engineering.release-token.v1` only when the current exact
+artifact has independently accepted evidence for every core owner outcome.
+`engineering verify-release-token <root> <token-id> <artifact-digest> --action
+<merge|install|activation>` validates only that exact action/artifact binding
+and returns `native_approval_required`. It does not merge, install, activate,
+deploy, or replace the separate native approval for any of those actions.
+The native `install_bundle(source, home, release_token={"root": ..., "token_id":
+...}, release_artifact_digest=...)` boundary requires the same `install` token
+preflight for every v2.2.6+ bundle; it never manufactures a token and still
+leaves native install approval required. Its legacy two-argument form remains
+readable only for the preserved v2.2.5 receipt and rollback path.
+Legacy v1 handoffs and v2.2.5 completion evidence remain readable but lack this
+binding and are `owner_intent_unknown`; they cannot receive a v2.2.6 release
+token.
 
 An unmanaged project returns advisory readiness with outcome survival Unknown
 and no completion surface. A missing canonical checkpoint, stale or invalid

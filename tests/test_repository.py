@@ -42,9 +42,9 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
-    def test_release_manifest_is_v2_2_5_with_pinned_graphify(self) -> None:
+    def test_release_manifest_is_v2_2_6_with_owner_intent_gate(self) -> None:
         manifest = json.loads((SKILL_ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual("2.2.5", manifest["version"])
+        self.assertEqual("2.2.6", manifest["version"])
         self.assertEqual(1, manifest["controller_schema"])
         self.assertEqual(
             {
@@ -55,6 +55,22 @@ class RepositoryContractTests(unittest.TestCase):
             },
             manifest["graphify"],
         )
+
+    def test_shared_controller_contract_documents_owner_intent_release_gate(self) -> None:
+        contract = (SKILL_ROOT / "references" / "controller-contract.md").read_text(
+            encoding="utf-8"
+        )
+        for command in (
+            "intent-bind",
+            "intent-status",
+            "outcome-accept",
+            "release-gate",
+            "verify-release-token",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, contract)
+        self.assertIn("engineering.owner-intent.v1", contract)
+        self.assertIn("engineering.release-token.v1", contract)
 
     def test_ci_installs_the_pinned_graphify_dependency(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(
@@ -804,6 +820,76 @@ Residual risk: No repository-supported vulnerability intake is available.
         ]
         self.assertEqual([], tracked_offenders)
         self.assertEqual([], local_offenders)
+
+    def test_public_export_accepts_an_independent_linked_worktree_destination(self) -> None:
+        """An isolated public worktree retains its own Git common directory."""
+        if not (ROOT / "tools" / "export_public.py").is_file():
+            self.skipTest("canonical-only exporter is intentionally absent")
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            primary = base / "public-primary"
+            destination = base / "public-linked"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(primary)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(primary), "config", "user.name", "Synthetic"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(primary),
+                    "config",
+                    "user.email",
+                    "synthetic" + "@" + "example.invalid",
+                ],
+                check=True,
+            )
+            (primary / "SECURITY.md").write_text(
+                "# Security\n\nUse GitHub private vulnerability reporting at "
+                "https://example.invalid/security/advisories/new.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(primary), "add", "SECURITY.md"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(primary), "commit", "-m", "security overlay"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(primary),
+                    "worktree",
+                    "add",
+                    "-b",
+                    "candidate",
+                    str(destination),
+                    "HEAD",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            self.assertTrue((destination / ".git").is_file())
+
+            result = module.export_tree(ROOT, destination)
+
+            self.assertEqual(module._source_commit(ROOT), result["source_commit"])
+            self.assertTrue(
+                (primary / ".git" / "engineering-public-export.json").is_file()
+            )
 
     def test_public_export_is_allowlisted_and_history_independent(self) -> None:
         if not (ROOT / "tools" / "export_public.py").is_file():

@@ -243,15 +243,27 @@ their native capabilities and permissions. Automated and technical checks are
 necessary evidence; domain and real-consumer outcome acceptance remain separate
 and Unknown when representative evidence is missing.
 
-Material redesign, replacement, capability deletion, and simplification also
-use the existing signed scope handoff to map every baseline requirement as
-`INCLUDED`, `REPLACED`, `DEFERRED`, or `EXCLUDED`, with a reason and verification
-method. Replacement needs outcome-equivalence evidence. Deferral or exclusion
-needs exact owner-approved scope. Unmanaged, missing-checkpoint, stale,
-conflicting, or otherwise Unknown traceability supports advisory analysis only;
-it cannot be reported as accepted design or implementation-ready. Independent
-design and final acceptance verify that original user/business outcomes survive,
-so a narrowed contract does not pass merely by auditing itself.
+Version 2.2.6 binds intent-impacting work to an external, owner-private
+`engineering.owner-intent.v1`. The host validates that binding before the
+controller retains it; Engineering has no approval-minting path. The controller
+injects its complete outcome baseline into the signed scope handoff, so a
+candidate cannot substitute a shorter list. Each outcome is `INCLUDED`,
+`REPLACED`, `DEFERRED`, or `EXCLUDED`: replacement needs independently reviewed
+equivalence, and deferral or exclusion needs a separately host-attested owner
+exception. Historical v2.2.5 records stay readable but their missing owner
+intent is `owner_intent_unknown` and cannot receive a new release token.
+
+`outcome-accept` records independent exact-artifact acceptance using typed
+evidence (`design`, `proxy`, `unit`, `integration`, `end_to_end`, or
+`real_outcome`). Lower evidence classes never satisfy a higher owner
+requirement, and interface and environment must match exactly. The independent
+auditor must be distinct from architect, implementer, and writer and attest to
+the original owner intent. `release-gate` emits a signed
+`engineering.release-token.v1` only when every core outcome is accepted for the
+exact artifact; `verify-release-token` checks that token for exactly `merge`,
+`install`, or `activation`. A v2.2.6+ installation requires the exact
+`install` token before its separate native approval. Neither operation performs
+or authorizes the native action.
 
 Version 2.2.4 distinguishes business-authority presence from whether approval
 must be requested again. Exact scoped authority can persist across unchanged

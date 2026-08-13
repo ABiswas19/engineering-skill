@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import re
@@ -16,11 +17,28 @@ class ExportError(RuntimeError):
     pass
 
 
+_AUDIENCE_MODULE: object | None = None
+
+
 def _audience_module():
+    global _AUDIENCE_MODULE
+    if _AUDIENCE_MODULE is not None:
+        return _AUDIENCE_MODULE
     try:
-        return importlib.import_module("check_audience")
-    except ModuleNotFoundError:
-        return importlib.import_module("tools.check_audience")
+        module = importlib.import_module("check_audience")
+    except ModuleNotFoundError as error:
+        if error.name != "check_audience":
+            raise
+        source = Path(__file__).resolve().with_name("check_audience.py")
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export_audience_guard", source
+        )
+        if spec is None or spec.loader is None:
+            raise ExportError("audience guard cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    _AUDIENCE_MODULE = module
+    return module
 
 
 def _git_common(root: Path) -> Path:
@@ -283,7 +301,7 @@ def export_tree(
     destination_git = destination / ".git"
     if (
         not (source / ".git").exists()
-        or not destination_git.is_dir()
+        or not (destination_git.is_dir() or destination_git.is_file())
         or destination_git.is_symlink()
         or bool(
             getattr(destination_git.lstat(), "st_file_attributes", 0)
@@ -291,8 +309,19 @@ def export_tree(
         )
     ):
         raise ExportError("source and destination must be independent Git repositories")
-    if _git_common(source) == _git_common(destination):
+    source_common = _git_common(source)
+    destination_common = _git_common(destination)
+    if source_common == destination_common:
         raise ExportError("public export must use independent Git history")
+    if (
+        not destination_common.is_dir()
+        or destination_common.is_symlink()
+        or bool(
+            getattr(destination_common.lstat(), "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
+    ):
+        raise ExportError("public export destination Git directory is unsafe")
     manifest_path = source / "release" / "public-export.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if (
@@ -315,7 +344,9 @@ def export_tree(
     sources = {relative: _safe_file(source, relative) for relative in files}
     source_tree_digest = _tree_digest(source, files)
     source_snapshot_digest = _snapshot_digest(source_commit, source_tree_digest)
-    receipt_path = _safe_destination(destination_git, "engineering-public-export.json")
+    receipt_path = _safe_destination(
+        destination_common, "engineering-public-export.json"
+    )
     previous = {}
     if receipt_path.is_file():
         retained = json.loads(receipt_path.read_text(encoding="utf-8"))

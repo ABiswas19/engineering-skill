@@ -23,6 +23,9 @@ outcome-equivalence evidence; deferral or exclusion needs exact owner authority.
 Unknown traceability permits advisory analysis only, never accepted design or
 implementation readiness. Independent acceptance verifies original outcome
 survival, not merely the candidate's narrower contract.
+Intent-impacting work needs external owner intent. A controller-injected
+baseline and independently accepted exact-artifact token precede separate
+native approval.
 For material risk, architecture or the narrowest specialist checks adjacent
 omissions and gives the implementer approved scope. Reject narrow handoffs and
 proxy-only results.

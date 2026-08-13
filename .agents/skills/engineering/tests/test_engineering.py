@@ -190,7 +190,7 @@ class SkillShapeTests(unittest.TestCase):
         behavior = {
             "seed-feedback-scope": (
                 Task5ContractTests,
-                ("test_seed_feedback_scope_handoff_uses_signed_approval_and_completion",),
+                ("test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown",),
             ),
             "traceability-debt-maintenance": (
                 Task6ContractTests,
@@ -209,7 +209,7 @@ class SkillShapeTests(unittest.TestCase):
                     "test_outcome_survival_lists_each_missing_baseline_mapping",
                     "test_unmanaged_material_redesign_is_advisory_and_never_accepted",
                     "test_managed_material_redesign_blocks_with_exact_mapping_boundary",
-                    "test_seed_feedback_scope_handoff_uses_signed_approval_and_completion",
+                    "test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown",
                 ),
             ),
         }
@@ -5811,7 +5811,7 @@ class Task5ContractTests(unittest.TestCase):
         )
 
 
-    def test_seed_feedback_scope_handoff_uses_signed_approval_and_completion(self):
+    def test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown(self):
         module = self.module()
         root, _ = self.prepared_repo("scope-handoff")
         ledger = root / "docs" / "engineering-traceability" / "decision-ledger.md"
@@ -5883,36 +5883,17 @@ class Task5ContractTests(unittest.TestCase):
                 "scope_handoff": handoff,
             },
         )
-        self.assertNotEqual("blocked", prepared["readiness"], prepared)
-
-        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
-        with self.assertRaisesRegex(module.EngineeringError, "result scope"):
-            module.complete(
-                root,
-                prepared["run_id"],
-                receipts=[],
-                result_scope=["REQ-1"],
-            )
-        with self.assertRaisesRegex(module.EngineeringError, "result artifacts"):
-            module.complete(
-                root,
-                prepared["run_id"],
-                receipts=[],
-                result_scope=handoff["result_scope"],
-            )
-        (root / "requirements.md").write_text("# REQ-1\nupdated\n", encoding="utf-8")
-        completion = module.complete(
-            root,
-            prepared["run_id"],
-            receipts=[],
-            result_scope=handoff["result_scope"],
-        )
-        self.assertEqual(handoff["result_scope"], completion["scope_result"])
+        self.assertEqual("blocked", prepared["readiness"])
+        self.assertEqual("owner_intent_unknown", prepared["owner_intent"]["state"])
         self.assertEqual(
-            handoff["outcome_survival"], completion["outcome_survival"]
+            "owner_intent_unknown", prepared["outcome_survival"]["boundary"]
         )
-        replay = module.complete(root, prepared["run_id"], receipts=[])
-        self.assertEqual(completion, replay)
+        self.assertEqual(
+            handoff["outcome_survival"],
+            prepared["authorization"]["scope_handoff"]["outcome_survival"],
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "not completion-ready"):
+            module.complete(root, prepared["run_id"], receipts=[])
 
     def green_receipts(self, prepared: dict) -> list[dict]:
         module = self.module()
@@ -7651,10 +7632,14 @@ class Task7ContractTests(unittest.TestCase):
             ],
         }
 
-    def bundle_repo(self, name="bundle"):
+    def bundle_repo(self, name="bundle", *, version="2.2.5"):
         root = Path(self.temporary_directory.name) / name
         source = root / ".agents" / "skills" / "engineering"
         shutil.copytree(SKILL_DIR, source, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        manifest_path = source / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = version
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         self.git(root, "init", "-b", "main")
         self.git(root, "config", "user.email", "synthetic")
         self.git(root, "config", "user.name", "Engineering Tests")
@@ -8242,6 +8227,47 @@ class Task7ContractTests(unittest.TestCase):
             self.home / ".agents" / "engineering" / "install-receipt.json"
         ).read_text(encoding="utf-8")
         self.assertNotIn(str(source), receipt_text)
+
+    def test_install_release_gate_preflight_requires_exact_token_pair(self):
+        """Installation may consume a verified token but never self-authorizes it."""
+        module = self.module()
+        source = self.bundle_repo("install-release-gate", version="2.2.6")
+        with self.assertRaisesRegex(module.EngineeringError, "requires an exact release token"):
+            module.install_bundle(source, self.home)
+        self.assertFalse((self.home / ".agents" / "skills" / "engineering").exists())
+        with self.assertRaisesRegex(module.EngineeringError, "both token"):
+            module.install_bundle(
+                source,
+                self.home,
+                release_token={"root": str(self.home), "token_id": "release-token-" + "1" * 32},
+            )
+        with patch.object(
+            module,
+            "verify_release_token",
+            return_value={
+                "schema": "engineering.release-token.v1",
+                "token_id": "release-token-" + "1" * 32,
+                "artifact_digest": "sha256:" + "1" * 64,
+                "action": "install",
+                "native_approval_required": True,
+            },
+        ) as verify:
+            receipt = module.install_bundle(
+                source,
+                self.home,
+                release_token={
+                    "root": str(source.parents[3]),
+                    "token_id": "release-token-" + "1" * 32,
+                },
+                release_artifact_digest="sha256:" + "1" * 64,
+            )
+        verify.assert_called_once_with(
+            source.parents[3],
+            "release-token-" + "1" * 32,
+            "sha256:" + "1" * 64,
+            "install",
+        )
+        self.assertTrue(receipt["release_gate"]["native_approval_required"])
 
     def test_install_publishes_a_discoverable_windows_command_launcher(self):
         module = self.module()
@@ -11889,6 +11915,830 @@ class Task10ContractTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, contract)
+
+class Task11OwnerIntentContractTests(Task10ContractTests):
+    """Owner-private intent bindings prevent candidate-local scope narrowing."""
+
+    def owner_intent_binding(self, **changes):
+        value = {
+            "schema": "engineering.owner-intent.v1",
+            "intent_id": "intent-native-graph",
+            "repository_id": self.repository_id,
+            "authority_epoch": "epoch-local-1",
+            "source_evidence": [
+                {
+                    "identity": "source-owner-approval",
+                    "digest": "sha256:" + "1" * 64,
+                }
+            ],
+            "outcomes": [
+                {
+                    "id": "OUTCOME-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                        }
+                    ],
+                }
+            ],
+        }
+        value.update(changes)
+        return value
+
+    def owner_intent_approval(self, binding):
+        module = self.module()
+        normalized = module._owner_intent_binding(self.root, binding)
+        material = module._canonical_json(
+            {
+                "schema": "engineering.host-owner-intent-claims.v1",
+                "claims": normalized,
+            }
+        )
+        claims_path = Path(self.temporary_directory.name) / f"owner-intent-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(self.host_key),
+                "-n",
+                "engineering-owner-intent",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": "engineering.host-owner-intent-approval.v1",
+            "approver": "synthetic-host",
+            "claims": normalized,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def bound_native_owner_intent(self):
+        module = self.module()
+        binding = self.owner_intent_binding()
+        return module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+
+    def owner_exception(self, intent, outcome_id, disposition):
+        module = self.module()
+        claims = {
+            "exception_id": "exception-native-graph",
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "outcome_id": outcome_id,
+            "disposition": disposition,
+        }
+        claims_path = Path(self.temporary_directory.name) / f"owner-exception-{time.time_ns()}.json"
+        claims_path.write_bytes(
+            module._canonical_json(
+                {
+                    "schema": "engineering.host-owner-exception-claims.v1",
+                    "claims": claims,
+                }
+            )
+        )
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(self.host_key),
+                "-n",
+                "engineering-owner-exception",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": "engineering.host-owner-exception.v1",
+            "approver": "synthetic-host",
+            "exception_id": claims["exception_id"],
+            "owner_intent_id": claims["owner_intent_id"],
+            "owner_intent_digest": claims["owner_intent_digest"],
+            "outcome_id": claims["outcome_id"],
+            "disposition": claims["disposition"],
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def outcome_survival_v2(self, intent, **changes):
+        outcome_id = intent["outcomes"][0]["id"]
+        value = {
+            "schema": "engineering.outcome-survival.v2",
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "mappings": [
+                {
+                    "outcome_id": outcome_id,
+                    "disposition": "INCLUDED",
+                    "reason": "Retain executable native graph outcome.",
+                    "verification_ids": ["evidence-native-graph"],
+                    "replacement_ids": [],
+                    "equivalence": None,
+                    "owner_exception": None,
+                }
+            ],
+        }
+        value.update(changes)
+        return value
+
+    def terminal_completion(self, survival):
+        return {
+            "schema": "engineering.complete.v1",
+            "run_id": "run-a1b2c3",
+            "authorization": {"scope_handoff": {"outcome_survival": survival}},
+            "owner_intent": {
+                "intent_id": survival["owner_intent_id"],
+                "owner_intent_digest": survival["owner_intent_digest"],
+                "authority_epoch": "epoch-local-1",
+            },
+            "result_identity": {
+                "commit": "a" * 40,
+                "dirty_tree_digest": None,
+            },
+            "changed_artifacts": ["src/native_graph.py"],
+            "scope_result_artifacts": ["src/native_graph.py"],
+        }
+
+    def outcome_acceptance(
+        self, intent, survival, evidence_class="real_outcome", evidence=None
+    ):
+        module = self.module()
+        completion = self.terminal_completion(survival)
+        completion_digest = "sha256:" + "3" * 64
+        artifact_digest = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        value = {
+            "schema": "engineering.outcome-acceptance.v1",
+            "acceptance_id": "acceptance-native-graph",
+            "completion_digest": completion_digest,
+            "artifact_digest": artifact_digest,
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "mapping_digest": survival["mapping_digest"],
+            "evidence_digest": None,
+            "roles": {
+                "architect_id": "architect-1",
+                "implementer_id": "implementer-1",
+                "writer_id": "writer-1",
+                "auditor_id": "auditor-1",
+            },
+            "audit_attestation": None,
+            "outcomes": [
+                {
+                    "outcome_id": intent["outcomes"][0]["id"],
+                    "state": "accepted",
+                    "evidence": evidence if evidence is not None else [
+                        {
+                            "evidence_id": "evidence-native-graph",
+                            "evidence_digest": "sha256:" + "4" * 64,
+                            "class": evidence_class,
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                            "producer_role": "codex_native",
+                        }
+                    ],
+                }
+            ],
+        }
+        value["evidence_digest"] = module._outcome_evidence_matrix_digest(
+            value["outcomes"]
+        )
+        value["audit_attestation"] = self.audit_attestation(value)
+        return completion, completion_digest, value
+
+    def audit_attestation(self, acceptance):
+        module = self.module()
+        claims = module._outcome_audit_claims(acceptance)
+        claims_path = Path(self.temporary_directory.name) / f"outcome-audit-{time.time_ns()}.json"
+        claims_path.write_bytes(module._canonical_json(claims))
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(self.host_key),
+                "-n",
+                "engineering-independent-audit",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": "engineering.independent-outcome-audit.v1",
+            "approver": "synthetic-host",
+            "claims": claims,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def test_owner_intent_requires_external_host_signature(self):
+        """Accepting a forged owner baseline would reintroduce self-approval."""
+        module = self.module()
+        with self.assertRaisesRegex(module.EngineeringError, "owner intent host approval"):
+            module.bind_owner_intent(
+                self.root,
+                self.owner_intent_binding(),
+                {"fabricated": True},
+            )
+
+    def test_intent_bind_and_status_cli_return_only_bound_owner_identity(self):
+        """A valid external intent becomes queryable without exposing its source body."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        binding_path = Path(self.temporary_directory.name) / "owner-intent.json"
+        approval_path = Path(self.temporary_directory.name) / "owner-intent-approval.json"
+        binding_path.write_text(json.dumps(binding), encoding="utf-8")
+        approval_path.write_text(
+            json.dumps(self.owner_intent_approval(binding)), encoding="utf-8"
+        )
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "intent-bind",
+                    str(self.root),
+                    "--binding-file",
+                    str(binding_path),
+                    "--approval-file",
+                    str(approval_path),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        bound = json.loads(output.getvalue())
+        self.assertEqual("engineering.owner-intent.v1", bound["schema"])
+        self.assertNotIn("source_body", json.dumps(bound))
+
+        status_output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "intent-status",
+                    str(self.root),
+                    "--authority-id",
+                    "intent-native-graph",
+                ],
+            ),
+            contextlib.redirect_stdout(status_output),
+        ):
+            self.assertEqual(0, module.main())
+        status = json.loads(status_output.getvalue())
+        self.assertEqual("bound", status["state"])
+        self.assertEqual("intent-native-graph", status["intent_id"])
+
+    def test_bound_owner_intent_stays_in_private_controller_state(self):
+        """A binding must not materialize owner-private intent as a project artifact."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        ledger = module._owner_intent_path(self.root)
+        self.assertTrue(ledger.is_file())
+        common = Path(
+            subprocess.run(
+                ["git", "-C", str(self.root), "rev-parse", "--git-common-dir"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        if not common.is_absolute():
+            common = self.root / common
+        self.assertTrue(ledger.is_relative_to(common.resolve()))
+        status = subprocess.run(
+            ["git", "-C", str(self.root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual("", status)
+        self.assertNotIn("source_body", json.dumps(intent))
+
+    def test_candidate_cannot_replace_owner_baseline_or_exclude_without_exception(self):
+        """A candidate cannot supply its own baseline or self-exclude a core outcome."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        narrowed = self.outcome_survival_v2(intent)
+        narrowed["baseline_ids"] = ["OUTCOME-UNIT"]
+        with self.assertRaisesRegex(module.EngineeringError, "controller-injected"):
+            module._outcome_survival_v2(narrowed, intent)
+
+        omitted = self.outcome_survival_v2(intent)
+        omitted["mappings"] = []
+        with self.assertRaisesRegex(module.EngineeringError, "incomplete|mapping"):
+            module._outcome_survival_v2(omitted, intent)
+
+        excluded = self.outcome_survival_v2(intent)
+        excluded["mappings"][0]["disposition"] = "EXCLUDED"
+        with self.assertRaisesRegex(module.EngineeringError, "owner exception"):
+            module._outcome_survival_v2(excluded, intent)
+
+    def test_intent_impact_detection_follows_exact_graph_links(self):
+        """Only exact links to explicit capability/assurance nodes require new intent."""
+        module = self.module()
+        self.assertTrue(
+            {
+                "capability",
+                "capability_assurance",
+                "assurance_obligation",
+                "obligation",
+            }.issubset(module.NODE_TYPES)
+        )
+        checkpoint = {
+            "nodes": [
+                {"id": "REQ-NATIVE", "type": "requirement"},
+                {"id": "CAP-NATIVE", "type": "capability"},
+                {"id": "code-native", "type": "code_symbol"},
+                {"id": "code-isolated", "type": "code_symbol"},
+            ],
+            "edges": [
+                {
+                    "id": "edge-native",
+                    "from": "REQ-NATIVE",
+                    "to": "code-native",
+                    "type": "implements",
+                    "provenance": "direct",
+                },
+                {
+                    "id": "edge-capability",
+                    "from": "CAP-NATIVE",
+                    "to": "code-isolated",
+                    "type": "may_impact",
+                    "provenance": "direct",
+                },
+            ],
+        }
+        self.assertFalse(
+            module._intent_impacting(
+                checkpoint, ["code-native"], None, None
+            )
+        )
+        self.assertTrue(
+            module._intent_impacting(
+                checkpoint, ["code-isolated"], None, None
+            )
+        )
+        nodes = {item["id"]: item for item in checkpoint["nodes"]}
+        selected, missing = module._explicit_context_ids(
+            "change CAP-NATIVE", {}, nodes
+        )
+        self.assertEqual(["CAP-NATIVE"], selected)
+        self.assertEqual([], missing)
+
+    def test_controller_injects_active_owner_baseline_into_v2_handoff(self):
+        """Scope approval receives mappings but never a candidate-owned baseline."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        raw = {
+            "seed_evidence": ["OUTCOME-NATIVE-GRAPH"],
+            "reconstructed_scope": [
+                "OUTCOME-NATIVE-GRAPH",
+                "evidence-native-graph",
+            ],
+            "architect_scope": [
+                "OUTCOME-NATIVE-GRAPH",
+                "evidence-native-graph",
+            ],
+            "result_scope": [
+                "OUTCOME-NATIVE-GRAPH",
+                "evidence-native-graph",
+            ],
+            "result_artifacts": ["src/native_graph.py"],
+            "outcome_survival": self.outcome_survival_v2(intent),
+        }
+        bound = module._bind_owner_intent_handoff(
+            self.root, module._scope_handoff(raw, require_approval=False)
+        )
+        survival = bound["outcome_survival"]
+        self.assertEqual(["OUTCOME-NATIVE-GRAPH"], survival["baseline_ids"])
+        self.assertRegex(survival["mapping_digest"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_signed_owner_exception_is_required_for_excluding_core_outcome(self):
+        """Only a host-signed exception can defer or exclude an owner baseline."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        excluded = self.outcome_survival_v2(intent)
+        mapping = excluded["mappings"][0]
+        mapping["disposition"] = "EXCLUDED"
+        mapping["owner_exception"] = self.owner_exception(
+            intent, mapping["outcome_id"], "EXCLUDED"
+        )
+        survival = module._outcome_survival_v2(
+            excluded, intent, root=self.root
+        )
+        self.assertEqual("EXCLUDED", survival["mappings"][0]["disposition"])
+
+    def test_replacement_requires_an_independent_equivalence_reviewer(self):
+        """A candidate cannot call its own replacement equivalent to the baseline."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        replacement = self.outcome_survival_v2(intent)
+        mapping = replacement["mappings"][0]
+        mapping["disposition"] = "REPLACED"
+        mapping["replacement_ids"] = ["replacement-native-graph"]
+        mapping["equivalence"] = {
+            "schema": "engineering.outcome-equivalence.v1",
+            "reviewer_id": "writer-1",
+            "architect_id": "architect-1",
+            "implementer_id": "implementer-1",
+            "writer_id": "writer-1",
+            "evidence_id": "evidence-equivalence",
+            "evidence_digest": "sha256:" + "6" * 64,
+        }
+        with self.assertRaisesRegex(module.EngineeringError, "not independent"):
+            module._outcome_survival_v2(replacement, intent)
+
+        mapping["equivalence"]["reviewer_id"] = "reviewer-1"
+        normalized = module._outcome_survival_v2(replacement, intent)
+        self.assertEqual("REPLACED", normalized["mappings"][0]["disposition"])
+
+    def test_execution_context_carries_owner_intent_digest_and_rejects_tampering(self):
+        """A dispatched continuation cannot shed or replace the bound owner intent."""
+        module = self.module()
+        preparation = {
+            "schema": "engineering.prepare.v1",
+            "run_id": "run-a1b2c3",
+            "project": {
+                "root_digest": "sha256:" + "1" * 64,
+                "commit": "a" * 40,
+            },
+            "authorization": {"scope": ["src/native_graph.py"]},
+            "context": [{"id": "OUTCOME-NATIVE-GRAPH", "provenance": "direct"}],
+            "owner_intent": {
+                "schema": "engineering.owner-intent-status.v1",
+                "state": "bound",
+                "intent_id": "intent-native-graph",
+                "owner_intent_digest": "sha256:" + "2" * 64,
+                "authority_epoch": "epoch-local-1",
+                "core_outcome_count": 1,
+                "intent_impacting": True,
+                "bound_to_scope_handoff": True,
+            },
+        }
+        bundle = module.build_execution_context(preparation)
+        self.assertEqual(
+            "sha256:" + "2" * 64,
+            bundle["owner_intent"]["owner_intent_digest"],
+        )
+        self.assertEqual(
+            "enforced",
+            module.validate_execution_context(
+                bundle, preparation, runner_enforces_boundary=True
+            )["mode"],
+        )
+        tampered = {**bundle, "owner_intent": {**bundle["owner_intent"], "owner_intent_digest": "sha256:" + "3" * 64}}
+        with self.assertRaisesRegex(module.EngineeringError, "digest|scope|owner intent"):
+            module.validate_execution_context(
+                tampered, preparation, runner_enforces_boundary=True
+            )
+
+    def test_unit_evidence_cannot_satisfy_real_native_harness_requirement(self):
+        """Typed evidence cannot upgrade a unit result into a native runtime proof."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival, evidence_class="unit"
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "required evidence"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_independent_audit_binds_role_assignments_and_outcome_states(self):
+        """An attestation cannot be replayed after actor or outcome-state changes."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["roles"]["architect_id"] = "architect-replaced"
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "independent outcome audit"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_accepted_evidence_must_retain_the_mapped_verification_identity(self):
+        """A matching class/interface cannot swap out the approved evidence identity."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["outcomes"][0]["evidence"][0]["evidence_id"] = "evidence-substitute"
+        acceptance["evidence_digest"] = module._outcome_evidence_matrix_digest(
+            acceptance["outcomes"]
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "mapped verification evidence"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["outcomes"][0]["state"] = "unknown"
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "independent outcome audit"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_v060_proxy_only_self_exclusion_cannot_receive_release_token(self):
+        """v0.6.0 policy evidence cannot exclude native fan-out/fan-in runtime proof."""
+        module = self.module()
+        binding = self.owner_intent_binding(
+            outcomes=[
+                {
+                    "id": "OUTCOME-EXECUTABLE-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "executable_native_graph",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "autonomous_fanout_fanin",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "no_prompt_steering",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "codex_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "claude_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                    ],
+                }
+            ]
+        )
+        intent = module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+        excluded = self.outcome_survival_v2(intent)
+        excluded["mappings"][0]["disposition"] = "EXCLUDED"
+        with self.assertRaisesRegex(module.EngineeringError, "owner exception"):
+            module._outcome_survival_v2(excluded, intent)
+
+        policy_kernel_unit = [
+            {
+                "evidence_id": "evidence-policy-kernel-unit",
+                "evidence_digest": "sha256:" + "4" * 64,
+                "class": "unit",
+                "interface": "policy_kernel",
+                "environment": "candidate",
+                "producer_role": "policy_kernel",
+            }
+        ]
+        raw_survival = self.outcome_survival_v2(intent)
+        raw_survival["mappings"][0]["verification_ids"] = [
+            item["evidence_id"] for item in policy_kernel_unit
+        ]
+        survival = module._outcome_survival_v2(raw_survival, intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival, evidence=policy_kernel_unit
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "required evidence"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+        acceptance["outcomes"][0]["state"] = "unknown"
+        acceptance["evidence_digest"] = module._outcome_evidence_matrix_digest(
+            acceptance["outcomes"]
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            with self.assertRaisesRegex(module.EngineeringError, "core outcome"):
+                module.release_gate(
+                    self.root, completion["run_id"], recorded["acceptance_id"]
+                )
+
+    def test_codex_and_claude_native_e2e_evidence_with_independent_auditor_receives_token(self):
+        """Both native harnesses plus an independent exact-artifact audit release."""
+        module = self.module()
+        binding = self.owner_intent_binding(
+            outcomes=[
+                {
+                    "id": "OUTCOME-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "end_to_end",
+                            "interface": "codex_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "end_to_end",
+                            "interface": "claude_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                        *[
+                            {
+                                "class": "real_outcome",
+                                "interface": interface,
+                                "environment": "candidate",
+                            }
+                            for interface in (
+                                "capability_negotiation",
+                                "authenticated_ipc",
+                                "anti_replay",
+                                "idempotent_effects",
+                                "bounded_retry_cycle_detection",
+                                "distinct_completion_states",
+                            )
+                        ],
+                    ],
+                }
+            ]
+        )
+        intent = module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+        evidence = [
+            {
+                "evidence_id": "evidence-codex-native",
+                "evidence_digest": "sha256:" + "4" * 64,
+                "class": "end_to_end",
+                "interface": "codex_native_dispatch_wake",
+                "environment": "candidate",
+                "producer_role": "codex_native",
+            },
+            {
+                "evidence_id": "evidence-claude-native",
+                "evidence_digest": "sha256:" + "5" * 64,
+                "class": "end_to_end",
+                "interface": "claude_native_dispatch_wake",
+                "environment": "candidate",
+                "producer_role": "claude_native",
+            },
+            *[
+                {
+                    "evidence_id": f"evidence-{interface}",
+                    "evidence_digest": "sha256:"
+                    + hashlib.sha256(interface.encode("ascii")).hexdigest(),
+                    "class": "real_outcome",
+                    "interface": interface,
+                    "environment": "candidate",
+                    "producer_role": "independent_runtime_audit",
+                }
+                for interface in (
+                    "capability_negotiation",
+                    "authenticated_ipc",
+                    "anti_replay",
+                    "idempotent_effects",
+                    "bounded_retry_cycle_detection",
+                    "distinct_completion_states",
+                )
+            ],
+        ]
+        raw_survival = self.outcome_survival_v2(intent)
+        raw_survival["mappings"][0]["verification_ids"] = [
+            item["evidence_id"] for item in evidence
+        ]
+        survival = module._outcome_survival_v2(raw_survival, intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival, evidence=evidence
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root, completion["run_id"], recorded["acceptance_id"]
+            )
+            verified = module.verify_release_token(
+                self.root, token["token_id"], token["artifact_digest"], "activation"
+            )
+        self.assertEqual("engineering.release-token.v1", token["schema"])
+        self.assertEqual("activation", verified["action"])
+
+    def test_outcome_acceptance_and_release_gate_cli_dispatch_exact_inputs(self):
+        """The public controller commands preserve exact local gate inputs."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "acceptance.json"
+        source.write_text("{}", encoding="utf-8")
+        output = io.StringIO()
+        with (
+            patch.object(
+                module,
+                "record_outcome_acceptance",
+                return_value={"schema": "engineering.outcome-acceptance.v1"},
+            ) as accept,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "outcome-accept",
+                    str(self.root),
+                    "run-a1b2c3",
+                    "--input-file",
+                    str(source),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        accept.assert_called_once()
+        self.assertEqual("run-a1b2c3", accept.call_args.args[1])
+        self.assertEqual({}, accept.call_args.args[2])
+        self.assertEqual("engineering.outcome-acceptance.v1", json.loads(output.getvalue())["schema"])
+
+        with (
+            patch.object(
+                module,
+                "release_gate",
+                return_value={"schema": "engineering.release-token.v1"},
+            ) as gate,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "release-gate",
+                    str(self.root),
+                    "run-a1b2c3",
+                    "--acceptance-id",
+                    "acceptance-native-graph",
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(0, module.main())
+        gate.assert_called_once()
+        self.assertEqual(
+            ("run-a1b2c3", "acceptance-native-graph"), gate.call_args.args[1:]
+        )
+
 
 class TraceabilityViewV225ContractTests(unittest.TestCase):
     """Regression coverage for the v2.2.5 query-only traceability projection."""

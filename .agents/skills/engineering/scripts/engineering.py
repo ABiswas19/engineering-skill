@@ -50,9 +50,44 @@ SCOPED_AUTHORITY_SCHEMA = "engineering.scoped-authority.v1"
 AUTHORITY_LEDGER_SCHEMA = "engineering.authority-ledger.v1"
 AUTHORITY_RESOLUTION_SCHEMA = "engineering.authority-resolution.v1"
 AUTHORITY_AUDIT_SCHEMA = "engineering.authority-audit.v1"
+OWNER_INTENT_SCHEMA = "engineering.owner-intent.v1"
+OWNER_INTENT_LEDGER_SCHEMA = "engineering.owner-intents.v1"
+OWNER_INTENT_STATUS_SCHEMA = "engineering.owner-intent-status.v1"
+OUTCOME_SURVIVAL_V2_SCHEMA = "engineering.outcome-survival.v2"
+OUTCOME_EQUIVALENCE_SCHEMA = "engineering.outcome-equivalence.v1"
+OWNER_EXCEPTION_SCHEMA = "engineering.host-owner-exception.v1"
+OUTCOME_ACCEPTANCE_SCHEMA = "engineering.outcome-acceptance.v1"
+OUTCOME_ACCEPTANCE_LEDGER_SCHEMA = "engineering.outcome-acceptances.v1"
+INDEPENDENT_OUTCOME_AUDIT_SCHEMA = "engineering.independent-outcome-audit.v1"
+RELEASE_TOKEN_SCHEMA = "engineering.release-token.v1"
+RELEASE_TOKEN_LEDGER_SCHEMA = "engineering.release-tokens.v1"
 NATIVE_APPROVAL_REQUIREMENTS = {"connector", "credential", "destructive", "system"}
 MAX_SCOPED_AUTHORITIES = 256
 MAX_AUTHORITY_AUDITS = 512
+MAX_OWNER_INTENTS = 64
+MAX_OWNER_INTENT_OUTCOMES = 256
+MAX_OWNER_INTENT_EVIDENCE = 64
+MAX_OUTCOME_ACCEPTANCES = 256
+MAX_RELEASE_TOKENS = 256
+OWNER_INTENT_CRITICALITIES = {"core", "supporting"}
+OUTCOME_EVIDENCE_CLASSES = {
+    "design",
+    "proxy",
+    "unit",
+    "integration",
+    "end_to_end",
+    "real_outcome",
+}
+OUTCOME_EVIDENCE_CLASS_ORDER = {
+    "design": 0,
+    "proxy": 1,
+    "unit": 2,
+    "integration": 3,
+    "end_to_end": 4,
+    "real_outcome": 5,
+}
+OUTCOME_ACCEPTANCE_STATES = {"accepted", "failed", "unknown"}
+RELEASE_TOKEN_ACTIONS = {"merge", "install", "activation"}
 ASSURANCE_EVIDENCE_KINDS = {
     "intent", "requirement", "decision", "plan", "implementation", "code", "test", "artifact",
     "release", "installation", "configuration", "route", "schedule", "interface",
@@ -98,10 +133,25 @@ NODE_TYPES = {
     "test",
     "evaluation",
     "verification_receipt",
+    "capability",
+    "capability_assurance",
+    "assurance_obligation",
+    "obligation",
     "commit",
     "pull_request",
     "project",
     "checkpoint",
+}
+INTENT_IMPACT_GRAPH_NODE_TYPES = {
+    "capability",
+    "capability_assurance",
+    "assurance_obligation",
+    "obligation",
+}
+EXPLICIT_INTENT_CONTEXT_NODE_TYPES = {
+    "requirement",
+    "decision",
+    *INTENT_IMPACT_GRAPH_NODE_TYPES,
 }
 EDGE_TYPES = {
     "satisfied_by",
@@ -205,6 +255,7 @@ PREPARATION_BLOCKERS = {
     "checkpoint_pending": "the first exact checkpoint is pending; run the reported foreground recovery",
     "semantic_matrix_incomplete": "an impacted declared ownership or routing matrix lacks atomic coverage",
     "outcome_survival_incomplete": "material change lacks a complete signed baseline outcome mapping",
+    "owner_intent_required": "intent-impacting work lacks a matching external owner-intent binding",
 }
 PREPARATION_ADVISORIES = {
     "remote_freshness_unknown": "canonical remote freshness is unknown",
@@ -6019,7 +6070,352 @@ def _outcome_survival(value: object, architect_scope: list[str]) -> dict[str, ob
     }
 
 
-def _scope_handoff(value: object, *, require_approval: bool = True) -> dict[str, object]:
+def _active_owner_intent(
+    root: Path,
+    intent_id: str | None = None,
+    intent_digest: str | None = None,
+) -> dict:
+    """Return the sole active external owner baseline, never a caller substitute."""
+    if intent_id is not None:
+        intent_id = _assurance_id(intent_id, "owner intent")
+    if intent_digest is not None and not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", intent_digest
+    ):
+        raise EngineeringError("Engineering owner intent digest is invalid.")
+    active = [
+        record
+        for record in _load_owner_intents(root)["intents"]
+        if record["status"] == "active"
+    ]
+    if len(active) > 1:
+        raise EngineeringError("Engineering owner intent ledger is ambiguous.")
+    if not active:
+        raise EngineeringError("Engineering owner intent is unknown.")
+    record = active[0]
+    if intent_id is not None and record["intent_id"] != intent_id:
+        raise EngineeringError("Engineering owner intent is not active for this scope.")
+    if (
+        intent_digest is not None
+        and record["owner_intent_digest"] != intent_digest
+    ):
+        raise EngineeringError("Engineering owner intent digest is mismatched.")
+    return record
+
+
+def _verify_host_owner_exception(
+    root: Path,
+    owner_intent: dict,
+    outcome_id: str,
+    disposition: str,
+    value: object,
+) -> dict:
+    """Verify the narrow owner exception required to defer or exclude one outcome."""
+    expected = {
+        "schema",
+        "exception_id",
+        "approver",
+        "owner_intent_id",
+        "owner_intent_digest",
+        "outcome_id",
+        "disposition",
+        "signature",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != OWNER_EXCEPTION_SCHEMA
+        or value.get("owner_intent_id") != owner_intent["intent_id"]
+        or value.get("owner_intent_digest") != owner_intent["owner_intent_digest"]
+        or value.get("outcome_id") != outcome_id
+        or value.get("disposition") != disposition
+        or disposition not in {"DEFERRED", "EXCLUDED"}
+        or not isinstance(value.get("signature"), str)
+        or not value["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(value["signature"]) > 16384
+    ):
+        raise EngineeringError("Engineering owner exception is invalid.")
+    try:
+        exception_id = _assurance_id(value["exception_id"], "owner exception")
+        approver = _assurance_id(value["approver"], "owner exception approver")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering owner exception is invalid.") from error
+    claims = {
+        "exception_id": exception_id,
+        "owner_intent_id": owner_intent["intent_id"],
+        "owner_intent_digest": owner_intent["owner_intent_digest"],
+        "outcome_id": outcome_id,
+        "disposition": disposition,
+    }
+    try:
+        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
+    except EngineeringError as error:
+        raise EngineeringError(
+            "Engineering owner exception host approver trust is unavailable."
+        ) from error
+    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
+        raise EngineeringError("Engineering owner exception host approver trust is invalid.")
+    material = _canonical_json(
+        {"schema": "engineering.host-owner-exception-claims.v1", "claims": claims}
+    )
+    with tempfile.TemporaryDirectory(prefix="engineering-owner-exception-") as temporary:
+        allowed_path = Path(temporary) / "allowed_signers"
+        signature_path = Path(temporary) / "exception.sig"
+        allowed_path.write_bytes(allowed)
+        signature_path.write_text(value["signature"], encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_path),
+                    "-I",
+                    approver,
+                    "-n",
+                    "engineering-owner-exception",
+                    "-s",
+                    str(signature_path),
+                ],
+                input=material,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EngineeringError(
+                "Engineering owner exception host approval verification is unavailable."
+            ) from error
+    if verified.returncode != 0:
+        raise EngineeringError("Engineering owner exception signature is invalid.")
+    return {
+        "schema": OWNER_EXCEPTION_SCHEMA,
+        "exception_id": exception_id,
+        "approver": approver,
+        "owner_intent_id": owner_intent["intent_id"],
+        "owner_intent_digest": owner_intent["owner_intent_digest"],
+        "outcome_id": outcome_id,
+        "disposition": disposition,
+        "signature": value["signature"],
+    }
+
+
+def _outcome_equivalence(value: object) -> dict:
+    expected = {
+        "schema",
+        "reviewer_id",
+        "architect_id",
+        "implementer_id",
+        "writer_id",
+        "evidence_id",
+        "evidence_digest",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != OUTCOME_EQUIVALENCE_SCHEMA
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("evidence_digest", "")))
+    ):
+        raise EngineeringError("Engineering outcome equivalence is invalid.")
+    try:
+        normalized = {
+            "schema": OUTCOME_EQUIVALENCE_SCHEMA,
+            "reviewer_id": _assurance_id(value["reviewer_id"], "outcome equivalence reviewer"),
+            "architect_id": _assurance_id(value["architect_id"], "outcome equivalence architect"),
+            "implementer_id": _assurance_id(value["implementer_id"], "outcome equivalence implementer"),
+            "writer_id": _assurance_id(value["writer_id"], "outcome equivalence writer"),
+            "evidence_id": _assurance_id(value["evidence_id"], "outcome equivalence evidence"),
+            "evidence_digest": value["evidence_digest"],
+        }
+    except EngineeringError as error:
+        raise EngineeringError("Engineering outcome equivalence is invalid.") from error
+    if normalized["reviewer_id"] in {
+        normalized["architect_id"],
+        normalized["implementer_id"],
+        normalized["writer_id"],
+    }:
+        raise EngineeringError("Engineering outcome equivalence reviewer is not independent.")
+    return normalized
+
+
+def _outcome_survival_v2(
+    value: object,
+    owner_intent: dict,
+    *,
+    root: Path | None = None,
+    architect_scope: list[str] | None = None,
+    allow_controller_baseline: bool = False,
+) -> dict[str, object]:
+    """Inject and completely map the external owner baseline for one handoff."""
+    if not isinstance(value, dict):
+        raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+    expected = {
+        "schema",
+        "owner_intent_id",
+        "owner_intent_digest",
+        "mappings",
+    }
+    controller_expected = expected | {"baseline_ids", "mapping_digest"}
+    if "baseline_ids" in value and not allow_controller_baseline:
+        raise EngineeringError(
+            "Engineering outcome survival v2 baseline is controller-injected; candidate baseline_ids are prohibited."
+        )
+    allowed_key_sets = (
+        {frozenset(expected)}
+        if not allow_controller_baseline
+        else {frozenset(expected), frozenset(controller_expected)}
+    )
+    if frozenset(value) not in allowed_key_sets:
+        raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+    if value.get("schema") != OUTCOME_SURVIVAL_V2_SCHEMA:
+        raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+    if (
+        value.get("owner_intent_id") != owner_intent.get("intent_id")
+        or value.get("owner_intent_digest") != owner_intent.get("owner_intent_digest")
+    ):
+        raise EngineeringError("Engineering outcome survival v2 owner intent is mismatched.")
+    baseline_ids = sorted(outcome["id"] for outcome in owner_intent["outcomes"])
+    if "baseline_ids" in value:
+        supplied = value["baseline_ids"]
+        if (
+            not isinstance(supplied, list)
+            or sorted(supplied) != baseline_ids
+            or len(set(supplied)) != len(supplied)
+        ):
+            raise EngineeringError("Engineering outcome survival v2 controller baseline is mismatched.")
+        if not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(value.get("mapping_digest", ""))
+        ):
+            raise EngineeringError("Engineering outcome survival v2 mapping digest is invalid.")
+    mappings = value.get("mappings")
+    if (
+        not isinstance(mappings, list)
+        or not mappings
+        or len(mappings) > MAX_OWNER_INTENT_OUTCOMES
+    ):
+        raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+    normalized_mappings = []
+    for mapping in mappings:
+        expected_mapping = {
+            "outcome_id",
+            "disposition",
+            "reason",
+            "verification_ids",
+            "replacement_ids",
+            "equivalence",
+            "owner_exception",
+        }
+        if not isinstance(mapping, dict) or set(mapping) != expected_mapping:
+            raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+        try:
+            outcome_id = _assurance_id(mapping["outcome_id"], "owner outcome")
+        except EngineeringError as error:
+            raise EngineeringError("Engineering outcome survival v2 mapping is invalid.") from error
+        disposition = mapping.get("disposition")
+        reason = mapping.get("reason")
+        if (
+            disposition not in OUTCOME_SURVIVAL_DISPOSITIONS
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 500
+            or _contains_credential(reason)
+        ):
+            raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+        lists: dict[str, list[str]] = {}
+        for key in ("verification_ids", "replacement_ids"):
+            items = mapping[key]
+            if (
+                not isinstance(items, list)
+                or len(items) > 64
+                or any(not isinstance(item, str) for item in items)
+            ):
+                raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+            try:
+                lists[key] = sorted(
+                    _assurance_id(item, f"outcome survival v2 {key}")
+                    for item in items
+                )
+            except EngineeringError as error:
+                raise EngineeringError("Engineering outcome survival v2 mapping is invalid.") from error
+            if len(set(lists[key])) != len(lists[key]):
+                raise EngineeringError("Engineering outcome survival v2 mapping is invalid.")
+        if not lists["verification_ids"]:
+            raise EngineeringError("Engineering outcome survival v2 verification is missing.")
+        equivalence = mapping["equivalence"]
+        owner_exception = mapping["owner_exception"]
+        if disposition == "INCLUDED":
+            if lists["replacement_ids"] or equivalence is not None or owner_exception is not None:
+                raise EngineeringError("Engineering included outcome carries incompatible disposition evidence.")
+            normalized_equivalence = None
+            normalized_exception = None
+        elif disposition == "REPLACED":
+            if not lists["replacement_ids"] or equivalence is None or owner_exception is not None:
+                raise EngineeringError("Engineering REPLACED outcome lacks independent equivalence evidence.")
+            normalized_equivalence = _outcome_equivalence(equivalence)
+            normalized_exception = None
+        else:
+            if lists["replacement_ids"] or equivalence is not None or owner_exception is None:
+                raise EngineeringError("Engineering DEFERRED or EXCLUDED outcome requires external owner exception.")
+            if root is None:
+                raise EngineeringError("Engineering owner exception verification requires a project root.")
+            normalized_equivalence = None
+            normalized_exception = _verify_host_owner_exception(
+                root, owner_intent, outcome_id, disposition, owner_exception
+            )
+        normalized_mappings.append(
+            {
+                "outcome_id": outcome_id,
+                "disposition": disposition,
+                "reason": reason.strip(),
+                "verification_ids": lists["verification_ids"],
+                "replacement_ids": lists["replacement_ids"],
+                "equivalence": normalized_equivalence,
+                "owner_exception": normalized_exception,
+            }
+        )
+    mapped_ids = [item["outcome_id"] for item in normalized_mappings]
+    missing = sorted(set(baseline_ids) - set(mapped_ids))
+    unexpected = sorted(set(mapped_ids) - set(baseline_ids))
+    if missing:
+        raise EngineeringError(
+            "Engineering outcome survival v2 is incomplete; missing controller baseline mappings: "
+            + ", ".join(missing)
+        )
+    if unexpected or len(set(mapped_ids)) != len(mapped_ids):
+        raise EngineeringError("Engineering outcome survival v2 mapping is ambiguous.")
+    if architect_scope is not None:
+        allowed = set(architect_scope)
+        referenced = set()
+        for mapping in normalized_mappings:
+            referenced.update(mapping["verification_ids"])
+            referenced.update(mapping["replacement_ids"])
+            if mapping["equivalence"] is not None:
+                referenced.add(mapping["equivalence"]["evidence_id"])
+        outside = sorted(referenced - allowed)
+        if outside:
+            raise EngineeringError(
+                "Engineering outcome survival v2 evidence is outside architect scope: "
+                + ", ".join(outside)
+            )
+    normalized = {
+        "schema": OUTCOME_SURVIVAL_V2_SCHEMA,
+        "owner_intent_id": owner_intent["intent_id"],
+        "owner_intent_digest": owner_intent["owner_intent_digest"],
+        "baseline_ids": baseline_ids,
+        "mappings": sorted(normalized_mappings, key=lambda item: item["outcome_id"]),
+    }
+    normalized["mapping_digest"] = _json_digest(normalized)
+    if "mapping_digest" in value and value["mapping_digest"] != normalized["mapping_digest"]:
+        raise EngineeringError("Engineering outcome survival v2 mapping digest is mismatched.")
+    return normalized
+
+
+def _scope_handoff(
+    value: object,
+    *,
+    require_approval: bool = True,
+    allow_controller_baseline: bool = False,
+) -> dict[str, object]:
     """Validate the bounded scope contract carried from investigation to delivery."""
     base_keys = {
         "seed_evidence",
@@ -6078,9 +6474,29 @@ def _scope_handoff(value: object, *, require_approval: bool = True) -> dict[str,
     if result != architect:
         raise EngineeringError("Preparation scope handoff is narrow or incomplete.")
     if "outcome_survival" in value:
-        normalized["outcome_survival"] = _outcome_survival(
-            value["outcome_survival"], normalized["architect_scope"]
-        )
+        survival = value["outcome_survival"]
+        if isinstance(survival, dict) and survival.get("schema") == OUTCOME_SURVIVAL_V2_SCHEMA:
+            input_keys = {
+                "schema",
+                "owner_intent_id",
+                "owner_intent_digest",
+                "mappings",
+            }
+            controller_keys = input_keys | {"baseline_ids", "mapping_digest"}
+            permitted = (
+                {frozenset(input_keys)}
+                if not allow_controller_baseline
+                else {frozenset(input_keys), frozenset(controller_keys)}
+            )
+            if frozenset(survival) not in permitted:
+                raise EngineeringError("Preparation owner-intent outcome survival is invalid.")
+            # Root-bound validation and controller baseline injection occur at
+            # the scope authority boundary, never from candidate input alone.
+            normalized["outcome_survival"] = dict(survival)
+        else:
+            normalized["outcome_survival"] = _outcome_survival(
+                survival, normalized["architect_scope"]
+            )
     if require_approval:
         approval_id = value["approval_id"]
         if (
@@ -6098,6 +6514,27 @@ def _scope_handoff(value: object, *, require_approval: bool = True) -> dict[str,
             raise EngineeringError("Preparation scope handoff decision digest is invalid.")
         normalized["approval_id"] = approval_id
         normalized["decision_digest"] = value["decision_digest"]
+    return normalized
+
+
+def _bind_owner_intent_handoff(root: Path, handoff: dict) -> dict:
+    """Compile a v2 survival mapping against the active private owner intent."""
+    normalized = dict(handoff)
+    survival = normalized.get("outcome_survival")
+    if not isinstance(survival, dict) or survival.get("schema") != OUTCOME_SURVIVAL_V2_SCHEMA:
+        return normalized
+    intent = _active_owner_intent(
+        root,
+        survival.get("owner_intent_id"),
+        survival.get("owner_intent_digest"),
+    )
+    normalized["outcome_survival"] = _outcome_survival_v2(
+        survival,
+        intent,
+        root=root,
+        architect_scope=normalized["architect_scope"],
+        allow_controller_baseline="baseline_ids" in survival,
+    )
     return normalized
 
 
@@ -6170,7 +6607,9 @@ def _scope_envelope(scope: dict) -> dict[str, object]:
             raise EngineeringError("Preparation task authority must be an object.")
         result["task_authority"] = scope["task_authority"]
     if "scope_handoff" in scope:
-        result["scope_handoff"] = _scope_handoff(scope["scope_handoff"])
+        result["scope_handoff"] = _scope_handoff(
+            scope["scope_handoff"], allow_controller_baseline=True
+        )
     if "change_class" in scope:
         change_class = scope["change_class"]
         if change_class not in MATERIAL_CHANGE_CLASSES:
@@ -6193,7 +6632,7 @@ def _explicit_context_ids(intent: str, scope: dict, nodes: dict[str, dict]) -> t
     positions = sorted(
         (match.start(), identifier)
         for identifier in nodes
-        if nodes[identifier].get("type") in {"requirement", "decision"}
+        if nodes[identifier].get("type") in EXPLICIT_INTENT_CONTEXT_NODE_TYPES
         for match in [re.search(rf"(?<![\w-]){re.escape(identifier)}(?![\w-])", intent)]
         if match
     )
@@ -6335,6 +6774,54 @@ def _context_impact(checkpoint: dict, identifiers: list[str]) -> list[dict]:
             ):
                 result[path] = item
     return [result[key] for key in sorted(result)]
+
+
+def _intent_impacting(
+    checkpoint: dict,
+    selected_ids: list[str],
+    change_class: str | None,
+    scope_handoff: object,
+) -> bool:
+    """Conservatively identify intent scope from exact graph connectivity.
+
+    A declared material class or an outcome-survival handoff is always
+    intent-impacting. For otherwise routine work, the controller follows only
+    exact edges from the selected nodes and detects contact with an explicit
+    capability or assurance/obligation node. Inferred links
+    never establish this gate, so ordinary legacy requirement links remain
+    readable history rather than being silently upgraded into new owner intent.
+    """
+    if change_class in MATERIAL_CHANGE_CLASSES or (
+        isinstance(scope_handoff, dict) and "outcome_survival" in scope_handoff
+    ):
+        return True
+    if not isinstance(checkpoint, dict) or not isinstance(selected_ids, list):
+        return False
+    raw_nodes = checkpoint.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return False
+    nodes = {
+        item.get("id"): item
+        for item in raw_nodes
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    queue = deque(identifier for identifier in selected_ids if identifier in nodes)
+    seen = set(queue)
+    while queue:
+        current = queue.popleft()
+        if nodes[current].get("type") in INTENT_IMPACT_GRAPH_NODE_TYPES:
+            return True
+        for edge in _exact_edges(checkpoint):
+            if edge["from"] == current:
+                target = edge["to"]
+            elif edge["to"] == current:
+                target = edge["from"]
+            else:
+                continue
+            if target in nodes and target not in seen:
+                seen.add(target)
+                queue.append(target)
+    return False
 
 
 def _dirty_paths(root: Path) -> list[str]:
@@ -7099,7 +7586,7 @@ def prepare(
         authorization["change_class"] = change_class
     config = load_project_config(project.root)
     if "scope_handoff" in authorization:
-        _validate_scope_handoff_authority(
+        authorization["scope_handoff"] = _validate_scope_handoff_authority(
             project.root, project.commit, config, authorization["scope_handoff"]
         )
     saved_autonomy = get_autonomy(project.root)
@@ -7179,6 +7666,44 @@ def prepare(
     context = _merge_context(context)
 
     impact = _context_impact(checkpoint, selected_ids)
+    intent_impact = _intent_impacting(
+        checkpoint, selected_ids, change_class, scope_handoff
+    )
+    owner_intent_projection = None
+    if intent_impact:
+        try:
+            status = owner_intent_status(project.root)
+            handoff_survival = (
+                scope_handoff.get("outcome_survival")
+                if isinstance(scope_handoff, dict)
+                else None
+            )
+            bound_to_handoff = bool(
+                isinstance(handoff_survival, dict)
+                and handoff_survival.get("schema") == OUTCOME_SURVIVAL_V2_SCHEMA
+                and status["state"] == "bound"
+                and handoff_survival.get("owner_intent_id") == status["intent_id"]
+                and handoff_survival.get("owner_intent_digest")
+                == status["owner_intent_digest"]
+            )
+            owner_intent_projection = {
+                **status,
+                "intent_impacting": True,
+                "bound_to_scope_handoff": bound_to_handoff,
+            }
+        except EngineeringError:
+            owner_intent_projection = {
+                "schema": OWNER_INTENT_STATUS_SCHEMA,
+                "state": "owner_intent_unknown",
+                "intent_id": None,
+                "owner_intent_digest": None,
+                "authority_epoch": None,
+                "core_outcome_count": 0,
+                "intent_impacting": True,
+                "bound_to_scope_handoff": False,
+            }
+        if not owner_intent_projection["bound_to_scope_handoff"]:
+            blocker_codes.append("owner_intent_required")
     contract_impact = any(
         item["provenance"] in EXACT_PROVENANCE
         and nodes.get(item["id"], {}).get("type") == "contract"
@@ -7329,6 +7854,24 @@ def prepare(
                 "approval_boundary": "signed_scope_handoff_verified",
                 "mappings": survival_mapping["mappings"],
             }
+    if (
+        intent_impact
+        and owner_intent_projection is not None
+        and not owner_intent_projection["bound_to_scope_handoff"]
+    ):
+        outcome_projection = {
+            "state": "unknown",
+            "boundary": "owner_intent_unknown",
+            "accepted": False,
+            "implementation_ready": False,
+            "missing_baseline_mappings": [],
+            "approval_boundary": "external_owner_intent_required",
+            "mappings": (
+                survival_mapping.get("mappings", [])
+                if isinstance(survival_mapping, dict)
+                else []
+            ),
+        }
     result = {
         "schema": "engineering.prepare.v1",
         "run_id": "",
@@ -7363,6 +7906,8 @@ def prepare(
     }
     if outcome_projection is not None:
         result["outcome_survival"] = outcome_projection
+    if owner_intent_projection is not None:
+        result["owner_intent"] = owner_intent_projection
     if applied_practices:
         result["applied_practices"] = applied_practices
     if practice_status is not None:
@@ -7550,7 +8095,9 @@ def approve_checks(root: Path, *, allow_inline_code: bool = False) -> dict:
 def _scope_handoff_claims(
     root: Path, commit: str, manifest: dict, handoff: dict
 ) -> dict:
-    normalized = _scope_handoff(handoff)
+    normalized = _bind_owner_intent_handoff(
+        root, _scope_handoff(handoff, allow_controller_baseline=True)
+    )
     decision_digest = _decision_artifact_digest(
         root, commit, manifest, normalized["decision_id"]
     )
@@ -7572,12 +8119,32 @@ def _scope_handoff_claims(
     return claims
 
 
-def approve_scope_handoff(root: Path, decision_id: str, handoff: dict) -> dict:
+def approve_scope_handoff(
+    root: Path,
+    decision_id: str,
+    handoff: dict,
+    *,
+    owner_intent_id: str | None = None,
+) -> dict:
     """Issue one signed, commit-bound approval for a reconstructed scope handoff."""
     project = resolve_project(Path(root))
     manifest = load_project_config(project.root)
     decision_id = _assurance_id(decision_id, "scope handoff decision")
-    normalized = _scope_handoff(handoff, require_approval=False)
+    normalized = _bind_owner_intent_handoff(
+        project.root, _scope_handoff(handoff, require_approval=False)
+    )
+    survival = normalized.get("outcome_survival")
+    if isinstance(survival, dict) and survival.get("schema") == OUTCOME_SURVIVAL_V2_SCHEMA:
+        if owner_intent_id is None:
+            raise EngineeringError(
+                "Engineering owner-intent scope approval requires the exact owner intent ID."
+            )
+        if _assurance_id(owner_intent_id, "scope approval owner intent") != survival[
+            "owner_intent_id"
+        ]:
+            raise EngineeringError("Engineering owner-intent scope approval is mismatched.")
+    elif owner_intent_id is not None:
+        raise EngineeringError("Engineering legacy scope approval has no owner intent binding.")
     decision_digest = _decision_artifact_digest(
         project.root, project.commit, manifest, decision_id
     )
@@ -7612,7 +8179,9 @@ def approve_scope_handoff(root: Path, decision_id: str, handoff: dict) -> dict:
 def _validate_scope_handoff_authority(
     root: Path, commit: str, manifest: dict, handoff: object
 ) -> dict:
-    normalized = _scope_handoff(handoff)
+    normalized = _bind_owner_intent_handoff(
+        root, _scope_handoff(handoff, allow_controller_baseline=True)
+    )
     claims = _scope_handoff_claims(root, commit, manifest, normalized)
     attestation = _require_attestation(
         _project_controller_dir(root), "scope_handoff", claims
@@ -7990,6 +8559,46 @@ def _successful_check_evidence(required: list[list[str]], checks: object) -> boo
     return True
 
 
+def _bound_preparation_owner_intent(preparation: object) -> dict | None:
+    if not isinstance(preparation, dict):
+        raise EngineeringError("Engineering preparation owner intent is invalid.")
+    owner_intent = preparation.get("owner_intent")
+    if owner_intent is None:
+        return None
+    expected = {
+        "schema",
+        "state",
+        "intent_id",
+        "owner_intent_digest",
+        "authority_epoch",
+        "core_outcome_count",
+        "intent_impacting",
+        "bound_to_scope_handoff",
+    }
+    if (
+        not isinstance(owner_intent, dict)
+        or set(owner_intent) != expected
+        or owner_intent.get("schema") != OWNER_INTENT_STATUS_SCHEMA
+        or owner_intent.get("state") != "bound"
+        or owner_intent.get("intent_impacting") is not True
+        or owner_intent.get("bound_to_scope_handoff") is not True
+    ):
+        raise EngineeringError("Engineering preparation owner intent is unknown or unbound.")
+    try:
+        normalized = {
+            "intent_id": _assurance_id(owner_intent["intent_id"], "preparation owner intent"),
+            "owner_intent_digest": owner_intent["owner_intent_digest"],
+            "authority_epoch": _assurance_id(owner_intent["authority_epoch"], "preparation owner intent epoch"),
+        }
+    except EngineeringError as error:
+        raise EngineeringError("Engineering preparation owner intent is invalid.") from error
+    if not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", normalized["owner_intent_digest"]
+    ):
+        raise EngineeringError("Engineering preparation owner intent is invalid.")
+    return normalized
+
+
 def _completion_payload(
     preparation: dict,
     changed: list[str],
@@ -8054,6 +8663,9 @@ def _completion_payload(
     handoff = preparation["authorization"].get("scope_handoff")
     if isinstance(handoff, dict) and "outcome_survival" in handoff:
         payload["outcome_survival"] = handoff["outcome_survival"]
+    owner_intent = _bound_preparation_owner_intent(preparation)
+    if owner_intent is not None:
+        payload["owner_intent"] = owner_intent
     return payload
 
 
@@ -9803,15 +10415,56 @@ def build_execution_context(
         "assertions": normalized_assertions,
         "forbidden_ids": forbidden,
     }
+    owner_intent = preparation.get("owner_intent")
+    if owner_intent is not None:
+        expected_owner_intent = {
+            "schema",
+            "state",
+            "intent_id",
+            "owner_intent_digest",
+            "authority_epoch",
+            "core_outcome_count",
+            "intent_impacting",
+            "bound_to_scope_handoff",
+        }
+        if (
+            not isinstance(owner_intent, dict)
+            or set(owner_intent) != expected_owner_intent
+            or owner_intent.get("schema") != OWNER_INTENT_STATUS_SCHEMA
+            or owner_intent.get("state") != "bound"
+            or owner_intent.get("intent_impacting") is not True
+            or owner_intent.get("bound_to_scope_handoff") is not True
+        ):
+            raise EngineeringError(
+                "Engineering execution context owner intent is unknown or unbound."
+            )
+        try:
+            bundle["owner_intent"] = {
+                "intent_id": _assurance_id(owner_intent["intent_id"], "execution owner intent"),
+                "owner_intent_digest": owner_intent["owner_intent_digest"],
+                "authority_epoch": _assurance_id(owner_intent["authority_epoch"], "execution owner intent epoch"),
+            }
+        except EngineeringError as error:
+            raise EngineeringError("Engineering execution context owner intent is invalid.") from error
+        if not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", bundle["owner_intent"]["owner_intent_digest"]
+        ):
+            raise EngineeringError("Engineering execution context owner intent is invalid.")
     if not isinstance(bundle["project"]["root_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", bundle["project"]["root_digest"]) or not isinstance(bundle["project"]["commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", bundle["project"]["commit"]):
         raise EngineeringError("Engineering execution context project is invalid.")
     return {**bundle, "digest": _json_digest(bundle)}
 
 
 def validate_execution_context(bundle: object, preparation: object, *, runner_enforces_boundary: bool) -> dict:
-    if not isinstance(bundle, dict) or set(bundle) != {
+    required = {
         "schema", "run_id", "project", "scope", "context", "assertions", "forbidden_ids", "digest"
-    } or bundle.get("schema") != EXECUTION_CONTEXT_SCHEMA:
+    }
+    allowed = {frozenset(required), frozenset(required | {"owner_intent"})}
+    if (
+        not isinstance(bundle, dict)
+        or frozenset(bundle) not in allowed
+        or bundle.get("schema") != EXECUTION_CONTEXT_SCHEMA
+    ):
         raise EngineeringError("Engineering execution context is invalid.")
     unsigned = {key: value for key, value in bundle.items() if key != "digest"}
     if bundle.get("digest") != _json_digest(unsigned):
@@ -10212,6 +10865,1100 @@ def _verify_host_authority_approval(root: Path, normalized: dict, approval: obje
     if verified.returncode != 0:
         raise EngineeringError("Engineering scoped authority host approval signature is invalid.")
     return "approval-" + hashlib.sha256(_canonical_json(approval)).hexdigest()[:32]
+
+
+def _owner_intent_path(root: Path) -> Path:
+    path = _project_controller_dir(root) / "owner-intents.json"
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _owner_intent_binding(root: Path, value: object) -> dict:
+    expected = {
+        "schema",
+        "intent_id",
+        "repository_id",
+        "authority_epoch",
+        "source_evidence",
+        "outcomes",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != OWNER_INTENT_SCHEMA
+    ):
+        raise EngineeringError("Engineering owner intent binding is invalid.")
+    repository_id = value.get("repository_id")
+    expected_repository = _project_contribution_digest(resolve_project_root(str(root)))
+    if repository_id != expected_repository:
+        raise EngineeringError("Engineering owner intent repository binding is invalid.")
+    source_evidence = value.get("source_evidence")
+    outcomes = value.get("outcomes")
+    if (
+        not isinstance(source_evidence, list)
+        or not source_evidence
+        or len(source_evidence) > MAX_OWNER_INTENT_EVIDENCE
+        or not isinstance(outcomes, list)
+        or not outcomes
+        or len(outcomes) > MAX_OWNER_INTENT_OUTCOMES
+    ):
+        raise EngineeringError("Engineering owner intent binding is invalid.")
+    normalized_sources = []
+    source_ids: set[str] = set()
+    for source in source_evidence:
+        if (
+            not isinstance(source, dict)
+            or set(source) != {"identity", "digest"}
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source.get("digest", "")))
+        ):
+            raise EngineeringError("Engineering owner intent source evidence is invalid.")
+        identity = _assurance_id(source.get("identity"), "owner intent source evidence")
+        if identity in source_ids:
+            raise EngineeringError("Engineering owner intent source evidence is duplicated.")
+        source_ids.add(identity)
+        normalized_sources.append({"identity": identity, "digest": source["digest"]})
+    normalized_outcomes = []
+    outcome_ids: set[str] = set()
+    for outcome in outcomes:
+        if (
+            not isinstance(outcome, dict)
+            or set(outcome) != {"id", "criticality", "statement_digest", "required_evidence"}
+            or outcome.get("criticality") not in OWNER_INTENT_CRITICALITIES
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(outcome.get("statement_digest", "")))
+            or not isinstance(outcome.get("required_evidence"), list)
+            or not outcome["required_evidence"]
+            or len(outcome["required_evidence"]) > 16
+        ):
+            raise EngineeringError("Engineering owner intent outcome is invalid.")
+        outcome_id = _assurance_id(outcome.get("id"), "owner intent outcome")
+        if outcome_id in outcome_ids:
+            raise EngineeringError("Engineering owner intent outcome is duplicated.")
+        outcome_ids.add(outcome_id)
+        requirements = []
+        requirement_keys: set[tuple[str, str, str]] = set()
+        for requirement in outcome["required_evidence"]:
+            if (
+                not isinstance(requirement, dict)
+                or set(requirement) != {"class", "interface", "environment"}
+                or requirement.get("class") not in OUTCOME_EVIDENCE_CLASSES
+            ):
+                raise EngineeringError("Engineering owner intent evidence requirement is invalid.")
+            interface = _assurance_id(requirement.get("interface"), "owner intent evidence interface")
+            environment = _assurance_id(requirement.get("environment"), "owner intent evidence environment")
+            key = (requirement["class"], interface, environment)
+            if key in requirement_keys:
+                raise EngineeringError("Engineering owner intent evidence requirement is duplicated.")
+            requirement_keys.add(key)
+            requirements.append(
+                {
+                    "class": requirement["class"],
+                    "interface": interface,
+                    "environment": environment,
+                }
+            )
+        normalized_outcomes.append(
+            {
+                "id": outcome_id,
+                "criticality": outcome["criticality"],
+                "statement_digest": outcome["statement_digest"],
+                "required_evidence": sorted(
+                    requirements,
+                    key=lambda item: (item["class"], item["interface"], item["environment"]),
+                ),
+            }
+        )
+    return {
+        "schema": OWNER_INTENT_SCHEMA,
+        "intent_id": _assurance_id(value.get("intent_id"), "owner intent"),
+        "repository_id": repository_id,
+        "authority_epoch": _assurance_id(value.get("authority_epoch"), "owner intent authority epoch"),
+        "source_evidence": sorted(normalized_sources, key=lambda item: item["identity"]),
+        "outcomes": sorted(normalized_outcomes, key=lambda item: item["id"]),
+    }
+
+
+def _owner_intent_signature(key: bytes, record: dict) -> str:
+    material = {name: value for name, value in record.items() if name != "signature"}
+    return "hmac-sha256:" + hmac.new(key, _canonical_json(material), hashlib.sha256).hexdigest()
+
+
+def _load_owner_intents(root: Path) -> dict:
+    path = _owner_intent_path(root)
+    if not path.exists():
+        return {"schema": OWNER_INTENT_LEDGER_SCHEMA, "intents": []}
+    _verify_owner_private(path, directory=False)
+    key = _controller_key(_project_controller_dir(root), required=True)
+    assert key is not None
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering owner intent ledger is invalid.") from error
+    if (
+        not isinstance(ledger, dict)
+        or set(ledger) != {"schema", "intents"}
+        or ledger.get("schema") != OWNER_INTENT_LEDGER_SCHEMA
+        or not isinstance(ledger.get("intents"), list)
+        or len(ledger["intents"]) > MAX_OWNER_INTENTS
+    ):
+        raise EngineeringError("Engineering owner intent ledger is invalid.")
+    active = 0
+    digests: set[str] = set()
+    for record in ledger["intents"]:
+        expected = {
+            "schema",
+            "intent_id",
+            "repository_id",
+            "authority_epoch",
+            "source_evidence",
+            "outcomes",
+            "owner_intent_digest",
+            "approval_reference",
+            "bound_at",
+            "status",
+            "signature",
+        }
+        if not isinstance(record, dict) or set(record) != expected:
+            raise EngineeringError("Engineering owner intent ledger is invalid.")
+        binding = {name: record[name] for name in (
+            "schema", "intent_id", "repository_id", "authority_epoch", "source_evidence", "outcomes"
+        )}
+        try:
+            normalized = _owner_intent_binding(root, binding)
+            _assurance_id(record["approval_reference"], "owner intent approval reference")
+            _assurance_timestamp(record["bound_at"])
+        except EngineeringError as error:
+            raise EngineeringError("Engineering owner intent ledger is invalid.") from error
+        if (
+            normalized != binding
+            or record.get("status") not in {"active", "superseded"}
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(record.get("owner_intent_digest", "")))
+            or record["owner_intent_digest"] != _json_digest(binding)
+            or record["owner_intent_digest"] in digests
+            or not hmac.compare_digest(str(record.get("signature", "")), _owner_intent_signature(key, record))
+        ):
+            raise EngineeringError("Engineering owner intent ledger is invalid.")
+        digests.add(record["owner_intent_digest"])
+        active += int(record["status"] == "active")
+    if active > 1:
+        raise EngineeringError("Engineering owner intent ledger is ambiguous.")
+    return ledger
+
+
+def _publish_owner_intents(root: Path, ledger: dict, new_key: bytes | None) -> None:
+    if (
+        len(ledger.get("intents", [])) > MAX_OWNER_INTENTS
+        or len(json.dumps(ledger).encode("utf-8")) > 1024 * 1024
+    ):
+        raise EngineeringError("Engineering owner intent ledger exceeds its bounded size.")
+    controller = _project_controller_dir(root)
+    controller.mkdir(parents=True, exist_ok=True)
+    _enforce_owner_private(controller)
+    binary = (
+        [(_controller_key_path(controller), new_key.hex().encode("ascii") + b"\n")]
+        if new_key is not None
+        else None
+    )
+    _transactional_json_documents([(_owner_intent_path(root), ledger)], binary)
+
+
+def _verify_host_owner_intent_approval(root: Path, normalized: dict, approval: object) -> str:
+    required = {"schema", "approver", "claims", "signature"}
+    if (
+        not isinstance(approval, dict)
+        or set(approval) != required
+        or approval.get("schema") != "engineering.host-owner-intent-approval.v1"
+        or approval.get("claims") != normalized
+        or not isinstance(approval.get("signature"), str)
+        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(approval["signature"]) > 16384
+    ):
+        raise EngineeringError("Engineering owner intent host approval is invalid.")
+    approver = _assurance_id(approval.get("approver"), "owner intent host approver")
+    try:
+        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering owner intent host approver trust is unavailable.") from error
+    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
+        raise EngineeringError("Engineering owner intent host approver trust is invalid.")
+    material = _canonical_json(
+        {"schema": "engineering.host-owner-intent-claims.v1", "claims": normalized}
+    )
+    with tempfile.TemporaryDirectory(prefix="engineering-owner-intent-") as temporary:
+        allowed_path = Path(temporary) / "allowed_signers"
+        signature_path = Path(temporary) / "approval.sig"
+        allowed_path.write_bytes(allowed)
+        signature_path.write_text(approval["signature"], encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_path),
+                    "-I",
+                    approver,
+                    "-n",
+                    "engineering-owner-intent",
+                    "-s",
+                    str(signature_path),
+                ],
+                input=material,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EngineeringError("Engineering owner intent host approval verification is unavailable.") from error
+    if verified.returncode != 0:
+        raise EngineeringError("Engineering owner intent host approval signature is invalid.")
+    return "owner-intent-approval-" + hashlib.sha256(_canonical_json(approval)).hexdigest()[:32]
+
+
+def bind_owner_intent(root: Path, binding: object, approval: object) -> dict:
+    """Persist a host-approved owner baseline; callers cannot self-approve it."""
+    project_root = resolve_project_root(str(root))
+    normalized = _owner_intent_binding(project_root, binding)
+    approval_reference = _verify_host_owner_intent_approval(
+        project_root, normalized, approval
+    )
+    operation = _begin_authority_mutation(project_root, "owner-intent-bind")
+    try:
+        ledger = _load_owner_intents(project_root)
+        digest = _json_digest(normalized)
+        matches = [
+            record
+            for record in ledger["intents"]
+            if record["owner_intent_digest"] == digest
+        ]
+        if matches:
+            if len(matches) != 1 or matches[0]["approval_reference"] != approval_reference:
+                raise EngineeringError("Engineering owner intent replay conflicts with retained state.")
+            return dict(matches[0])
+        controller = _project_controller_dir(project_root)
+        key = _controller_key(controller, required=False)
+        new_key = os.urandom(32) if key is None else None
+        key = key or new_key
+        assert key is not None
+        for existing in ledger["intents"]:
+            if existing["status"] == "active":
+                existing["status"] = "superseded"
+                existing["signature"] = _owner_intent_signature(key, existing)
+        record = {
+            **normalized,
+            "owner_intent_digest": digest,
+            "approval_reference": approval_reference,
+            "bound_at": datetime.now(timezone.utc).isoformat(),
+            "status": "active",
+        }
+        record["signature"] = _owner_intent_signature(key, record)
+        ledger["intents"].append(record)
+        ledger["intents"].sort(key=lambda item: item["owner_intent_digest"])
+        _publish_owner_intents(project_root, ledger, new_key)
+        return dict(record)
+    finally:
+        _end_completion(project_root, operation)
+
+
+def owner_intent_status(root: Path, authority_id: str | None = None) -> dict:
+    project_root = resolve_project_root(str(root))
+    if authority_id is not None:
+        authority_id = _assurance_id(authority_id, "owner intent")
+    ledger = _load_owner_intents(project_root)
+    candidates = [
+        record
+        for record in ledger["intents"]
+        if authority_id is None or record["intent_id"] == authority_id
+    ]
+    active = [record for record in candidates if record["status"] == "active"]
+    if len(active) > 1:
+        raise EngineeringError("Engineering owner intent status is ambiguous.")
+    record = active[0] if active else None
+    return {
+        "schema": OWNER_INTENT_STATUS_SCHEMA,
+        "state": "bound" if record is not None else "owner_intent_unknown",
+        "intent_id": record["intent_id"] if record is not None else authority_id,
+        "owner_intent_digest": record["owner_intent_digest"] if record is not None else None,
+        "authority_epoch": record["authority_epoch"] if record is not None else None,
+        "core_outcome_count": sum(
+            item["criticality"] == "core" for item in record["outcomes"]
+        ) if record is not None else 0,
+    }
+
+
+def _completion_artifact_digest(completion: object, completion_digest: object) -> str:
+    """Bind a token to the exact terminal completion and its immutable artifact identity."""
+    if (
+        not isinstance(completion, dict)
+        or completion.get("schema") != "engineering.complete.v1"
+        or not isinstance(completion.get("run_id"), str)
+        or not re.fullmatch(r"run-[0-9a-f]{6}", completion["run_id"])
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(completion_digest))
+        or not isinstance(completion.get("result_identity"), dict)
+        or set(completion["result_identity"]) != {"commit", "dirty_tree_digest"}
+        or not isinstance(completion.get("changed_artifacts"), list)
+        or any(not isinstance(path, str) for path in completion["changed_artifacts"])
+    ):
+        raise EngineeringError("Engineering terminal completion artifact identity is invalid.")
+    return _json_digest(
+        {
+            "completion_digest": completion_digest,
+            "result_identity": completion["result_identity"],
+            "changed_artifacts": sorted(completion["changed_artifacts"]),
+            "scope_result_artifacts": sorted(
+                completion.get("scope_result_artifacts", [])
+            ),
+        }
+    )
+
+
+def _outcome_acceptance_path(root: Path) -> Path:
+    path = _project_controller_dir(root) / "outcome-acceptances.json"
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _outcome_audit_claims(value: object) -> dict:
+    """Return the minimum exact claims an independent auditor must sign."""
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("roles"), dict)
+        or not isinstance(value.get("outcomes"), list)
+    ):
+        raise EngineeringError("Engineering independent outcome audit is invalid.")
+    roles = value["roles"]
+    expected_roles = {"architect_id", "implementer_id", "writer_id", "auditor_id"}
+    if set(roles) != expected_roles or any(
+        not isinstance(roles[name], str) for name in expected_roles
+    ):
+        raise EngineeringError("Engineering independent outcome audit is invalid.")
+    states = []
+    for outcome in value["outcomes"]:
+        if (
+            not isinstance(outcome, dict)
+            or set(outcome) != {"outcome_id", "state", "evidence"}
+            or not isinstance(outcome.get("outcome_id"), str)
+            or outcome.get("state") not in OUTCOME_ACCEPTANCE_STATES
+        ):
+            raise EngineeringError("Engineering independent outcome audit is invalid.")
+        states.append(
+            {"outcome_id": outcome["outcome_id"], "state": outcome["state"]}
+        )
+    if len({item["outcome_id"] for item in states}) != len(states):
+        raise EngineeringError("Engineering independent outcome audit is invalid.")
+    return {
+        "schema": "engineering.independent-outcome-audit-claims.v1",
+        "acceptance_id": value.get("acceptance_id"),
+        "completion_digest": value.get("completion_digest"),
+        "artifact_digest": value.get("artifact_digest"),
+        "owner_intent_id": value.get("owner_intent_id"),
+        "owner_intent_digest": value.get("owner_intent_digest"),
+        "mapping_digest": value.get("mapping_digest"),
+        "evidence_digest": value.get("evidence_digest"),
+        "roles": {name: roles[name] for name in sorted(expected_roles)},
+        "outcome_states": sorted(states, key=lambda item: item["outcome_id"]),
+        "original_owner_intent_compared": True,
+    }
+
+
+def _verify_independent_outcome_audit(root: Path, value: dict) -> dict:
+    attestation = value.get("audit_attestation")
+    expected = {"schema", "approver", "claims", "signature"}
+    claims = _outcome_audit_claims(value)
+    if (
+        not isinstance(attestation, dict)
+        or set(attestation) != expected
+        or attestation.get("schema") != INDEPENDENT_OUTCOME_AUDIT_SCHEMA
+        or attestation.get("claims") != claims
+        or not isinstance(attestation.get("signature"), str)
+        or not attestation["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(attestation["signature"]) > 16384
+    ):
+        raise EngineeringError("Engineering independent outcome audit is invalid.")
+    try:
+        approver = _assurance_id(attestation["approver"], "independent outcome audit approver")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering independent outcome audit is invalid.") from error
+    try:
+        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
+    except EngineeringError as error:
+        raise EngineeringError(
+            "Engineering independent outcome audit trust is unavailable."
+        ) from error
+    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
+        raise EngineeringError("Engineering independent outcome audit trust is invalid.")
+    with tempfile.TemporaryDirectory(prefix="engineering-outcome-audit-") as temporary:
+        allowed_path = Path(temporary) / "allowed_signers"
+        signature_path = Path(temporary) / "audit.sig"
+        allowed_path.write_bytes(allowed)
+        signature_path.write_text(attestation["signature"], encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_path),
+                    "-I",
+                    approver,
+                    "-n",
+                    "engineering-independent-audit",
+                    "-s",
+                    str(signature_path),
+                ],
+                input=_canonical_json(claims),
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EngineeringError(
+                "Engineering independent outcome audit verification is unavailable."
+            ) from error
+    if verified.returncode != 0:
+        raise EngineeringError("Engineering independent outcome audit signature is invalid.")
+    return {
+        "schema": INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
+        "approver": approver,
+        "claims": claims,
+        "signature": attestation["signature"],
+    }
+
+
+def _outcome_evidence(value: object) -> list[dict]:
+    if not isinstance(value, list) or len(value) > MAX_OWNER_INTENT_EVIDENCE:
+        raise EngineeringError("Engineering outcome acceptance evidence is invalid.")
+    normalized = []
+    identities: set[str] = set()
+    for evidence in value:
+        expected = {
+            "evidence_id",
+            "evidence_digest",
+            "class",
+            "interface",
+            "environment",
+            "producer_role",
+        }
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != expected
+            or evidence.get("class") not in OUTCOME_EVIDENCE_CLASSES
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(evidence.get("evidence_digest", ""))
+            )
+        ):
+            raise EngineeringError("Engineering outcome acceptance evidence is invalid.")
+        try:
+            normalized_evidence = {
+                "evidence_id": _assurance_id(evidence["evidence_id"], "outcome evidence"),
+                "evidence_digest": evidence["evidence_digest"],
+                "class": evidence["class"],
+                "interface": _assurance_id(evidence["interface"], "outcome evidence interface"),
+                "environment": _assurance_id(evidence["environment"], "outcome evidence environment"),
+                "producer_role": _assurance_id(evidence["producer_role"], "outcome evidence producer role"),
+            }
+        except EngineeringError as error:
+            raise EngineeringError("Engineering outcome acceptance evidence is invalid.") from error
+        identity = normalized_evidence["evidence_id"]
+        if identity in identities:
+            raise EngineeringError("Engineering outcome acceptance evidence is duplicated.")
+        identities.add(identity)
+        normalized.append(normalized_evidence)
+    return sorted(normalized, key=lambda item: item["evidence_id"])
+
+
+def _outcome_evidence_matrix_digest(outcomes: object) -> str:
+    """Digest the declared outcome/evidence matrix independent of presentation order."""
+    if not isinstance(outcomes, list) or len(outcomes) > MAX_OWNER_INTENT_OUTCOMES:
+        raise EngineeringError("Engineering outcome acceptance evidence matrix is invalid.")
+    matrix = []
+    for outcome in outcomes:
+        if not isinstance(outcome, dict):
+            raise EngineeringError("Engineering outcome acceptance evidence matrix is invalid.")
+        outcome_id = outcome.get("outcome_id")
+        evidence = outcome.get("evidence")
+        if not isinstance(outcome_id, str) or not isinstance(evidence, list):
+            raise EngineeringError("Engineering outcome acceptance evidence matrix is invalid.")
+        if any(not isinstance(item, dict) for item in evidence):
+            raise EngineeringError("Engineering outcome acceptance evidence matrix is invalid.")
+        matrix.append(
+            {
+                "outcome_id": outcome_id,
+                "evidence": sorted(evidence, key=lambda item: str(item.get("evidence_id", ""))),
+            }
+        )
+    if len({item["outcome_id"] for item in matrix}) != len(matrix):
+        raise EngineeringError("Engineering outcome acceptance evidence matrix is invalid.")
+    return _json_digest(sorted(matrix, key=lambda item: item["outcome_id"]))
+
+
+def _evidence_satisfies_requirements(
+    evidence: list[dict], requirements: list[dict]
+) -> bool:
+    for required in requirements:
+        required_order = OUTCOME_EVIDENCE_CLASS_ORDER[required["class"]]
+        if not any(
+            OUTCOME_EVIDENCE_CLASS_ORDER[item["class"]] >= required_order
+            and item["interface"] == required["interface"]
+            and item["environment"] == required["environment"]
+            for item in evidence
+        ):
+            return False
+    return True
+
+
+def _outcome_acceptance(
+    root: Path, completion_id: str, value: object
+) -> dict:
+    expected = {
+        "schema",
+        "acceptance_id",
+        "completion_digest",
+        "artifact_digest",
+        "owner_intent_id",
+        "owner_intent_digest",
+        "mapping_digest",
+        "evidence_digest",
+        "roles",
+        "audit_attestation",
+        "outcomes",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != OUTCOME_ACCEPTANCE_SCHEMA
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("completion_digest", "")))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("artifact_digest", "")))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("mapping_digest", "")))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("evidence_digest", "")))
+    ):
+        raise EngineeringError("Engineering outcome acceptance is invalid.")
+    try:
+        acceptance_id = _assurance_id(value["acceptance_id"], "outcome acceptance")
+        completion, completion_digest = _terminal_completion(root, completion_id)
+        artifact_digest = _completion_artifact_digest(completion, completion_digest)
+    except EngineeringError as error:
+        raise EngineeringError("Engineering outcome acceptance terminal completion is invalid.") from error
+    if value["completion_digest"] != completion_digest or value["artifact_digest"] != artifact_digest:
+        raise EngineeringError("Engineering outcome acceptance exact artifact is mismatched.")
+    authorization = completion.get("authorization")
+    handoff = authorization.get("scope_handoff") if isinstance(authorization, dict) else None
+    survival = handoff.get("outcome_survival") if isinstance(handoff, dict) else None
+    if not isinstance(survival, dict) or survival.get("schema") != OUTCOME_SURVIVAL_V2_SCHEMA:
+        raise EngineeringError("Engineering outcome acceptance owner intent is unknown for this completion.")
+    try:
+        intent = _active_owner_intent(
+            root, value["owner_intent_id"], value["owner_intent_digest"]
+        )
+        compiled_survival = _outcome_survival_v2(
+            survival,
+            intent,
+            root=root,
+            allow_controller_baseline=True,
+        )
+    except EngineeringError as error:
+        raise EngineeringError("Engineering outcome acceptance owner intent is invalid.") from error
+    completion_owner_intent = completion.get("owner_intent")
+    expected_completion_owner_intent = {
+        "intent_id": intent["intent_id"],
+        "owner_intent_digest": intent["owner_intent_digest"],
+        "authority_epoch": intent["authority_epoch"],
+    }
+    if completion_owner_intent != expected_completion_owner_intent:
+        raise EngineeringError("Engineering outcome acceptance completion owner intent is mismatched.")
+    if value["mapping_digest"] != compiled_survival["mapping_digest"]:
+        raise EngineeringError("Engineering outcome acceptance mapping is mismatched.")
+    roles = value["roles"]
+    expected_roles = {"architect_id", "implementer_id", "writer_id", "auditor_id"}
+    if not isinstance(roles, dict) or set(roles) != expected_roles:
+        raise EngineeringError("Engineering outcome acceptance roles are invalid.")
+    try:
+        normalized_roles = {
+            name: _assurance_id(roles[name], f"outcome acceptance {name}")
+            for name in sorted(expected_roles)
+        }
+    except EngineeringError as error:
+        raise EngineeringError("Engineering outcome acceptance roles are invalid.") from error
+    if normalized_roles["auditor_id"] in {
+        normalized_roles["architect_id"],
+        normalized_roles["implementer_id"],
+        normalized_roles["writer_id"],
+    }:
+        raise EngineeringError("Engineering outcome acceptance auditor is not independent.")
+    audit_input = {**value, "roles": normalized_roles}
+    audit_attestation = _verify_independent_outcome_audit(root, audit_input)
+    outcomes = value["outcomes"]
+    if (
+        not isinstance(outcomes, list)
+        or not outcomes
+        or len(outcomes) > MAX_OWNER_INTENT_OUTCOMES
+    ):
+        raise EngineeringError("Engineering outcome acceptance outcomes are invalid.")
+    required_by_id = {item["id"]: item for item in intent["outcomes"]}
+    dispositions = {
+        item["outcome_id"]: item["disposition"]
+        for item in compiled_survival["mappings"]
+    }
+    mappings_by_id = {
+        item["outcome_id"]: item
+        for item in compiled_survival["mappings"]
+    }
+    normalized_outcomes = []
+    for outcome in outcomes:
+        expected_outcome = {"outcome_id", "state", "evidence"}
+        if (
+            not isinstance(outcome, dict)
+            or set(outcome) != expected_outcome
+            or outcome.get("state") not in OUTCOME_ACCEPTANCE_STATES
+        ):
+            raise EngineeringError("Engineering outcome acceptance outcomes are invalid.")
+        try:
+            outcome_id = _assurance_id(outcome["outcome_id"], "accepted owner outcome")
+        except EngineeringError as error:
+            raise EngineeringError("Engineering outcome acceptance outcomes are invalid.") from error
+        evidence = _outcome_evidence(outcome["evidence"])
+        if outcome_id not in required_by_id:
+            raise EngineeringError("Engineering outcome acceptance includes an unknown owner outcome.")
+        if outcome["state"] == "accepted":
+            if dispositions.get(outcome_id) not in {"INCLUDED", "REPLACED"}:
+                raise EngineeringError("Engineering outcome acceptance cannot accept deferred or excluded core outcome.")
+            if not _evidence_satisfies_requirements(
+                evidence, required_by_id[outcome_id]["required_evidence"]
+            ):
+                raise EngineeringError(
+                    "Engineering outcome acceptance required evidence is not satisfied."
+                )
+            mapped = mappings_by_id[outcome_id]
+            required_evidence_ids = set(mapped["verification_ids"])
+            if mapped["equivalence"] is not None:
+                required_evidence_ids.add(mapped["equivalence"]["evidence_id"])
+            retained_evidence_ids = {item["evidence_id"] for item in evidence}
+            if not required_evidence_ids.issubset(retained_evidence_ids):
+                raise EngineeringError(
+                    "Engineering outcome acceptance does not retain mapped verification evidence."
+                )
+        normalized_outcomes.append(
+            {"outcome_id": outcome_id, "state": outcome["state"], "evidence": evidence}
+        )
+    outcome_ids = [item["outcome_id"] for item in normalized_outcomes]
+    if len(set(outcome_ids)) != len(outcome_ids):
+        raise EngineeringError("Engineering outcome acceptance outcomes are duplicated.")
+    evidence_digest = _outcome_evidence_matrix_digest(normalized_outcomes)
+    if value["evidence_digest"] != evidence_digest:
+        raise EngineeringError("Engineering outcome acceptance evidence matrix is mismatched.")
+    core_ids = {
+        item["id"] for item in intent["outcomes"] if item["criticality"] == "core"
+    }
+    missing_core = sorted(core_ids - set(outcome_ids))
+    if missing_core:
+        raise EngineeringError(
+            "Engineering outcome acceptance lacks core outcome states: "
+            + ", ".join(missing_core)
+        )
+    return {
+        "schema": OUTCOME_ACCEPTANCE_SCHEMA,
+        "acceptance_id": acceptance_id,
+        "completion_id": completion_id,
+        "completion_digest": completion_digest,
+        "artifact_digest": artifact_digest,
+        "owner_intent_id": intent["intent_id"],
+        "owner_intent_digest": intent["owner_intent_digest"],
+        "mapping_digest": compiled_survival["mapping_digest"],
+        "evidence_digest": evidence_digest,
+        "roles": normalized_roles,
+        "audit_attestation": audit_attestation,
+        "outcomes": sorted(normalized_outcomes, key=lambda item: item["outcome_id"]),
+    }
+
+
+def _outcome_acceptance_signature(key: bytes, record: dict) -> str:
+    material = {name: value for name, value in record.items() if name != "signature"}
+    return "hmac-sha256:" + hmac.new(key, _canonical_json(material), hashlib.sha256).hexdigest()
+
+
+def _load_outcome_acceptances(root: Path) -> dict:
+    path = _outcome_acceptance_path(root)
+    if not path.exists():
+        return {"schema": OUTCOME_ACCEPTANCE_LEDGER_SCHEMA, "acceptances": []}
+    _verify_owner_private(path, directory=False)
+    key = _controller_key(_project_controller_dir(root), required=True)
+    assert key is not None
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering outcome acceptance ledger is invalid.") from error
+    if (
+        not isinstance(ledger, dict)
+        or set(ledger) != {"schema", "acceptances"}
+        or ledger.get("schema") != OUTCOME_ACCEPTANCE_LEDGER_SCHEMA
+        or not isinstance(ledger.get("acceptances"), list)
+        or len(ledger["acceptances"]) > MAX_OUTCOME_ACCEPTANCES
+    ):
+        raise EngineeringError("Engineering outcome acceptance ledger is invalid.")
+    identities: set[str] = set()
+    for record in ledger["acceptances"]:
+        expected = {
+            "acceptance",
+            "acceptance_digest",
+            "recorded_at",
+            "signature",
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != expected
+            or not isinstance(record.get("acceptance"), dict)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(record.get("acceptance_digest", "")))
+            or record["acceptance_digest"] != _json_digest(record["acceptance"])
+            or not hmac.compare_digest(
+                str(record.get("signature", "")), _outcome_acceptance_signature(key, record)
+            )
+        ):
+            raise EngineeringError("Engineering outcome acceptance ledger is invalid.")
+        try:
+            acceptance_id = _assurance_id(
+                record["acceptance"].get("acceptance_id"), "retained outcome acceptance"
+            )
+            _assurance_timestamp(record["recorded_at"])
+        except EngineeringError as error:
+            raise EngineeringError("Engineering outcome acceptance ledger is invalid.") from error
+        if acceptance_id in identities:
+            raise EngineeringError("Engineering outcome acceptance ledger is ambiguous.")
+        identities.add(acceptance_id)
+    return ledger
+
+
+def _publish_outcome_acceptances(
+    root: Path, ledger: dict, new_key: bytes | None
+) -> None:
+    if (
+        len(ledger.get("acceptances", [])) > MAX_OUTCOME_ACCEPTANCES
+        or len(json.dumps(ledger).encode("utf-8")) > 1024 * 1024
+    ):
+        raise EngineeringError("Engineering outcome acceptance ledger exceeds its bounded size.")
+    controller = _project_controller_dir(root)
+    controller.mkdir(parents=True, exist_ok=True)
+    _enforce_owner_private(controller)
+    binary = (
+        [(_controller_key_path(controller), new_key.hex().encode("ascii") + b"\n")]
+        if new_key is not None
+        else None
+    )
+    _transactional_json_documents([(_outcome_acceptance_path(root), ledger)], binary)
+
+
+def record_outcome_acceptance(
+    root: Path, completion_id: str, value: object
+) -> dict:
+    """Retain independently audited evidence for one exact terminal artifact."""
+    project_root = resolve_project_root(str(root))
+    normalized = _outcome_acceptance(project_root, completion_id, value)
+    operation = _begin_authority_mutation(project_root, "outcome-accept")
+    try:
+        ledger = _load_outcome_acceptances(project_root)
+        digest = _json_digest(normalized)
+        for retained in ledger["acceptances"]:
+            prior = retained["acceptance"]
+            if prior["acceptance_id"] != normalized["acceptance_id"]:
+                continue
+            if retained["acceptance_digest"] != digest:
+                raise EngineeringError("Engineering outcome acceptance replay conflicts with retained state.")
+            return {**prior, "acceptance_digest": retained["acceptance_digest"]}
+        controller = _project_controller_dir(project_root)
+        key = _controller_key(controller, required=False)
+        new_key = os.urandom(32) if key is None else None
+        key = key or new_key
+        assert key is not None
+        record = {
+            "acceptance": normalized,
+            "acceptance_digest": digest,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        record["signature"] = _outcome_acceptance_signature(key, record)
+        ledger["acceptances"].append(record)
+        ledger["acceptances"].sort(
+            key=lambda item: item["acceptance"]["acceptance_id"]
+        )
+        _publish_outcome_acceptances(project_root, ledger, new_key)
+        return {**normalized, "acceptance_digest": digest}
+    finally:
+        _end_completion(project_root, operation)
+
+
+def _release_token_path(root: Path) -> Path:
+    path = _project_controller_dir(root) / "release-tokens.json"
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _release_token_signature(key: bytes, record: dict) -> str:
+    material = {name: value for name, value in record.items() if name != "signature"}
+    return "hmac-sha256:" + hmac.new(key, _canonical_json(material), hashlib.sha256).hexdigest()
+
+
+def _load_release_tokens(root: Path) -> dict:
+    path = _release_token_path(root)
+    if not path.exists():
+        return {"schema": RELEASE_TOKEN_LEDGER_SCHEMA, "tokens": []}
+    _verify_owner_private(path, directory=False)
+    key = _controller_key(_project_controller_dir(root), required=True)
+    assert key is not None
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering release token ledger is invalid.") from error
+    if (
+        not isinstance(ledger, dict)
+        or set(ledger) != {"schema", "tokens"}
+        or ledger.get("schema") != RELEASE_TOKEN_LEDGER_SCHEMA
+        or not isinstance(ledger.get("tokens"), list)
+        or len(ledger["tokens"]) > MAX_RELEASE_TOKENS
+    ):
+        raise EngineeringError("Engineering release token ledger is invalid.")
+    identities: set[str] = set()
+    for record in ledger["tokens"]:
+        expected = {"token", "issued_at", "signature"}
+        token = record.get("token") if isinstance(record, dict) else None
+        token_keys = {
+            "schema",
+            "token_id",
+            "completion_id",
+            "completion_digest",
+            "artifact_digest",
+            "owner_intent_id",
+            "owner_intent_digest",
+            "mapping_digest",
+            "evidence_digest",
+            "acceptance_id",
+            "acceptance_digest",
+            "actions",
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != expected
+            or not isinstance(token, dict)
+            or set(token) != token_keys
+            or token.get("schema") != RELEASE_TOKEN_SCHEMA
+            or not isinstance(token.get("actions"), list)
+            or token["actions"] != sorted(RELEASE_TOKEN_ACTIONS)
+            or any(
+                not re.fullmatch(r"sha256:[0-9a-f]{64}", str(token.get(name, "")))
+                for name in (
+                    "completion_digest",
+                    "artifact_digest",
+                    "owner_intent_digest",
+                    "mapping_digest",
+                    "evidence_digest",
+                    "acceptance_digest",
+                )
+            )
+            or not hmac.compare_digest(
+                str(record.get("signature", "")), _release_token_signature(key, record)
+            )
+        ):
+            raise EngineeringError("Engineering release token ledger is invalid.")
+        try:
+            token_id = _assurance_id(token.get("token_id"), "release token")
+            _assurance_id(token.get("completion_id"), "release completion")
+            _assurance_id(token.get("owner_intent_id"), "release owner intent")
+            _assurance_id(token.get("acceptance_id"), "release outcome acceptance")
+            _assurance_timestamp(record["issued_at"])
+        except EngineeringError as error:
+            raise EngineeringError("Engineering release token ledger is invalid.") from error
+        if token_id in identities:
+            raise EngineeringError("Engineering release token ledger is ambiguous.")
+        identities.add(token_id)
+    return ledger
+
+
+def _publish_release_tokens(root: Path, ledger: dict, new_key: bytes | None) -> None:
+    if (
+        len(ledger.get("tokens", [])) > MAX_RELEASE_TOKENS
+        or len(json.dumps(ledger).encode("utf-8")) > 1024 * 1024
+    ):
+        raise EngineeringError("Engineering release token ledger exceeds its bounded size.")
+    controller = _project_controller_dir(root)
+    controller.mkdir(parents=True, exist_ok=True)
+    _enforce_owner_private(controller)
+    binary = (
+        [(_controller_key_path(controller), new_key.hex().encode("ascii") + b"\n")]
+        if new_key is not None
+        else None
+    )
+    _transactional_json_documents([(_release_token_path(root), ledger)], binary)
+
+
+def _retained_outcome_acceptance(root: Path, acceptance_id: str) -> tuple[dict, str]:
+    acceptance_id = _assurance_id(acceptance_id, "outcome acceptance")
+    matches = [
+        record
+        for record in _load_outcome_acceptances(root)["acceptances"]
+        if record["acceptance"].get("acceptance_id") == acceptance_id
+    ]
+    if len(matches) != 1:
+        raise EngineeringError("Engineering outcome acceptance is unavailable.")
+    return matches[0]["acceptance"], matches[0]["acceptance_digest"]
+
+
+def _release_gate_acceptance(
+    root: Path, completion_id: str, acceptance_id: str
+) -> tuple[dict, dict, str]:
+    completion, completion_digest = _terminal_completion(root, completion_id)
+    artifact_digest = _completion_artifact_digest(completion, completion_digest)
+    acceptance, acceptance_digest = _retained_outcome_acceptance(root, acceptance_id)
+    if (
+        acceptance.get("completion_id") != completion_id
+        or acceptance.get("completion_digest") != completion_digest
+        or acceptance.get("artifact_digest") != artifact_digest
+    ):
+        raise EngineeringError("Engineering release gate exact artifact acceptance is mismatched.")
+    authorization = completion.get("authorization")
+    handoff = authorization.get("scope_handoff") if isinstance(authorization, dict) else None
+    survival = handoff.get("outcome_survival") if isinstance(handoff, dict) else None
+    if not isinstance(survival, dict) or survival.get("schema") != OUTCOME_SURVIVAL_V2_SCHEMA:
+        raise EngineeringError("Engineering release gate owner intent is unknown for this completion.")
+    intent = _active_owner_intent(
+        root, acceptance.get("owner_intent_id"), acceptance.get("owner_intent_digest")
+    )
+    if completion.get("owner_intent") != {
+        "intent_id": intent["intent_id"],
+        "owner_intent_digest": intent["owner_intent_digest"],
+        "authority_epoch": intent["authority_epoch"],
+    }:
+        raise EngineeringError("Engineering release gate completion owner intent is mismatched.")
+    compiled_survival = _outcome_survival_v2(
+        survival,
+        intent,
+        root=root,
+        allow_controller_baseline=True,
+    )
+    if acceptance.get("mapping_digest") != compiled_survival["mapping_digest"]:
+        raise EngineeringError("Engineering release gate outcome mapping is mismatched.")
+    if (
+        not re.fullmatch(r"sha256:[0-9a-f]{64}", str(acceptance.get("evidence_digest", "")))
+        or acceptance["evidence_digest"]
+        != _outcome_evidence_matrix_digest(acceptance.get("outcomes"))
+    ):
+        raise EngineeringError("Engineering release gate evidence matrix is mismatched.")
+    _verify_independent_outcome_audit(root, acceptance)
+    outcomes = acceptance.get("outcomes")
+    if not isinstance(outcomes, list):
+        raise EngineeringError("Engineering release gate acceptance is invalid.")
+    outcomes_by_id = {
+        item.get("outcome_id"): item for item in outcomes if isinstance(item, dict)
+    }
+    if len(outcomes_by_id) != len(outcomes):
+        raise EngineeringError("Engineering release gate acceptance is invalid.")
+    dispositions = {
+        item["outcome_id"]: item["disposition"]
+        for item in compiled_survival["mappings"]
+    }
+    for requirement in intent["outcomes"]:
+        if requirement["criticality"] != "core":
+            continue
+        outcome = outcomes_by_id.get(requirement["id"])
+        if (
+            not isinstance(outcome, dict)
+            or outcome.get("state") != "accepted"
+            or dispositions.get(requirement["id"]) not in {"INCLUDED", "REPLACED"}
+            or not isinstance(outcome.get("evidence"), list)
+            or not _evidence_satisfies_requirements(
+                outcome["evidence"], requirement["required_evidence"]
+            )
+        ):
+            raise EngineeringError(
+                "Engineering release gate core outcome is not independently accepted."
+            )
+    return acceptance, intent, acceptance_digest
+
+
+def release_gate(root: Path, completion_id: str, acceptance_id: str) -> dict:
+    """Issue an opaque exact-artifact token only after every core owner outcome passes."""
+    project_root = resolve_project_root(str(root))
+    acceptance, intent, acceptance_digest = _release_gate_acceptance(
+        project_root, completion_id, acceptance_id
+    )
+    token_seed = {
+        "completion_id": completion_id,
+        "completion_digest": acceptance["completion_digest"],
+        "artifact_digest": acceptance["artifact_digest"],
+        "owner_intent_digest": intent["owner_intent_digest"],
+        "mapping_digest": acceptance["mapping_digest"],
+        "evidence_digest": acceptance["evidence_digest"],
+        "acceptance_digest": acceptance_digest,
+    }
+    token_id = "release-token-" + hashlib.sha256(_canonical_json(token_seed)).hexdigest()[:32]
+    token = {
+        "schema": RELEASE_TOKEN_SCHEMA,
+        "token_id": token_id,
+        "completion_id": completion_id,
+        "completion_digest": acceptance["completion_digest"],
+        "artifact_digest": acceptance["artifact_digest"],
+        "owner_intent_id": intent["intent_id"],
+        "owner_intent_digest": intent["owner_intent_digest"],
+        "mapping_digest": acceptance["mapping_digest"],
+        "evidence_digest": acceptance["evidence_digest"],
+        "acceptance_id": acceptance["acceptance_id"],
+        "acceptance_digest": acceptance_digest,
+        "actions": sorted(RELEASE_TOKEN_ACTIONS),
+    }
+    operation = _begin_authority_mutation(project_root, "release-gate")
+    try:
+        ledger = _load_release_tokens(project_root)
+        matches = [
+            record for record in ledger["tokens"] if record["token"]["token_id"] == token_id
+        ]
+        if matches:
+            if len(matches) != 1 or matches[0]["token"] != token:
+                raise EngineeringError("Engineering release token replay conflicts with retained state.")
+            return dict(token)
+        controller = _project_controller_dir(project_root)
+        key = _controller_key(controller, required=False)
+        new_key = os.urandom(32) if key is None else None
+        key = key or new_key
+        assert key is not None
+        record = {"token": token, "issued_at": datetime.now(timezone.utc).isoformat()}
+        record["signature"] = _release_token_signature(key, record)
+        ledger["tokens"].append(record)
+        ledger["tokens"].sort(key=lambda item: item["token"]["token_id"])
+        _publish_release_tokens(project_root, ledger, new_key)
+        return dict(token)
+    finally:
+        _end_completion(project_root, operation)
+
+
+def verify_release_token(
+    root: Path, token_id: str, artifact_digest: str, action: str
+) -> dict:
+    """Check a token at a native merge/install/activation boundary; never perform it."""
+    project_root = resolve_project_root(str(root))
+    token_id = _assurance_id(token_id, "release token")
+    if (
+        not re.fullmatch(r"sha256:[0-9a-f]{64}", str(artifact_digest))
+        or action not in RELEASE_TOKEN_ACTIONS
+    ):
+        raise EngineeringError("Engineering release token verification is invalid.")
+    matches = [
+        record for record in _load_release_tokens(project_root)["tokens"]
+        if record["token"]["token_id"] == token_id
+    ]
+    if len(matches) != 1:
+        raise EngineeringError("Engineering release token is unavailable.")
+    token = matches[0]["token"]
+    if token["artifact_digest"] != artifact_digest or action not in token["actions"]:
+        raise EngineeringError("Engineering release token does not authorize this exact artifact action.")
+    _active_owner_intent(
+        project_root, token["owner_intent_id"], token["owner_intent_digest"]
+    )
+    return {
+        "schema": RELEASE_TOKEN_SCHEMA,
+        "token_id": token_id,
+        "artifact_digest": artifact_digest,
+        "action": action,
+        "acceptance_id": token["acceptance_id"],
+        "owner_intent_digest": token["owner_intent_digest"],
+        "native_approval_required": True,
+    }
 
 
 def persist_scoped_authority(root: Path, binding: object, approval: object) -> dict:
@@ -12763,7 +14510,30 @@ def _expand_install_path(value: Path | str) -> Path:
     return Path(expanded)
 
 
-def install_bundle(source: Path, home: Path) -> dict:
+def _release_token_required_for_install(manifest: object) -> bool:
+    """Require a v2.2.6+ token while preserving the v2.2.5 rollback path."""
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("version"), str):
+        raise EngineeringError("Engineering bundle manifest is invalid.")
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", manifest["version"])
+    if match is None:
+        raise EngineeringError("Engineering bundle manifest is invalid.")
+    return tuple(int(part) for part in match.groups()) >= (2, 2, 6)
+
+
+def install_bundle(
+    source: Path,
+    home: Path,
+    *,
+    release_token: object | None = None,
+    release_artifact_digest: str | None = None,
+) -> dict:
+    """Install a bundle only after the required exact-artifact gate preflight.
+
+    The caller retains responsibility for a separate native install approval.
+    A v2.2.6+ bundle requires the token/root/artifact trio. The historical
+    v2.2.5 path remains readable and rollback-safe but cannot gain a v2.2.6
+    token retrospectively.
+    """
     source = _expand_install_path(source)
     home = _expand_install_path(home)
     if not home.is_absolute() and not os.path.isabs(os.path.expanduser(os.fspath(home))):
@@ -12771,6 +14541,30 @@ def install_bundle(source: Path, home: Path) -> dict:
     if str(home).startswith("\\\\"):
         raise EngineeringError("Engineering installation on UNC paths is unsupported.")
     files, manifest, commit, source_digest = _bundle_files(source)
+    if (release_token is None) != (release_artifact_digest is None):
+        raise EngineeringError(
+            "Engineering install release gate requires both token and exact artifact digest."
+        )
+    if _release_token_required_for_install(manifest) and release_token is None:
+        raise EngineeringError(
+            "Engineering v2.2.6+ installation requires an exact release token preflight."
+        )
+    release_gate = None
+    if release_token is not None:
+        if not isinstance(release_token, dict) or set(release_token) != {
+            "root",
+            "token_id",
+        }:
+            raise EngineeringError("Engineering install release gate reference is invalid.")
+        gate_root = _expand_install_path(release_token["root"])
+        if not gate_root.is_absolute() or not isinstance(release_token["token_id"], str):
+            raise EngineeringError("Engineering install release gate reference is invalid.")
+        release_gate = verify_release_token(
+            gate_root,
+            release_token["token_id"],
+            release_artifact_digest,
+            "install",
+        )
     paths = _install_paths(home)
     _validate_install_paths(home, paths)
     home = home.resolve()
@@ -12797,7 +14591,10 @@ def install_bundle(source: Path, home: Path) -> dict:
                 and _valid_forwarder(paths["shim"], "engineering-traceability")
                 and _valid_command_launchers(paths["command"])
             ):
-                return current
+                return {
+                    **current,
+                    **({"release_gate": release_gate} if release_gate is not None else {}),
+                }
         elif any(paths[key].exists() for key in ("canonical", "previous", "previous_receipt")):
             raise EngineeringError("Engineering install state is incomplete.")
         for path in stages.values():
@@ -12844,7 +14641,10 @@ def install_bundle(source: Path, home: Path) -> dict:
                 else None
             ),
         )
-        return receipt
+        return {
+            **receipt,
+            **({"release_gate": release_gate} if release_gate is not None else {}),
+        }
     finally:
         for path in stages.values():
             _remove_install_path(path)
@@ -13642,6 +15442,29 @@ def main() -> int:
     approve_scope_parser.add_argument("root")
     approve_scope_parser.add_argument("--decision-id", required=True)
     approve_scope_parser.add_argument("--handoff-file", required=True)
+    approve_scope_parser.add_argument("--owner-intent-id")
+    intent_bind_parser = commands.add_parser("intent-bind")
+    intent_bind_parser.add_argument("root")
+    intent_bind_parser.add_argument("--binding-file", required=True)
+    intent_bind_parser.add_argument("--approval-file", required=True)
+    intent_status_parser = commands.add_parser("intent-status")
+    intent_status_parser.add_argument("root")
+    intent_status_parser.add_argument("--authority-id")
+    outcome_accept_parser = commands.add_parser("outcome-accept")
+    outcome_accept_parser.add_argument("root")
+    outcome_accept_parser.add_argument("completion_id")
+    outcome_accept_parser.add_argument("--input-file", required=True)
+    release_gate_parser = commands.add_parser("release-gate")
+    release_gate_parser.add_argument("root")
+    release_gate_parser.add_argument("completion_id")
+    release_gate_parser.add_argument("--acceptance-id", required=True)
+    verify_release_token_parser = commands.add_parser("verify-release-token")
+    verify_release_token_parser.add_argument("root")
+    verify_release_token_parser.add_argument("token_id")
+    verify_release_token_parser.add_argument("artifact_digest")
+    verify_release_token_parser.add_argument(
+        "--action", choices=sorted(RELEASE_TOKEN_ACTIONS), required=True
+    )
     assurance_parser = commands.add_parser("assurance-status")
     assurance_parser.add_argument("root")
     assurance_parser.add_argument("capability_id")
@@ -13838,7 +15661,58 @@ def main() -> int:
                 handoff = json.loads(source)
             except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
                 raise EngineeringError("Engineering scope handoff JSON is invalid.") from error
-            result = approve_scope_handoff(root, arguments.decision_id, handoff)
+            result = approve_scope_handoff(
+                root,
+                arguments.decision_id,
+                handoff,
+                owner_intent_id=arguments.owner_intent_id,
+            )
+        elif arguments.command == "intent-bind":
+            try:
+                binding_source = (
+                    sys.stdin.read()
+                    if arguments.binding_file == "-"
+                    else Path(arguments.binding_file).read_text(encoding="utf-8")
+                )
+                approval_source = (
+                    sys.stdin.read()
+                    if arguments.approval_file == "-"
+                    else Path(arguments.approval_file).read_text(encoding="utf-8")
+                )
+                if (
+                    len(binding_source.encode("utf-8")) > 64 * 1024
+                    or len(approval_source.encode("utf-8")) > 64 * 1024
+                ):
+                    raise ValueError
+                binding = json.loads(binding_source)
+                approval = json.loads(approval_source)
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+                raise EngineeringError("Engineering owner intent input is invalid.") from error
+            result = bind_owner_intent(root, binding, approval)
+        elif arguments.command == "intent-status":
+            result = owner_intent_status(root, arguments.authority_id)
+        elif arguments.command == "outcome-accept":
+            try:
+                source = (
+                    sys.stdin.read()
+                    if arguments.input_file == "-"
+                    else Path(arguments.input_file).read_text(encoding="utf-8")
+                )
+                if len(source.encode("utf-8")) > 64 * 1024:
+                    raise ValueError
+                acceptance = json.loads(source)
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+                raise EngineeringError("Engineering outcome acceptance input is invalid.") from error
+            result = record_outcome_acceptance(root, arguments.completion_id, acceptance)
+        elif arguments.command == "release-gate":
+            result = release_gate(root, arguments.completion_id, arguments.acceptance_id)
+        elif arguments.command == "verify-release-token":
+            result = verify_release_token(
+                root,
+                arguments.token_id,
+                arguments.artifact_digest,
+                arguments.action,
+            )
         elif arguments.command == "assurance-status":
             result = assurance_status(root, arguments.capability_id, arguments.cell_id, arguments.as_of)
         elif arguments.command == "complete":
