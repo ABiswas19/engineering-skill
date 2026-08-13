@@ -3815,6 +3815,7 @@ def cleanup_hook_operation(
     operation_id: str,
     *,
     timeout_seconds: float,
+    allow_replaced_completion_lock: bool = False,
 ) -> dict:
     started = time.monotonic()
     deadline = started + max(0.0, timeout_seconds)
@@ -3890,19 +3891,26 @@ def cleanup_hook_operation(
     if paths is None:
         return invalid_boundary()
     owner = _lock_owner({**record, **{key: str(value) for key, value in paths.items()}})
+    replaced_completion_lock = False
     if owner is not None:
         if (
             owner.get("operation_id") != operation_id
             or owner.get("lock_token") != record.get("lock_token")
         ):
-            return _orphan_cleanup_result(
-                project_root,
-                operation_id,
-                record,
-                "repository_lock_owner_mismatch",
-                started,
-            )
-        owner_state = _owner_process_state(owner)
+            if not (
+                allow_replaced_completion_lock
+                and record.get("controller_owned_completion") is True
+                and not isinstance(record.get("worker_pid"), int)
+            ):
+                return _orphan_cleanup_result(
+                    project_root,
+                    operation_id,
+                    record,
+                    "repository_lock_owner_mismatch",
+                    started,
+                )
+            replaced_completion_lock = True
+        owner_state = _owner_process_state(owner) if not replaced_completion_lock else "dead"
         if owner_state != "dead":
             return _orphan_cleanup_result(
                 project_root,
@@ -3957,13 +3965,19 @@ def cleanup_hook_operation(
             owner.get("operation_id") != operation_id
             or owner.get("lock_token") != record.get("lock_token")
         ):
-            return _orphan_cleanup_result(
-                project_root,
-                operation_id,
-                record,
-                "repository_lock_owner_mismatch",
-                started,
-            )
+            if not (
+                allow_replaced_completion_lock
+                and record.get("kind") == "completion"
+                and not isinstance(record.get("worker_pid"), int)
+            ):
+                return _orphan_cleanup_result(
+                    project_root,
+                    operation_id,
+                    record,
+                    "repository_lock_owner_mismatch",
+                    started,
+                )
+            replaced_completion_lock = True
     if time.monotonic() >= deadline:
         return _orphan_cleanup_result(
             project_root, operation_id, record, "cleanup_timeout", started
@@ -3982,17 +3996,35 @@ def cleanup_hook_operation(
         if paths is None:
             return invalid_boundary()
         lock = paths["repository_lock_path"]
-        if lock.exists():
+        if lock.exists() and not replaced_completion_lock:
             owner_path = lock / "owner.json"
             if owner_path.exists():
                 paths = trusted_paths()
                 if paths is None:
                     return invalid_boundary()
-                (paths["repository_lock_path"] / "owner.json").unlink()
+                current_owner = _lock_owner(
+                    {**record, **{key: str(value) for key, value in paths.items()}}
+                )
+                if current_owner is not None and (
+                    current_owner.get("operation_id") == operation_id
+                    and current_owner.get("lock_token") == record.get("lock_token")
+                ):
+                    (paths["repository_lock_path"] / "owner.json").unlink()
+                elif allow_replaced_completion_lock and record.get("controller_owned_completion") is True:
+                    replaced_completion_lock = True
+                else:
+                    return _orphan_cleanup_result(
+                        project_root,
+                        operation_id,
+                        record,
+                        "repository_lock_owner_mismatch",
+                        started,
+                    )
             paths = trusted_paths()
             if paths is None:
                 return invalid_boundary()
-            paths["repository_lock_path"].rmdir()
+            if not replaced_completion_lock and paths["repository_lock_path"].exists():
+                paths["repository_lock_path"].rmdir()
         paths = trusted_paths()
         if paths is None:
             return invalid_boundary()
@@ -7865,14 +7897,23 @@ def _begin_completion(root: Path, run_id: str) -> dict:
 
 def _end_completion(root: Path, record: dict) -> None:
     current = _read_operation(root, record["operation_id"])
-    current.update(phase="orphaned", worker_process_tree_dead=True)
+    current.update(
+        phase="orphaned",
+        worker_process_tree_dead=True,
+        controller_owned_completion=True,
+    )
     _write_operation(current)
     # Completion/maintenance operations are owned by this controller process.
     # Release that exact lock before the orphan cleanup guard checks for live
     # owners; worker-operation cleanup must still refuse any live owner.
     if not _release_failed_start_lock(current):
         raise EngineeringError("Engineering completion lock ownership is ambiguous.")
-    result = cleanup_hook_operation(root, current["operation_id"], timeout_seconds=30)
+    result = cleanup_hook_operation(
+        root,
+        current["operation_id"],
+        timeout_seconds=30,
+        allow_replaced_completion_lock=True,
+    )
     if not result["completed"]:
         raise EngineeringError(f"Engineering completion cleanup failed: {result['reason']}")
 
