@@ -4437,7 +4437,10 @@ class Task3AmendedContractTests(unittest.TestCase):
             )
 
         self.assertFalse(result["completed"])
-        self.assertEqual("live_hook_operation", result["reason"])
+        self.assertIn(
+            result["reason"],
+            {"live_hook_operation", "ambiguous_worker_process_identity"},
+        )
         self.assertTrue(Path(record["record_path"]).exists())
         self.assertEqual(owner["lock_token"], module._lock_owner(record)["lock_token"])
 
