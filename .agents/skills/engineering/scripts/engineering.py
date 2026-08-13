@@ -3216,34 +3216,6 @@ def _process_tree_status(record: dict) -> dict:
 def _process_identity(pid: int) -> dict | None:
     if not isinstance(pid, int) or pid <= 0:
         return None
-
-
-def _release_failed_start_lock(record: dict) -> bool:
-    """Release only the exact lock acquired by this controller before Popen failed."""
-    lock = Path(record["repository_lock_path"])
-    owner_path = lock / "owner.json"
-    try:
-        owner = json.loads(owner_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    current_identity = _process_identity(os.getpid())
-    identity_matches = owner.get("owner_identity") == record.get("owner_identity")
-    if current_identity is not None:
-        identity_matches = identity_matches and owner.get("owner_identity") == current_identity
-    if (
-        owner.get("operation_id") != record.get("operation_id")
-        or owner.get("lock_token") != record.get("lock_token")
-        or owner.get("owner_pid") != os.getpid()
-        or not identity_matches
-    ):
-        return False
-    try:
-        _reject_reparse_ancestors(lock)
-        owner_path.unlink()
-        lock.rmdir()
-    except OSError:
-        return False
-    return True
     if os.name == "nt":
         import ctypes
 
@@ -3285,6 +3257,32 @@ def _release_failed_start_lock(record: dict) -> bool:
         return None
 
 
+def _release_failed_start_lock(record: dict) -> bool:
+    """Release only the exact lock acquired by this controller before Popen failed."""
+    lock = Path(record["repository_lock_path"])
+    owner_path = lock / "owner.json"
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    current_identity = _process_identity(os.getpid())
+    identity_matches = owner.get("owner_identity") == record.get("owner_identity")
+    if current_identity is not None:
+        identity_matches = identity_matches and owner.get("owner_identity") == current_identity
+    if (
+        owner.get("operation_id") != record.get("operation_id")
+        or owner.get("lock_token") != record.get("lock_token")
+        or owner.get("owner_pid") != os.getpid()
+        or not identity_matches
+    ):
+        return False
+    try:
+        _reject_reparse_ancestors(lock)
+        owner_path.unlink()
+        lock.rmdir()
+    except OSError:
+        return False
+    return True
 def _windows_process_entries() -> list[dict] | None:
     """Enumerate Windows processes and parent IDs without a shell command."""
     if os.name != "nt":
