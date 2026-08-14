@@ -34,8 +34,8 @@ native install approval. Reject narrow handoffs and proxy-only results.
 Model selection stays native; delivery records requested, actual, and fallback
 facts. Research separates facts, assumptions, citations, and Unknowns.
 
-Completion runs automatically before claiming non-trivial work ready; controller
-commands are diagnostic and CI interfaces.
+Engineering completion runs automatically before claiming non-trivial work is ready;
+controller commands are diagnostics and CI interfaces.
 Use `engineering map`; see `references/controller-contract.md` for protocols.
 
 ## Graph and context
