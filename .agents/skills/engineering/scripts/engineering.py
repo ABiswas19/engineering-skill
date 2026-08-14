@@ -53,16 +53,26 @@ AUTHORITY_AUDIT_SCHEMA = "engineering.authority-audit.v1"
 OWNER_INTENT_SCHEMA = "engineering.owner-intent.v1"
 OWNER_INTENT_LEDGER_SCHEMA = "engineering.owner-intents.v1"
 OWNER_INTENT_STATUS_SCHEMA = "engineering.owner-intent-status.v1"
-HOST_TRUST_ANCHOR_SCHEMA = "engineering.host-trust-anchor.v1"
+LEGACY_HOST_TRUST_ANCHOR_SCHEMA = "engineering.host-trust-anchor.v1"
+HOST_TRUST_ANCHOR_SCHEMA = "engineering.host-trust-anchor.v2"
+HOST_RECEIPT_SCHEMA = "engineering.host-receipt.v1"
+HOST_AUTHORITY_APPROVAL_SCHEMA = "engineering.host-authority-approval.v3"
+HOST_OWNER_INTENT_APPROVAL_SCHEMA = "engineering.host-owner-intent-approval.v3"
+TRACEABILITY_HOST_ATTESTATION_SCHEMA = "engineering.traceability-host-attestation.v3"
 OUTCOME_SURVIVAL_V2_SCHEMA = "engineering.outcome-survival.v2"
 OUTCOME_EQUIVALENCE_SCHEMA = "engineering.outcome-equivalence.v2"
-OWNER_EXCEPTION_SCHEMA = "engineering.host-owner-exception.v2"
+OWNER_EXCEPTION_SCHEMA = "engineering.host-owner-exception.v3"
+OUTCOME_EQUIVALENCE_ATTESTATION_SCHEMA = "engineering.outcome-equivalence-attestation.v2"
 OUTCOME_ACCEPTANCE_SCHEMA = "engineering.outcome-acceptance.v1"
 OUTCOME_ACCEPTANCE_LEDGER_SCHEMA = "engineering.outcome-acceptances.v1"
-INDEPENDENT_OUTCOME_AUDIT_SCHEMA = "engineering.independent-outcome-audit.v2"
+INDEPENDENT_OUTCOME_AUDIT_SCHEMA = "engineering.independent-outcome-audit.v3"
+OWNER_INTENT_IMPORT_SCHEMA = "engineering.owner-intent-import.v1"
+OWNER_INTENT_IMPORT_LEDGER_SCHEMA = "engineering.owner-intent-imports.v1"
+POST_ACTIVATION_IMPORT_SCOPES = {"accepted_owner_outcomes", "product_releases"}
 LEGACY_RELEASE_TOKEN_SCHEMA = "engineering.release-token.v1"
 RELEASE_TOKEN_SCHEMA = "engineering.release-token.v2"
 RELEASE_TOKEN_LEDGER_SCHEMA = "engineering.release-tokens.v1"
+V226_BOOTSTRAP_AUTHORIZATION_SCHEMA = "engineering.v2.2.6-bootstrap-authorization.v1"
 NATIVE_APPROVAL_REQUIREMENTS = {"connector", "credential", "destructive", "system"}
 MAX_SCOPED_AUTHORITIES = 256
 MAX_AUTHORITY_AUDITS = 512
@@ -341,39 +351,32 @@ def _identity_git(root: Path, *arguments: str) -> str:
     )
 
 
-def _identity_git_bytes(root: Path, *arguments: str) -> bytes:
-    """Read an exact Git object with hostile Git environment variables removed."""
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("GIT_")
-    }
-    environment.update(
-        {
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_SYSTEM": os.devnull,
-        }
-    )
-    try:
-        result = subprocess.run(
-            ["git", "--no-replace-objects", "-C", str(root), *arguments],
-            capture_output=True,
-            shell=False,
-            timeout=15,
-            env=environment,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise EngineeringError("Engineering canonical host trust is unavailable.") from error
-    if result.returncode != 0:
-        raise EngineeringError("Engineering canonical host trust is unavailable.")
-    return result.stdout
-
-
 def _host_trust_anchor(value: object) -> dict:
-    """Validate the immutable remote/default-branch signer receipt shape."""
-    expected = {
+    """Validate a current host-owned anchor or a readable legacy anchor."""
+    if not isinstance(value, dict):
+        raise EngineeringError("Engineering host trust anchor is invalid.")
+    if value.get("schema") == HOST_TRUST_ANCHOR_SCHEMA:
+        expected = {"schema", "anchor_id", "format_version", "signers_digest", "identity"}
+        if (
+            set(value) != expected
+            or not isinstance(value.get("format_version"), int)
+            or value["format_version"] != 1
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("signers_digest", "")))
+            or value.get("identity") != {"state": "unknown"}
+        ):
+            raise EngineeringError("Engineering host trust anchor is invalid.")
+        try:
+            anchor_id = _assurance_id(value.get("anchor_id"), "host trust anchor")
+        except EngineeringError as error:
+            raise EngineeringError("Engineering host trust anchor is invalid.") from error
+        return {
+            "schema": HOST_TRUST_ANCHOR_SCHEMA,
+            "anchor_id": anchor_id,
+            "format_version": 1,
+            "signers_digest": value["signers_digest"],
+            "identity": {"state": "unknown"},
+        }
+    legacy_expected = {
         "schema",
         "remote_url_digest",
         "default_ref",
@@ -382,11 +385,10 @@ def _host_trust_anchor(value: object) -> dict:
         "signers_blob",
         "signers_digest",
     }
-    if not isinstance(value, dict) or set(value) != expected:
-        raise EngineeringError("Engineering canonical host trust is invalid.")
     default_ref = value.get("default_ref")
     if (
-        value.get("schema") != HOST_TRUST_ANCHOR_SCHEMA
+        set(value) != legacy_expected
+        or value.get("schema") != LEGACY_HOST_TRUST_ANCHOR_SCHEMA
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("remote_url_digest", "")))
         or not isinstance(default_ref, str)
         or not default_ref.startswith("refs/heads/")
@@ -400,83 +402,97 @@ def _host_trust_anchor(value: object) -> dict:
         )
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("signers_digest", "")))
     ):
-        raise EngineeringError("Engineering canonical host trust is invalid.")
+        raise EngineeringError("Engineering host trust anchor is invalid.")
     return dict(value)
 
 
-def _canonical_host_trust_anchor(root: Path) -> tuple[dict, bytes]:
-    """Read the exact signer blob from the live canonical remote default branch."""
+def _host_authority_dir() -> Path:
+    path = _engineering_user_home() / ".agents" / "engineering" / "host-authority"
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _host_owned_trust_anchor(root: Path | None = None) -> tuple[dict, bytes]:
+    """Read the host-owned post-activation trust material outside candidate Git."""
+    directory = _host_authority_dir()
+    anchor_path = directory / "host-trust-anchor.json"
+    signers_path = directory / "allowed-signers"
     try:
-        remote_url = _identity_git(root, "remote", "get-url", "origin")
-        symref_output = _identity_git(root, "ls-remote", "--symref", "origin", "HEAD")
-    except (EngineeringError, OSError, subprocess.TimeoutExpired) as error:
-        raise EngineeringError("Engineering canonical host trust is unavailable.") from error
-    if not remote_url or len(remote_url) > 4096 or "\x00" in remote_url:
-        raise EngineeringError("Engineering canonical host trust is invalid.")
-    default_refs = []
-    advertised_heads = []
-    for line in symref_output.splitlines():
-        fields = line.split()
-        if len(fields) == 3 and fields[0] == "ref:" and fields[2] == "HEAD":
-            default_refs.append(fields[1])
-        elif len(fields) == 2 and fields[1] == "HEAD":
-            advertised_heads.append(fields[0])
-    if len(default_refs) != 1 or len(advertised_heads) != 1:
-        raise EngineeringError("Engineering canonical host trust is invalid.")
-    default_ref = default_refs[0]
+        _reject_reparse_ancestors(directory)
+        _reject_reparse_ancestors(anchor_path, directory)
+        _reject_reparse_ancestors(signers_path, directory)
+        _verify_owner_private(directory, directory=True)
+        _verify_owner_private(anchor_path, directory=False)
+        _verify_owner_private(signers_path, directory=False)
+        anchor = _host_trust_anchor(json.loads(anchor_path.read_text(encoding="utf-8")))
+        allowed = signers_path.read_bytes()
+    except (OSError, json.JSONDecodeError, EngineeringError) as error:
+        raise EngineeringError("Engineering host-owned trust is unavailable.") from error
     if (
-        not default_ref.startswith("refs/heads/")
-        or not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*", default_ref)
-        or ".." in default_ref
-        or "//" in default_ref
-        or "@{" in default_ref
-    ):
-        raise EngineeringError("Engineering canonical host trust is invalid.")
-    remote_commit = advertised_heads[0]
-    if not re.fullmatch(r"[0-9a-f]{40}", remote_commit):
-        raise EngineeringError("Engineering canonical host trust is invalid.")
-    try:
-        head_output = _identity_git(root, "ls-remote", "--heads", "origin", default_ref)
-        head_rows = [line.split() for line in head_output.splitlines() if line.strip()]
-        local_ref = "refs/remotes/origin/" + default_ref.removeprefix("refs/heads/")
-        local_commit = _identity_git(root, "rev-parse", "--verify", f"{local_ref}^{{commit}}")
-        candidate_commit = _identity_git(root, "rev-parse", "HEAD^{commit}")
-        anchor_tree = _identity_git(root, "rev-parse", f"{remote_commit}^{{tree}}")
-        signer_blob = _identity_git(
-            root, "rev-parse", f"{remote_commit}:.engineering-host-approvers"
-        )
-        allowed = _identity_git_bytes(
-            root, "show", f"{remote_commit}:.engineering-host-approvers"
-        )
-        common = _identity_git(root, "merge-base", remote_commit, candidate_commit)
-    except (EngineeringError, OSError, subprocess.TimeoutExpired) as error:
-        raise EngineeringError("Engineering canonical host trust is unavailable.") from error
-    if (
-        len(head_rows) != 1
-        or len(head_rows[0]) != 2
-        or head_rows[0][0] != remote_commit
-        or head_rows[0][1] != default_ref
-        or local_commit != remote_commit
-        or common != remote_commit
-        or not re.fullmatch(r"[0-9a-f]{40}", anchor_tree)
-        or not re.fullmatch(r"[0-9a-f]{40}", signer_blob)
+        anchor.get("schema") != HOST_TRUST_ANCHOR_SCHEMA
         or not allowed
         or len(allowed) > 65536
         or b"\x00" in allowed
+        or anchor["signers_digest"]
+        != "sha256:" + hashlib.sha256(allowed).hexdigest()
     ):
-        raise EngineeringError("Engineering canonical host trust is mismatched.")
-    return _host_trust_anchor({
-        "schema": HOST_TRUST_ANCHOR_SCHEMA,
-        "remote_url_digest": "sha256:" + hashlib.sha256(remote_url.encode("utf-8")).hexdigest(),
-        "default_ref": default_ref,
-        "commit": remote_commit,
-        "tree": anchor_tree,
-        "signers_blob": signer_blob,
-        "signers_digest": "sha256:" + hashlib.sha256(allowed).hexdigest(),
-    }), allowed
+        raise EngineeringError("Engineering host-owned trust is invalid.")
+    if root is not None:
+        try:
+            project_root = resolve_project_root(str(root))
+            if directory.resolve().is_relative_to(project_root.resolve()):
+                raise EngineeringError("Engineering host-owned trust is inside candidate Git.")
+        except (OSError, ValueError) as error:
+            raise EngineeringError("Engineering host-owned trust is unavailable.") from error
+    return anchor, allowed
 
 
-def _verify_external_host_signature(
+def _host_receipt(
+    root: Path,
+    value: object,
+    *,
+    anchor: dict,
+    authority_epoch: str | None,
+    contract: str,
+) -> dict:
+    expected = {
+        "schema",
+        "receipt_id",
+        "repository_id",
+        "authority_epoch",
+        "contract",
+        "identity",
+        "trust_anchor",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != HOST_RECEIPT_SCHEMA
+        or value.get("repository_id") != _project_contribution_digest(root)
+        or value.get("contract") != contract
+        or value.get("trust_anchor") != anchor
+        or value.get("identity") != {"state": "unknown"}
+    ):
+        raise EngineeringError("Engineering host receipt repository or contract is mismatched.")
+    try:
+        receipt_id = _assurance_id(value.get("receipt_id"), "host receipt")
+        receipt_epoch = _assurance_id(value.get("authority_epoch"), "host receipt epoch")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering host receipt is invalid.") from error
+    if authority_epoch is not None and receipt_epoch != authority_epoch:
+        raise EngineeringError("Engineering host receipt authority epoch is mismatched.")
+    return {
+        "schema": HOST_RECEIPT_SCHEMA,
+        "receipt_id": receipt_id,
+        "repository_id": value["repository_id"],
+        "authority_epoch": receipt_epoch,
+        "contract": contract,
+        "identity": {"state": "unknown"},
+        "trust_anchor": anchor,
+    }
+
+
+def _verify_host_owned_signature(
     root: Path,
     approval: object,
     *,
@@ -486,17 +502,18 @@ def _verify_external_host_signature(
     namespace: str,
     label: str,
     reference_prefix: str,
+    contract: str,
+    authority_epoch: str | None,
     required_principal: str | None = None,
 ) -> tuple[str, dict]:
-    """Verify a new external approval against a canonical, non-candidate anchor."""
-    anchor, allowed = _canonical_host_trust_anchor(root)
-    expected = {"schema", "approver", "claims", "trust_anchor", "signature"}
+    """Verify a new approval against the host-owned post-activation boundary."""
+    anchor, allowed = _host_owned_trust_anchor(root)
+    expected = {"schema", "approver", "claims", "host_receipt", "signature"}
     if (
         not isinstance(approval, dict)
         or set(approval) != expected
         or approval.get("schema") != approval_schema
         or approval.get("claims") != claims
-        or approval.get("trust_anchor") != anchor
         or not isinstance(approval.get("signature"), str)
         or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
         or len(approval["signature"]) > 16384
@@ -508,8 +525,15 @@ def _verify_external_host_signature(
         raise EngineeringError(f"{label} is invalid.") from error
     if required_principal is not None and approver != required_principal:
         raise EngineeringError(f"{label} principal is not the declared independent reviewer.")
+    receipt = _host_receipt(
+        root,
+        approval.get("host_receipt"),
+        anchor=anchor,
+        authority_epoch=authority_epoch,
+        contract=contract,
+    )
     material = _canonical_json(
-        {"schema": claims_schema, "claims": claims, "trust_anchor": anchor}
+        {"schema": claims_schema, "claims": claims, "host_receipt": receipt}
     )
     with tempfile.TemporaryDirectory(prefix="engineering-external-host-") as temporary:
         allowed_path = Path(temporary) / "allowed_signers"
@@ -541,7 +565,7 @@ def _verify_external_host_signature(
     if verified.returncode != 0:
         raise EngineeringError(f"{label} signature is invalid.")
     reference = reference_prefix + hashlib.sha256(
-        _canonical_json({"approval": approval, "trust_anchor": anchor})
+        _canonical_json({"approval": approval, "host_receipt": receipt})
     ).hexdigest()[:32]
     return reference, anchor
 
@@ -6299,7 +6323,10 @@ def _active_owner_intent(
     if not active:
         raise EngineeringError("Engineering owner intent is unknown.")
     record = active[0]
-    if "approval_trust_anchor" not in record:
+    if (
+        "approval_trust_anchor" not in record
+        or record["approval_trust_anchor"].get("schema") != HOST_TRUST_ANCHOR_SCHEMA
+    ):
         raise EngineeringError("Engineering owner intent is historical and cannot govern new release work.")
     if intent_id is not None and record["intent_id"] != intent_id:
         raise EngineeringError("Engineering owner intent is not active for this scope.")
@@ -6320,7 +6347,7 @@ def _verify_host_owner_exception(
 ) -> dict:
     """Verify the narrow owner exception required to defer or exclude one outcome."""
     if not isinstance(value, dict) or set(value) != {
-        "schema", "approver", "claims", "trust_anchor", "signature"
+        "schema", "approver", "claims", "host_receipt", "signature"
     }:
         raise EngineeringError("Engineering owner exception is invalid.")
     raw_claims = value.get("claims")
@@ -6353,26 +6380,28 @@ def _verify_host_owner_exception(
         or disposition not in {"DEFERRED", "EXCLUDED"}
     ):
         raise EngineeringError("Engineering owner exception is invalid.")
-    _, anchor = _verify_external_host_signature(
+    _verify_host_owned_signature(
         root,
         value,
         approval_schema=OWNER_EXCEPTION_SCHEMA,
-        claims_schema="engineering.host-owner-exception-claims.v2",
+        claims_schema="engineering.host-owner-exception-claims.v3",
         claims=claims,
         namespace="engineering-owner-exception",
         label="Engineering owner exception",
         reference_prefix="owner-exception-",
+        contract=OWNER_EXCEPTION_SCHEMA,
+        authority_epoch=owner_intent["authority_epoch"],
     )
     return {
         "schema": OWNER_EXCEPTION_SCHEMA,
         "approver": value["approver"],
         "claims": claims,
-        "trust_anchor": anchor,
+        "host_receipt": value["host_receipt"],
         "signature": value["signature"],
     }
 
 
-def _outcome_equivalence(root: Path, value: object) -> dict:
+def _outcome_equivalence(root: Path, owner_intent: dict, value: object) -> dict:
     """Require an externally attested, role-bound replacement equivalence claim."""
     expected = {
         "schema",
@@ -6425,24 +6454,26 @@ def _outcome_equivalence(root: Path, value: object) -> dict:
             "evidence_digest",
         )
     }
-    _, anchor = _verify_external_host_signature(
+    _verify_host_owned_signature(
         root,
         value["equivalence_attestation"],
-        approval_schema="engineering.outcome-equivalence-attestation.v1",
-        claims_schema="engineering.outcome-equivalence-claims.v1",
+        approval_schema=OUTCOME_EQUIVALENCE_ATTESTATION_SCHEMA,
+        claims_schema="engineering.outcome-equivalence-claims.v2",
         claims=claims,
         namespace="engineering-outcome-equivalence",
         label="Engineering outcome equivalence attestation",
         reference_prefix="outcome-equivalence-",
+        contract=OUTCOME_EQUIVALENCE_SCHEMA,
+        authority_epoch=owner_intent["authority_epoch"],
         required_principal=normalized["reviewer_id"],
     )
     return {
         **normalized,
         "equivalence_attestation": {
-            "schema": "engineering.outcome-equivalence-attestation.v1",
+            "schema": OUTCOME_EQUIVALENCE_ATTESTATION_SCHEMA,
             "approver": normalized["reviewer_id"],
             "claims": claims,
-            "trust_anchor": anchor,
+            "host_receipt": value["equivalence_attestation"]["host_receipt"],
             "signature": value["equivalence_attestation"]["signature"],
         },
     }
@@ -6565,7 +6596,7 @@ def _outcome_survival_v2(
                 raise EngineeringError(
                     "Engineering REPLACED outcome requires an externally attested equivalence root."
                 )
-            normalized_equivalence = _outcome_equivalence(root, equivalence)
+            normalized_equivalence = _outcome_equivalence(root, owner_intent, equivalence)
             normalized_exception = None
         else:
             if lists["replacement_ids"] or equivalence is not None or owner_exception is None:
@@ -10383,16 +10414,18 @@ def _traceability_host_claims(receipt: dict) -> dict:
 
 
 def _verify_traceability_host_attestation(root: Path, receipt: dict, approval: object) -> str:
-    """Verify a new host attestation against the canonical remote trust anchor."""
-    reference, _ = _verify_external_host_signature(
+    """Verify a new host attestation against the host-owned trust boundary."""
+    reference, _ = _verify_host_owned_signature(
         root,
         approval,
-        approval_schema="engineering.traceability-host-attestation.v2",
-        claims_schema="engineering.traceability-host-claims.v2",
+        approval_schema=TRACEABILITY_HOST_ATTESTATION_SCHEMA,
+        claims_schema="engineering.traceability-host-claims.v3",
         claims=_traceability_host_claims(receipt),
         namespace="engineering-traceability",
         label="Engineering traceability host attestation",
         reference_prefix="traceability-host-attestation-",
+        contract="engineering.traceability-host-attestation.v2",
+        authority_epoch=None,
     )
     return reference
 
@@ -10478,8 +10511,8 @@ def issue_traceability_receipt_admission(
     """Bind storage integrity to a detached, trusted host/adapter signature.
 
     This helper deliberately does not mint host authority.  The detached
-    signature must already be produced by an approver in the canonical remote
-    default branch's `.engineering-host-approvers` trust route.
+    signature must already be produced through the host-owned authority
+    boundary outside the candidate repository.
     """
     project_root = resolve_project_root(str(root))
     normalized = _traceability_receipt(receipt, datetime.now(timezone.utc))
@@ -11068,15 +11101,17 @@ def _begin_authority_mutation(root: Path, kind: str) -> dict:
 
 
 def _verify_host_authority_approval(root: Path, normalized: dict, approval: object) -> tuple[str, dict]:
-    return _verify_external_host_signature(
+    return _verify_host_owned_signature(
         root,
         approval,
-        approval_schema="engineering.host-authority-approval.v2",
-        claims_schema="engineering.host-authority-claims.v2",
+        approval_schema=HOST_AUTHORITY_APPROVAL_SCHEMA,
+        claims_schema="engineering.host-authority-claims.v3",
         claims=normalized,
         namespace="engineering-authority",
         label="Engineering scoped authority host approval",
         reference_prefix="approval-",
+        contract=SCOPED_AUTHORITY_SCHEMA,
+        authority_epoch=normalized["authority_epoch"],
     )
 def _owner_intent_path(root: Path) -> Path:
     path = _project_controller_dir(root) / "owner-intents.json"
@@ -11279,15 +11314,17 @@ def _publish_owner_intents(root: Path, ledger: dict, new_key: bytes | None) -> N
 
 
 def _verify_host_owner_intent_approval(root: Path, normalized: dict, approval: object) -> tuple[str, dict]:
-    return _verify_external_host_signature(
+    return _verify_host_owned_signature(
         root,
         approval,
-        approval_schema="engineering.host-owner-intent-approval.v2",
-        claims_schema="engineering.host-owner-intent-claims.v2",
+        approval_schema=HOST_OWNER_INTENT_APPROVAL_SCHEMA,
+        claims_schema="engineering.host-owner-intent-claims.v3",
         claims=normalized,
         namespace="engineering-owner-intent",
         label="Engineering owner intent host approval",
         reference_prefix="owner-intent-approval-",
+        contract=OWNER_INTENT_SCHEMA,
+        authority_epoch=normalized["authority_epoch"],
     )
 def bind_owner_intent(root: Path, binding: object, approval: object) -> dict:
     """Persist a host-approved owner baseline; callers cannot self-approve it."""
@@ -11352,7 +11389,13 @@ def owner_intent_status(root: Path, authority_id: str | None = None) -> dict:
     active = [record for record in candidates if record["status"] == "active"]
     if len(active) > 1:
         raise EngineeringError("Engineering owner intent status is ambiguous.")
-    record = active[0] if active and "approval_trust_anchor" in active[0] else None
+    record = (
+        active[0]
+        if active
+        and isinstance(active[0].get("approval_trust_anchor"), dict)
+        and active[0]["approval_trust_anchor"].get("schema") == HOST_TRUST_ANCHOR_SCHEMA
+        else None
+    )
     return {
         "schema": OWNER_INTENT_STATUS_SCHEMA,
         "state": "bound" if record is not None else "owner_intent_unknown",
@@ -11362,6 +11405,258 @@ def owner_intent_status(root: Path, authority_id: str | None = None) -> dict:
         "core_outcome_count": sum(
             item["criticality"] == "core" for item in record["outcomes"]
         ) if record is not None else 0,
+        "post_activation_import_state": (
+            "complete"
+            if record is not None and _active_owner_intent_import(project_root, record) is not None
+            else "required"
+            if record is not None
+            else "unknown"
+        ),
+    }
+
+
+def _owner_intent_import_path(root: Path) -> Path:
+    path = _project_controller_dir(root) / "owner-intent-imports.json"
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _retained_owner_intent(root: Path, intent_id: str, intent_digest: str) -> dict:
+    matches = [
+        record
+        for record in _load_owner_intents(root)["intents"]
+        if record["intent_id"] == intent_id
+        and record["owner_intent_digest"] == intent_digest
+    ]
+    if len(matches) != 1:
+        raise EngineeringError("Engineering owner intent import owner intent is unavailable.")
+    return dict(matches[0])
+
+
+def _owner_intent_import(
+    root: Path, value: object, *, allow_historical_intent: bool = False
+) -> dict:
+    """Validate an exact host-recorded completeness import after activation."""
+    expected = {
+        "schema",
+        "import_id",
+        "repository_id",
+        "authority_epoch",
+        "owner_intent_id",
+        "owner_intent_digest",
+        "outcome_ids",
+        "coverage_scopes",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != OWNER_INTENT_IMPORT_SCHEMA
+        or value.get("repository_id") != _project_contribution_digest(root)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("owner_intent_digest", "")))
+        or not isinstance(value.get("outcome_ids"), list)
+        or not isinstance(value.get("coverage_scopes"), list)
+        or any(not isinstance(item, str) for item in value["coverage_scopes"])
+    ):
+        raise EngineeringError("Engineering owner intent import is invalid.")
+    try:
+        import_id = _assurance_id(value.get("import_id"), "owner intent import")
+        intent_id = _assurance_id(value.get("owner_intent_id"), "owner intent import owner intent")
+        authority_epoch = _assurance_id(
+            value.get("authority_epoch"), "owner intent import authority epoch"
+        )
+        outcome_ids = sorted(
+            _assurance_id(item, "owner intent import outcome") for item in value["outcome_ids"]
+        )
+    except EngineeringError as error:
+        raise EngineeringError("Engineering owner intent import is invalid.") from error
+    if (
+        not outcome_ids
+        or len(outcome_ids) != len(set(outcome_ids))
+        or sorted(value["coverage_scopes"]) != sorted(POST_ACTIVATION_IMPORT_SCOPES)
+        or len(value["coverage_scopes"]) != len(set(value["coverage_scopes"]))
+    ):
+        raise EngineeringError("Engineering owner intent import completeness is invalid.")
+    intent = (
+        _retained_owner_intent(root, intent_id, value["owner_intent_digest"])
+        if allow_historical_intent
+        else _active_owner_intent(root, intent_id, value["owner_intent_digest"])
+    )
+    expected_outcomes = sorted(item["id"] for item in intent["outcomes"])
+    if (
+        value["repository_id"] != intent["repository_id"]
+        or authority_epoch != intent["authority_epoch"]
+        or outcome_ids != expected_outcomes
+    ):
+        raise EngineeringError("Engineering owner intent import is incomplete or mismatched.")
+    return {
+        "schema": OWNER_INTENT_IMPORT_SCHEMA,
+        "import_id": import_id,
+        "repository_id": intent["repository_id"],
+        "authority_epoch": intent["authority_epoch"],
+        "owner_intent_id": intent["intent_id"],
+        "owner_intent_digest": intent["owner_intent_digest"],
+        "outcome_ids": expected_outcomes,
+        "coverage_scopes": sorted(POST_ACTIVATION_IMPORT_SCOPES),
+    }
+
+
+def _owner_intent_import_signature(key: bytes, record: dict) -> str:
+    material = {name: value for name, value in record.items() if name != "signature"}
+    return "hmac-sha256:" + hmac.new(key, _canonical_json(material), hashlib.sha256).hexdigest()
+
+
+def _load_owner_intent_imports(root: Path) -> dict:
+    path = _owner_intent_import_path(root)
+    if not path.exists():
+        return {"schema": OWNER_INTENT_IMPORT_LEDGER_SCHEMA, "imports": []}
+    _verify_owner_private(path, directory=False)
+    key = _controller_key(_project_controller_dir(root), required=True)
+    assert key is not None
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EngineeringError("Engineering owner intent import ledger is invalid.") from error
+    if (
+        not isinstance(ledger, dict)
+        or set(ledger) != {"schema", "imports"}
+        or ledger.get("schema") != OWNER_INTENT_IMPORT_LEDGER_SCHEMA
+        or not isinstance(ledger.get("imports"), list)
+        or len(ledger["imports"]) > MAX_OWNER_INTENTS
+    ):
+        raise EngineeringError("Engineering owner intent import ledger is invalid.")
+    import_ids: set[str] = set()
+    for record in ledger["imports"]:
+        expected = {
+            "import",
+            "import_digest",
+            "approval_reference",
+            "approval_trust_anchor",
+            "approval_host_receipt",
+            "imported_at",
+            "signature",
+        }
+        if not isinstance(record, dict) or set(record) != expected:
+            raise EngineeringError("Engineering owner intent import ledger is invalid.")
+        try:
+            normalized = _owner_intent_import(
+                root, record["import"], allow_historical_intent=True
+            )
+            _assurance_id(record["approval_reference"], "owner intent import approval reference")
+            _host_trust_anchor(record["approval_trust_anchor"])
+            _assurance_timestamp(record["imported_at"])
+        except EngineeringError as error:
+            raise EngineeringError("Engineering owner intent import ledger is invalid.") from error
+        if (
+            normalized != record["import"]
+            or record["approval_trust_anchor"].get("schema") != HOST_TRUST_ANCHOR_SCHEMA
+            or not isinstance(record["approval_host_receipt"], dict)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(record.get("import_digest", "")))
+            or record["import_digest"] != _json_digest(normalized)
+            or normalized["import_id"] in import_ids
+            or not hmac.compare_digest(
+                str(record.get("signature", "")), _owner_intent_import_signature(key, record)
+            )
+        ):
+            raise EngineeringError("Engineering owner intent import ledger is invalid.")
+        import_ids.add(normalized["import_id"])
+    return ledger
+
+
+def _publish_owner_intent_imports(root: Path, ledger: dict) -> None:
+    if (
+        len(ledger.get("imports", [])) > MAX_OWNER_INTENTS
+        or len(json.dumps(ledger).encode("utf-8")) > 1024 * 1024
+    ):
+        raise EngineeringError("Engineering owner intent import ledger exceeds its bounded size.")
+    controller = _project_controller_dir(root)
+    controller.mkdir(parents=True, exist_ok=True)
+    _enforce_owner_private(controller)
+    _transactional_json_documents([(_owner_intent_import_path(root), ledger)])
+
+
+def _active_owner_intent_import(root: Path, intent: dict) -> dict | None:
+    matches = [
+        record
+        for record in _load_owner_intent_imports(root)["imports"]
+        if record["import"]["owner_intent_id"] == intent["intent_id"]
+        and record["import"]["owner_intent_digest"] == intent["owner_intent_digest"]
+    ]
+    if len(matches) > 1:
+        raise EngineeringError("Engineering owner intent import is ambiguous.")
+    return dict(matches[0]) if matches else None
+
+
+def import_owner_intent(root: Path, imported: object, approval: object) -> dict:
+    """Retain the host proof that activation imported every recorded owner outcome."""
+    project_root = resolve_project_root(str(root))
+    normalized = _owner_intent_import(project_root, imported)
+    approval_reference, approval_anchor = _verify_host_owned_signature(
+        project_root,
+        approval,
+        approval_schema="engineering.host-owner-intent-import-approval.v1",
+        claims_schema="engineering.host-owner-intent-import-claims.v1",
+        claims=normalized,
+        namespace="engineering-owner-intent-import",
+        label="Engineering owner intent import host approval",
+        reference_prefix="owner-intent-import-approval-",
+        contract=OWNER_INTENT_IMPORT_SCHEMA,
+        authority_epoch=normalized["authority_epoch"],
+    )
+    operation = _begin_authority_mutation(project_root, "owner-intent-import")
+    try:
+        ledger = _load_owner_intent_imports(project_root)
+        digest = _json_digest(normalized)
+        for retained in ledger["imports"]:
+            if retained["import"]["import_id"] != normalized["import_id"]:
+                continue
+            if (
+                retained["import_digest"] != digest
+                or retained["approval_reference"] != approval_reference
+                or retained["approval_trust_anchor"] != approval_anchor
+                or retained["approval_host_receipt"] != approval["host_receipt"]
+            ):
+                raise EngineeringError("Engineering owner intent import replay conflicts with retained state.")
+            return {**normalized, "import_digest": digest}
+        controller = _project_controller_dir(project_root)
+        key = _controller_key(controller, required=True)
+        assert key is not None
+        record = {
+            "import": normalized,
+            "import_digest": digest,
+            "approval_reference": approval_reference,
+            "approval_trust_anchor": approval_anchor,
+            "approval_host_receipt": approval["host_receipt"],
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        record["signature"] = _owner_intent_import_signature(key, record)
+        ledger["imports"].append(record)
+        ledger["imports"].sort(key=lambda item: item["import"]["import_id"])
+        _publish_owner_intent_imports(project_root, ledger)
+        return {**normalized, "import_digest": digest}
+    finally:
+        _end_completion(project_root, operation)
+
+
+def dependent_dispatch_status(root: Path, scope: str) -> dict:
+    """Return a non-authorizing downstream admission fact after complete import."""
+    project_root = resolve_project_root(str(root))
+    if scope not in POST_ACTIVATION_IMPORT_SCOPES:
+        raise EngineeringError("Engineering dependent dispatch scope is invalid.")
+    intent = _active_owner_intent(project_root)
+    imported = _active_owner_intent_import(project_root, intent)
+    if imported is None:
+        raise EngineeringError(
+            "Engineering post-activation owner intent import is required before dependent dispatch."
+        )
+    return {
+        "schema": "engineering.dependent-dispatch-status.v1",
+        "state": "admitted",
+        "scope": scope,
+        "owner_intent_id": intent["intent_id"],
+        "owner_intent_digest": intent["owner_intent_digest"],
+        "import_digest": imported["import_digest"],
+        "dispatch_performed": False,
+        "native_approval_required": True,
     }
 
 
@@ -11449,22 +11744,30 @@ def _verify_independent_outcome_audit(root: Path, value: dict) -> dict:
         )
     except EngineeringError as error:
         raise EngineeringError("Engineering independent outcome audit is invalid.") from error
-    _, anchor = _verify_external_host_signature(
+    try:
+        owner_intent = _active_owner_intent(
+            root, value.get("owner_intent_id"), value.get("owner_intent_digest")
+        )
+    except EngineeringError as error:
+        raise EngineeringError("Engineering independent outcome audit is invalid.") from error
+    _verify_host_owned_signature(
         root,
         attestation,
         approval_schema=INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
-        claims_schema="engineering.independent-outcome-audit-claims.v2",
+        claims_schema="engineering.independent-outcome-audit-claims.v3",
         claims=claims,
         namespace="engineering-independent-audit",
         label="Engineering independent outcome audit",
         reference_prefix="independent-outcome-audit-",
+        contract=OUTCOME_ACCEPTANCE_SCHEMA,
+        authority_epoch=owner_intent["authority_epoch"],
         required_principal=auditor_id,
     )
     return {
         "schema": INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
         "approver": auditor_id,
         "claims": claims,
-        "trust_anchor": anchor,
+        "host_receipt": attestation["host_receipt"],
         "signature": attestation["signature"],
     }
 
@@ -14558,6 +14861,130 @@ def _sign_install_receipt(receipt: dict, key: bytes) -> dict:
     }
 
 
+def _v226_bootstrap_authorization(value: object, source_bundle: object) -> dict:
+    """Validate root-provided first-delivery facts without invoking host trust.
+
+    This deliberately verifies only the exact source/artifact envelope.  The
+    installed v2.2.5 controller, recorded owner approval, and independent
+    audits are evaluated by the native delivery boundary before it supplies
+    this receipt.  A candidate cannot mint that external decision here.
+    """
+    expected = {
+        "schema",
+        "artifact_digest",
+        "source_bundle",
+        "installed_v225_receipt_digest",
+        "owner_approval_reference",
+        "independent_audits",
+        "identity",
+    }
+    source_expected = {"source_git_commit", "source_digest", "skill_version"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != V226_BOOTSTRAP_AUTHORIZATION_SCHEMA
+        or not isinstance(source_bundle, dict)
+        or set(source_bundle) != source_expected
+        or value.get("source_bundle") != source_bundle
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("artifact_digest", "")))
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(value.get("installed_v225_receipt_digest", ""))
+        )
+        or value.get("identity") != {"state": "unknown"}
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap authorization is invalid.")
+    if (
+        not re.fullmatch(
+            r"[0-9a-f]{40}", str(source_bundle.get("source_git_commit", ""))
+        )
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(source_bundle.get("source_digest", ""))
+        )
+        or source_bundle.get("skill_version") != "2.2.6"
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap source bundle is invalid.")
+    try:
+        owner_approval_reference = _assurance_id(
+            value.get("owner_approval_reference"), "v2.2.6 bootstrap owner approval"
+        )
+    except EngineeringError as error:
+        raise EngineeringError("Engineering v2.2.6 bootstrap authorization is invalid.") from error
+    audits = value.get("independent_audits")
+    if not isinstance(audits, list) or not 2 <= len(audits) <= 16:
+        raise EngineeringError("Engineering v2.2.6 bootstrap independent audits are invalid.")
+    normalized_audits = []
+    audit_ids: set[str] = set()
+    for audit in audits:
+        if (
+            not isinstance(audit, dict)
+            or set(audit) != {"audit_id", "artifact_digest"}
+            or audit.get("artifact_digest") != value["artifact_digest"]
+        ):
+            raise EngineeringError("Engineering v2.2.6 bootstrap independent audits are invalid.")
+        try:
+            audit_id = _assurance_id(audit.get("audit_id"), "v2.2.6 bootstrap audit")
+        except EngineeringError as error:
+            raise EngineeringError("Engineering v2.2.6 bootstrap independent audits are invalid.") from error
+        if audit_id in audit_ids:
+            raise EngineeringError("Engineering v2.2.6 bootstrap independent audits are duplicated.")
+        audit_ids.add(audit_id)
+        normalized_audits.append(
+            {"audit_id": audit_id, "artifact_digest": value["artifact_digest"]}
+        )
+    return {
+        "schema": V226_BOOTSTRAP_AUTHORIZATION_SCHEMA,
+        "artifact_digest": value["artifact_digest"],
+        "source_bundle": dict(source_bundle),
+        "installed_v225_receipt_digest": value["installed_v225_receipt_digest"],
+        "owner_approval_reference": owner_approval_reference,
+        "independent_audits": sorted(normalized_audits, key=lambda item: item["audit_id"]),
+        "identity": {"state": "unknown"},
+    }
+
+
+def _v226_bootstrap_authorization_path(home: Path) -> Path:
+    """Return the native/root-owned first-delivery record outside candidate Git."""
+    path = (
+        home
+        / ".agents"
+        / "engineering"
+        / "bootstrap-authority"
+        / "v2.2.6-authorization.json"
+    )
+    _reject_reparse_ancestors(path)
+    return path
+
+
+def _host_v226_bootstrap_authorization(
+    source: Path, home: Path, supplied: object, source_bundle: dict
+) -> dict:
+    """Require the caller's bootstrap facts to equal the host-captured record.
+
+    This is deliberately separate from the post-activation signer boundary.
+    It makes the installed-v2.2.5/root/auditor bootstrap decision durable and
+    external to candidate Git without asserting a human cryptographic identity
+    that the native host cannot prove.
+    """
+    supplied_normalized = _v226_bootstrap_authorization(supplied, source_bundle)
+    path = _v226_bootstrap_authorization_path(home)
+    directory = path.parent
+    try:
+        source_root = resolve_project_root(str(source)).resolve()
+        if directory.resolve().is_relative_to(source_root):
+            raise EngineeringError("Engineering host bootstrap authority is inside candidate Git.")
+        _reject_reparse_ancestors(directory)
+        _reject_reparse_ancestors(path, directory)
+        _verify_owner_private(directory, directory=True)
+        _verify_owner_private(path, directory=False)
+        host_value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError, EngineeringError) as error:
+        raise EngineeringError("Engineering host bootstrap authority is unavailable.") from error
+    host_normalized = _v226_bootstrap_authorization(host_value, source_bundle)
+    if host_normalized != supplied_normalized:
+        raise EngineeringError("Engineering host bootstrap authority is mismatched.")
+    return host_normalized
+
+
 def _load_install_receipt(path: Path, key: bytes) -> dict | None:
     if not path.is_file():
         return None
@@ -14586,7 +15013,11 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
         "source_bundle",
     }
     authorization = receipt.get("release_authorization") if isinstance(receipt, dict) else None
+    bootstrap_authorization = (
+        receipt.get("bootstrap_authorization") if isinstance(receipt, dict) else None
+    )
     v2_required = legacy_required | {"release_authorization"}
+    v3_required = legacy_required | {"bootstrap_authorization"}
     valid_legacy = (
         isinstance(receipt, dict)
         and set(receipt) == legacy_required
@@ -14617,8 +15048,23 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
         and isinstance(authorization.get("acceptance_id"), str)
         and re.fullmatch(r"acceptance-[A-Za-z0-9][A-Za-z0-9._-]*", authorization["acceptance_id"])
     )
+    source_bundle = {
+        "source_git_commit": receipt.get("source_git_commit"),
+        "source_digest": receipt.get("source_digest"),
+        "skill_version": receipt.get("skill_version"),
+    }
+    try:
+        valid_v3 = (
+            isinstance(receipt, dict)
+            and set(receipt) == v3_required
+            and receipt.get("schema") == "engineering.install.v3"
+            and _v226_bootstrap_authorization(bootstrap_authorization, source_bundle)
+            == bootstrap_authorization
+        )
+    except EngineeringError:
+        valid_v3 = False
     if (
-        not (valid_legacy or valid_v2)
+        not (valid_legacy or valid_v2 or valid_v3)
         or receipt.get("status") not in {"installed", "rolled_back"}
         or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_git_commit", "")))
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("source_digest", "")))
@@ -14819,13 +15265,15 @@ def install_bundle(
     *,
     release_token: object | None = None,
     release_artifact_digest: str | None = None,
+    bootstrap_authorization: object | None = None,
 ) -> dict:
     """Install a bundle only after the required exact-artifact gate preflight.
 
     The caller retains responsibility for a separate native install approval.
-    A v2.2.6+ bundle requires the token/root/artifact trio. The historical
-    v2.2.5 path remains readable and rollback-safe but cannot gain a v2.2.6
-    token retrospectively.
+    A v2.2.6+ bundle requires the token/root/artifact trio, except for its
+    one-time host-provided bootstrap authorization. The historical v2.2.5 path
+    remains readable and rollback-safe but cannot gain a v2.2.6 token
+    retrospectively.
     """
     source = _expand_install_path(source)
     home = _expand_install_path(home)
@@ -14834,14 +15282,32 @@ def install_bundle(
     if str(home).startswith("\\\\"):
         raise EngineeringError("Engineering installation on UNC paths is unsupported.")
     files, manifest, commit, source_digest = _bundle_files(source)
+    expected_source_bundle = {
+        "source_git_commit": commit,
+        "source_digest": source_digest,
+        "skill_version": manifest["version"],
+    }
     if (release_token is None) != (release_artifact_digest is None):
         raise EngineeringError(
             "Engineering install release gate requires both token and exact artifact digest."
         )
-    if _release_token_required_for_install(manifest) and release_token is None:
+    if bootstrap_authorization is not None and release_token is not None:
         raise EngineeringError(
-            "Engineering v2.2.6+ installation requires an exact release token preflight."
+            "Engineering install accepts either a release token or bootstrap authorization, never both."
         )
+    if _release_token_required_for_install(manifest) and (
+        release_token is None and bootstrap_authorization is None
+    ):
+        raise EngineeringError(
+            "Engineering v2.2.6+ installation requires an exact release token preflight or bootstrap authorization."
+        )
+    validated_bootstrap = (
+        _host_v226_bootstrap_authorization(
+            source, home, bootstrap_authorization, expected_source_bundle
+        )
+        if bootstrap_authorization is not None
+        else None
+    )
     release_gate = None
     if release_token is not None:
         if not isinstance(release_token, dict) or set(release_token) != {
@@ -14859,11 +15325,6 @@ def install_bundle(
             "install",
         )
         source_bundle = release_gate.get("source_bundle") if isinstance(release_gate, dict) else None
-        expected_source_bundle = {
-            "source_git_commit": commit,
-            "source_digest": source_digest,
-            "skill_version": manifest["version"],
-        }
         if source_bundle != expected_source_bundle:
             raise EngineeringError(
                 "Engineering release token does not authorize this exact source bundle."
@@ -14924,6 +15385,12 @@ def install_bundle(
                     raise EngineeringError(
                         "Engineering installed bundle release authorization is mismatched."
                     )
+                if validated_bootstrap is not None and (
+                    current.get("bootstrap_authorization") != validated_bootstrap
+                ):
+                    raise EngineeringError(
+                        "Engineering installed bundle bootstrap authorization is mismatched."
+                    )
                 return {
                     **current,
                     **({"release_gate": release_gate} if release_gate is not None else {}),
@@ -14948,7 +15415,13 @@ def install_bundle(
                 "Engineering staged bundle does not match the authorized source bundle."
             )
         receipt_payload = {
-            "schema": "engineering.install.v2" if release_authorization is not None else "engineering.install.v1",
+            "schema": (
+                "engineering.install.v2"
+                if release_authorization is not None
+                else "engineering.install.v3"
+                if validated_bootstrap is not None
+                else "engineering.install.v1"
+            ),
             "status": "installed",
             "skill_version": manifest["version"],
             "source_git_commit": commit,
@@ -14960,6 +15433,8 @@ def install_bundle(
         }
         if release_authorization is not None:
             receipt_payload["release_authorization"] = release_authorization
+        if validated_bootstrap is not None:
+            receipt_payload["bootstrap_authorization"] = validated_bootstrap
         receipt = _sign_install_receipt(receipt_payload, install_key)
         stages["receipt"].parent.mkdir(parents=True, exist_ok=True)
         stages["receipt"].write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
@@ -15790,6 +16265,15 @@ def main() -> int:
     intent_status_parser = commands.add_parser("intent-status")
     intent_status_parser.add_argument("root")
     intent_status_parser.add_argument("--authority-id")
+    intent_import_parser = commands.add_parser("intent-import")
+    intent_import_parser.add_argument("root")
+    intent_import_parser.add_argument("--import-file", required=True)
+    intent_import_parser.add_argument("--approval-file", required=True)
+    dependent_dispatch_parser = commands.add_parser("dependent-dispatch-status")
+    dependent_dispatch_parser.add_argument("root")
+    dependent_dispatch_parser.add_argument(
+        "--scope", choices=sorted(POST_ACTIVATION_IMPORT_SCOPES), required=True
+    )
     outcome_accept_parser = commands.add_parser("outcome-accept")
     outcome_accept_parser.add_argument("root")
     outcome_accept_parser.add_argument("completion_id")
@@ -16032,6 +16516,34 @@ def main() -> int:
             result = bind_owner_intent(root, binding, approval)
         elif arguments.command == "intent-status":
             result = owner_intent_status(root, arguments.authority_id)
+        elif arguments.command == "intent-import":
+            try:
+                if arguments.import_file == "-" and arguments.approval_file == "-":
+                    raise ValueError
+                imported_source = (
+                    sys.stdin.read()
+                    if arguments.import_file == "-"
+                    else Path(arguments.import_file).read_text(encoding="utf-8")
+                )
+                approval_source = (
+                    sys.stdin.read()
+                    if arguments.approval_file == "-"
+                    else Path(arguments.approval_file).read_text(encoding="utf-8")
+                )
+                if (
+                    len(imported_source.encode("utf-8")) > 64 * 1024
+                    or len(approval_source.encode("utf-8")) > 64 * 1024
+                ):
+                    raise ValueError
+                imported = json.loads(imported_source)
+                approval = json.loads(approval_source)
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+                raise EngineeringError(
+                    "Engineering owner intent import input is invalid."
+                ) from error
+            result = import_owner_intent(root, imported, approval)
+        elif arguments.command == "dependent-dispatch-status":
+            result = dependent_dispatch_status(root, arguments.scope)
         elif arguments.command == "outcome-accept":
             try:
                 source = (

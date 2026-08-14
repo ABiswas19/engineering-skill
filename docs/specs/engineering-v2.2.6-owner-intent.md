@@ -1,201 +1,126 @@
-# Engineering v2.2.6 owner-intent and exact-artifact release gate
+# Engineering v2.2.6 owner intent and exact-artifact release gate
 
 ## Status and scope
 
-This approved design corrects a release-critical gap: a candidate must not be
-able to narrow the owner-approved outcomes that Engineering evaluates. It
-extends the existing local deterministic controller; it does not replace host
-native task execution, install a workflow engine, create a scheduler, or put
-owner intent, customer data, credentials, or runtime evidence in Git.
+This approved design prevents a candidate from narrowing the owner-approved
+outcomes Engineering evaluates. It is a local policy overlay: it preserves
+native Codex and Claude execution, permissions, dispatch, callbacks, and
+completion semantics. It does not install a workflow engine, create a
+scheduler, put owner intent or runtime data in Git, or perform merge,
+installation, activation, deployment, credential, connector, or destructive
+actions.
 
-The scope is limited to owner-intent binding, outcome survival, outcome
-acceptance, exact-artifact release tokens, and the commands and tests needed to
-enforce them. The prior v2.2.5 orphan-recovery receipt and rollback remain
-unchanged. Merge, installation, activation, deployment, credential, connector,
-and destructive action remain separately approved native actions.
+The v2.2.5 receipt and rollback are unchanged. The first v2.2.6 delivery is a
+one-time bootstrap governed outside the candidate by installed v2.2.5, the
+recorded package approval, and independent exact-artifact audits. After
+activation, owner-intent admission uses the host-owned external boundary
+defined below. It never depends on GitHub branch policy, collaborators, remote
+default-branch files, or a personal owner key.
 
 ## Decision ledger and requirement coverage
 
-| Approved requirement | Design location | Verification |
+| Approved requirement | Controller rule | Verification |
 | --- | --- | --- |
-| External owner-private intent; Engineering cannot mint approval | Owner-intent binding | forged/candidate-only binding rejection |
-| Controller-injected outcome baseline | Outcome-survival v2 | candidate baseline injection and omitted-mapping rejection |
-| Owner exceptions and independent replacement equivalence | Outcome-survival v2 | deferred/excluded and replacement negative tests |
-| Typed evidence with no lower-class substitution | Outcome acceptance | evidence-class matrix tests |
-| Independent exact-artifact audit | Outcome acceptance | role collision and artifact mismatch tests |
-| Token gates for merge/install/activation | Release gate | missing/unknown/failed token rejection and positive token test |
-| Intent continuity across preparation, completion, replay, and handoff | Execution binding | digest mismatch/replay tests |
-| Legacy evidence remains readable but cannot gain a new release token | Compatibility | legacy status and gate-rejection tests |
-| v0.6.0 regression and native Codex/Claude positive evidence | Incident scenarios | proxy-only failure and two-harness acceptance tests |
+| External owner intent; Engineering cannot mint approval | Host-signed `engineering.host-receipt.v1` binds repository, epoch, contract, claims, and an external host anchor. Engine only validates and retains it. | forged, wrong repository, wrong epoch, wrong contract, and candidate-anchor substitutions reject |
+| Controller-injected outcome baseline | Outcome-survival v2 derives every baseline ID from the active imported owner intent. | candidate baseline injection, omissions, and self-exclusion reject |
+| Typed evidence and independent audit | Exact artifact acceptance binds required evidence class/interface/environment and a role-distinct audit attestation. | unit/proxy downgrade and role collision reject |
+| Exact artifact release token | A release token binds the terminal artifact and, for install, the exact clean source bundle. | A-token/B-bundle and receipt fact mismatches reject |
+| Non-circular v2.2.6 bootstrap | Bootstrap uses the external delivery receipt and never invokes post-activation host trust. | missing facts and self-gate invocation reject |
+| Post-activation completeness | Host imports all recorded owner-approved outcomes for `accepted_owner_outcomes` and `product_releases` before downstream admission. | pre-import product/owner-outcome dependent work rejects |
+| Historical evidence is not upgraded | Legacy records are readable but are `owner_intent_unknown` for new capability-impacting release work. | legacy release-token request rejects |
 
-## External owner intent
+## External owner intent and host receipts
 
-`engineering.owner-intent.v1` is supplied through an explicit local binding
-file and a separately supplied host approval file. Both are validated before
-the controller writes a compact signed record under the Git-common private
-controller directory. The canonical remote default branch supplies the pinned
-allowed-host signer list; the private signing key and the intent body never
-enter the candidate tree.
+`engineering.owner-intent.v1` contains only repository lineage, authority
+epoch, source-evidence digests, outcome statement digests, and required
+evidence classes/interfaces/environments. It never stores populated intent
+bodies in Git.
 
-The normalized binding is:
+The native host owns the post-activation anchor outside candidate Git. The
+anchor is a private descriptor plus allowed-signers bytes at the configured
+Engineering user-home boundary. Its public schema is:
 
 ```json
 {
-  "schema": "engineering.owner-intent.v1",
-  "intent_id": "intent-example-01",
-  "repository_id": "sha256:<immutable-lineage-digest>",
-  "authority_epoch": "epoch-example-01",
-  "source_evidence": [{"identity": "source-example-01", "digest": "sha256:<digest>"}],
-  "outcomes": [{
-    "id": "OUTCOME-NATIVE-GRAPH",
-    "criticality": "core",
-    "statement_digest": "sha256:<digest>",
-    "required_evidence": [{
-      "class": "real_outcome",
-      "interface": "native_harness",
-      "environment": "candidate"
-    }]
-  }]
+  "schema": "engineering.host-trust-anchor.v2",
+  "anchor_id": "host-anchor-<opaque-id>",
+  "format_version": 1,
+  "signers_digest": "sha256:<digest>",
+  "identity": {"state": "unknown"}
 }
 ```
 
-Validation bounds every list, rejects credentials and source bodies, requires
-the current immutable repository digest, and canonicalizes identifiers and
-digests. New host approval uses a distinct `engineering-owner-intent` signing
-namespace and a signed `engineering.host-trust-anchor.v1` receipt: `origin`'s
-advertised default branch, its exact commit/tree/signer blob, and their
-digests. The controller verifies against that receipt rather than candidate
-`HEAD`, retains the receipt in the private binding record, and fails closed if
-the live remote, local tracking ref, or signer blob is unavailable or
-mismatched. Only that external signature can bind or replace owner intent.
+Every new approval envelope carries a matching host receipt:
 
-The retained record is keyed by the deterministic binding digest. Binding an
-identical approved intent is idempotent. A changed binding creates a new intent
-record only after a new external approval. `intent-status` is read-only and
-reports `bound` or `owner_intent_unknown` without exposing source bodies.
+```json
+{
+  "schema": "engineering.host-receipt.v1",
+  "receipt_id": "host-receipt-<opaque-id>",
+  "repository_id": "sha256:<immutable-lineage-digest>",
+  "authority_epoch": "epoch-example-01",
+  "contract": "engineering.owner-intent.v1",
+  "identity": {"state": "unknown"},
+  "trust_anchor": {"schema": "engineering.host-trust-anchor.v2", "...": "..."}
+}
+```
 
-## Outcome-survival v2 and intent-impact detection
+`identity.state` remains `unknown` unless the native host can prove a stronger
+typed identity. An SSH principal is an opaque host/service or declared-role
+identifier; it is not a claim that a person was cryptographically identified.
+The controller loads the host anchor afresh, verifies private storage and the
+signers digest, verifies the receipt fields and signature, and fails closed.
+It has no command that writes the anchor or allowed-signers material.
 
-For an intent-impacting change the controller obtains the complete baseline
-from the active bound owner intent, never from the candidate handoff. The
-scope-handoff schema carries the `owner_intent_id` and digest, but does not
-accept caller-provided `baseline_ids`.
+## Outcome survival, acceptance, and release
 
-Intent impact is determined from the exact checkpoint graph, declared material
-change class, normalized authorized paths, and approved result-artifact paths.
-Any selected context, authorized/touched source path, or exact downstream impact
-reaching an explicit capability, assurance, or obligation node is
-intent-impacting. Completion repeats that determination against every observed
-changed path, including both sides of a rename, before it retains a completion.
-The controller also treats redesign, replacement,
-simplification, capability deletion, and a handoff carrying outcome survival as
-intent-impacting. This prevents a candidate from escaping the gate by renaming
-the request or omitting a caller flag, while preserving ordinary legacy
-requirement links as readable history rather than silently upgrading them.
+For intent-impacting work, outcome-survival v2 obtains the complete baseline
+from the active host-bound owner intent. Every outcome is `INCLUDED`,
+`REPLACED`, `DEFERRED`, or `EXCLUDED`; replacement requires independent
+equivalence and deferral/exclusion requires a host-attested owner exception.
+Preparation and completion both derive intent impact from declared selection,
+authorized/result paths, changed paths, and rename sides, so underselection or
+renaming cannot evade the fence.
 
-Each baseline outcome receives exactly one mapping:
+Exact acceptance retains distinct `accepted`, `failed`, and `unknown` states
+for every core outcome. It verifies evidence type, interface, environment,
+exact artifact, original owner intent, mapping digest, and independent auditor
+role. A lower class never satisfies a higher class. The v0.6.0 regression
+therefore cannot convert policy kernel/unit evidence and self-excluded runtime
+into a release token; the positive contract requires independently audited
+Codex and Claude native end-to-end evidence.
 
-- `INCLUDED` retains its required evidence.
-- `REPLACED` supplies a replacement identity plus an externally attested
-  equivalence reviewer distinct from architect, implementer, and writer; the
-  SSH principal must be that declared reviewer.
-- `DEFERRED` and `EXCLUDED` require an externally attested owner exception ID
-  bound to the active owner-intent digest.
+`release-gate` remains an evidence gate, not an action. It emits a
+controller-signed token only when all core outcomes are accepted. An
+install-capable token and the installer both bind the exact source commit,
+source digest, version, staged digest, and accepted artifact. Native approval
+remains a separate requirement for merge, install, activation, deployment,
+credential, connector, and destructive actions.
 
-The controller rejects duplicates, omissions, mismatched intent digest, a
-candidate-supplied baseline, self-attested exception, and role collisions. The
-normalized v2 mapping digest travels in scope handoff, preparation,
-execution-context, completion, replay, and release records.
+## Bootstrap and downstream import
 
-## Outcome acceptance
+For the first v2.2.6 installation only, the installer accepts a complete
+`engineering.v2.2.6-bootstrap-authorization.v1` instead of a token that the
+uninstalled controller would need to mint. It validates the exact source and
+artifact facts and stores them with the install receipt, but treats approval
+and audit authority as native/root evidence supplied from outside Engineering.
+The caller-provided record must exactly equal the host-owned durable bootstrap
+record outside candidate Git; a candidate cannot invent approval-shaped facts.
+It neither uses nor creates the post-activation anchor.
 
-`engineering.outcome-acceptance.v1` is an owner-private signed controller
-record for one exact terminal completion. It binds:
-
-- terminal completion digest and exact artifact digest;
-- owner intent ID and digest;
-- survival mapping digest;
-- evidence matrix digest;
-- independent auditor identity and role identities; and
-- one `accepted`, `failed`, or `unknown` state for each core owner outcome.
-
-Evidence entries name an outcome, a bounded evidence identity and digest, an
-evidence class, interface, environment, and the actor role that produced it.
-Valid classes are ordered: `design`, `proxy`, `unit`, `integration`,
-`end_to_end`, `real_outcome`. A requirement is satisfied only by the same
-class or a higher class and only when interface and environment match exactly.
-The controller additionally requires all declared native harnesses for an
-outcome to be represented; evidence from a policy kernel or unit test cannot
-satisfy an executable native-harness requirement.
-
-The owner-intent ID, digest, and authority epoch are copied into every
-intent-impacting execution context. Its digest covers that projection, so a
-handoff, compaction, or resumed worker cannot replace or remove the owner
-baseline without producing a different invalid context.
-
-The acceptance input records the architect, implementer, writer, and auditor.
-The auditor must be distinct from all three and explicitly attest that the
-original owner intent, rather than a candidate-local contract, was compared.
-`unknown` is retained as a distinct state and always blocks a release token.
-
-## Exact-artifact release gate
-
-`engineering release-gate <root> <completion-id> --acceptance-id <id>
---install-source <path>` verifies
-the retained terminal completion, its active owner intent, the exact outcome
-acceptance record, and every core outcome. It emits one controller-signed
-`engineering.release-token.v2` only when every core outcome is accepted at the
-required evidence class and all bindings match byte-for-byte. Omitting
-`--install-source` creates a merge/activation-only token. Supplying it creates
-an install-capable token only when the clean source bundle is in the accepted
-repository and its commit equals the terminal accepted commit.
-
-The token contains only opaque IDs/digests, the exact artifact digest, intent
-digest, acceptance digest, supported action gates, and—only for install—the
-accepted source commit/digest/version. It does not authorize an action.
-`verify-release-token` validates it for one requested action (`merge`,
-`install`, or `activation`) and exact artifact, returning the token digest and
-source-bundle receipt. Calls made by these action workflows must require this
-verification before their existing native approval checks; a valid token never
-substitutes for those approvals. `install_bundle` recomputes that source before
-copy and the staged-tree digest after copy, then reconciles the signed token
-facts in `engineering.install.v2`. The retained v2.2.5 two-argument installer
-path stays readable and rollback safe; it cannot be retrospectively upgraded
-into a v2.2.6 release token.
-
-Completion remains `implementation_complete` evidence. Release readiness,
-installation, activation, and verified-current outcome remain separate states.
+After activation, `intent-bind` and `intent-import` bind the recorded
+`OWNER_APPROVED` baseline and prove coverage for both `accepted_owner_outcomes`
+and `product_releases`. A read-only dependent-dispatch gate fails closed until
+that import is complete. That contract applies to every accepted owner outcome
+and every product release; later v0.6.1 and frontend work must consume it when
+separately authorized, without this Engineering repair dispatching or changing
+them.
 
 ## Compatibility, privacy, and recovery
 
-Existing `engineering.complete.v1`, scope-handoff v1, and delivery-evaluation
-records remain readable. They are not rewritten or upgraded. A legacy
-capability- or intent-impacting completion lacking an owner-intent binding is
-reported as `owner_intent_unknown` and cannot receive a v2.2.6 release token.
-Routine non-impacting work remains compatible with the existing handoff
-contract.
-
-All mutable owner-intent, acceptance, and release-token records use the shared
-Git-common operation lock and atomic JSON publication. Their replay identities
-are deterministic; conflicting replays fail closed. A compaction or handoff
-must retain the owner-intent digest. A successor carrying a different or
-narrowed digest blocks instead of silently continuing.
-
-## Incident regression and positive proof
-
-The mandatory regression models the v0.6.0 failure: the owner baseline requires
-an executable native graph, autonomous fan-out/fan-in, no prompt-by-prompt
-steering, and separate native dispatch/wake evidence from both Codex and
-Claude; the candidate supplies policy-kernel/unit evidence and marks runtime
-as excluded. Binding, mapping, acceptance, and release gate must refuse to
-produce a token.
-
-The positive synthetic contract requires evidence from both `codex_native` and
-`claude_native` at `end_to_end` or `real_outcome` level, with matching native
-harness interface/environment and a distinct independent auditor. The owner
-intent must separately name capability negotiation, authenticated IPC,
-anti-replay, idempotent effects, bounded retry/cycle detection, and distinct
-completion states. Hooks, MCP availability, a policy kernel, or a unit test are
-not substitutes for those per-harness native runtime facts. The test proves
-only controller admission behavior; it does not claim that a real host run
-occurred during this Engineering release.
+Legacy source and receipts remain readable and are never rewritten. A legacy
+capability-impacting completion without a v2 imported owner intent remains
+`owner_intent_unknown` and cannot receive a new release token. All new private
+records use the shared lock, atomic publication, bounded data, and no source
+body. Bootstrap and install transactions retain v2.2.5 rollback on failure;
+host-authority unavailability fails closed for new admissions without changing
+historical state.

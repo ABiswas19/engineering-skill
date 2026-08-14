@@ -7,29 +7,31 @@ description: Use when a non-trivial software task needs setup, planning, impleme
 
 ## What Engineering does
 
-Engineering makes non-trivial changes verifiable from request through
-completion, across instructions, contracts, tests, and approval boundaries.
+Engineering makes changes verifiable across instructions, contracts,
+tests, and approval boundaries.
 
-The orchestrator independently accepts the exact artifact. Engineering preserves
-native Codex and Claude semantics, tools, permissions, autonomy, concurrency,
-and one writer per shared resource.
+The orchestrator independently accepts exact artifacts. Engineering preserves
+native Codex and Claude semantics and one writer per shared resource.
 
-Treat feedback as seed evidence. Before dispatch, reconstruct the decision
-ledger, approved intent, dependencies, sibling flows, and bounded workspace.
-For material redesign, replacement, deletion, or simplification, map every
-baseline outcome as INCLUDED, REPLACED, DEFERRED, or EXCLUDED. Replacement
-needs independent equivalence; deferral/exclusion needs exact owner authority.
-Unknown traceability permits advisory analysis, never accepted readiness.
+Before dispatch, reconstruct approved intent, decision ledger, dependencies,
+sibling flows, and bounded workspace. For material redesign, replacement,
+deletion, or simplification, classify every baseline outcome as INCLUDED,
+REPLACED, DEFERRED, or EXCLUDED. Replacement needs independent equivalence;
+deferral/exclusion needs exact owner authority. Unknown traceability permits
+advisory analysis, never accepted readiness.
 Intent-impacting work needs external owner intent, a controller-injected
 baseline, and an independently accepted exact-artifact token before separate
-native approval. New owner approvals, exceptions, audits, equivalence, and
-traceability host attestations use a signed canonical-default-branch anchor,
-not a candidate signer file; auditor/reviewer principal equals declared role.
-Legacy traceability attestations remain readable but cannot establish current
-trust. Impact derives from graph context plus authorized, approved, and changed
-paths; completion checks rename endpoints. An install token binds the accepted
-clean source bundle and is rechecked before/after staging; it never replaces
-native install approval. Reject narrow handoffs and proxy-only results.
+native approval. The one-time v2.2.6 bootstrap uses installed v2.2.5, recorded
+owner approval, and independent exact-artifact audits—not post-activation
+trust. Thereafter approvals, exceptions, audits, equivalence, and traceability
+attestations use a host-owned external anchor and receipt outside candidate Git,
+never a candidate signer file, GitHub policy, collaborator setting, or personal
+owner key; auditor/reviewer principal equals its declared role. Legacy
+attestations remain readable but cannot establish current trust. Impact derives
+from graph context plus authorized, approved, and changed paths; completion
+checks rename endpoints. An install token binds the accepted clean source bundle
+and is rechecked before/after staging; it never replaces native install approval.
+Reject narrow handoffs and proxy-only results.
 
 Model selection stays native; delivery records requested, actual, and fallback
 facts. Research separates facts, assumptions, citations, and Unknowns.
@@ -41,17 +43,20 @@ Use `engineering map`; see `references/controller-contract.md` for protocols.
 ## Graph and context
 
 Engineering is local-first. Graphify supplies the base graph and a deterministic
-overlay supplies verified links, decisions, and checks. Claims use the canonical default-branch checkpoint; missing/incompatible Graphify blocks graph claims.
-Same-machine worktrees share Git-common checkpoints; other machines recreate
-evidence. A cold start builds, an incremental change updates, and a cache hit
-reuses validated evidence.
+Engineering overlay supplies verified links, decisions, and checks. Claims use
+the canonical default-branch checkpoint; missing/incompatible Graphify blocks
+graph claims. Same-machine worktrees share the Git-common local checkpoint
+catalogue. Separate machines recreate their own evidence. Enterprise graph
+sharing is an inactive opt-in. A cold start builds; an incremental change
+updates; cache
+hits reuse validated evidence.
 
 ## Setup and autonomy
 
-For an unmanaged project, work is advisory and writes nothing. Setup previews
-first, needs explicit authority, and preserves instructions/hooks. Graphify
-installation or upgrade is separately approved; the first eligible commit
-establishes the canonical checkpoint.
+For an unmanaged project, work is advisory and writes nothing. Setup is always
+a preview first, needs explicit setup authority, and preserves instructions/hooks.
+Installing or upgrading Graphify is a separate approval; the first eligible
+commit establishes the canonical checkpoint.
 
 Autonomy is Guided, Collaborative (default), or Steward. Guided asks before
 project changes; Collaborative handles routine in-scope work; Steward may also
@@ -83,7 +88,7 @@ Maintenance is one foreground pass over a local queue and does not run in the
 background; it repairs only mechanically verified work. Historical/advisory traceability debt remains
 visible without blocking unrelated work. An orchestrator may dispatch
 disjoint maintenance lanes in parallel, while each shared-ledger mutation and
-overlapping writer serializes under the existing lock. Preparation blocks
+overlapping writer serializes under existing lock. Preparation blocks
 for checkpoint identity/integrity, required current-contract evidence, or
 dependent graph/release acceptance.
 

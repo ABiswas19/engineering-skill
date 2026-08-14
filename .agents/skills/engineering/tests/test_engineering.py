@@ -11672,6 +11672,13 @@ class Task10ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.home = Path(self.temporary_directory.name) / "host-owned-home"
+        self.home.mkdir()
+        self.engineering_home = patch.dict(
+            os.environ, {"ENGINEERING_USER_HOME": str(self.home)}, clear=False
+        )
+        self.engineering_home.start()
+        self.addCleanup(self.engineering_home.stop)
         self.root = Path(self.temporary_directory.name) / "authority-project"
         subprocess.run(
             ["git", "init", "--initial-branch=main", str(self.root)],
@@ -11717,7 +11724,7 @@ class Task10ContractTests(unittest.TestCase):
         reviewer_public_key = self.reviewer_key.with_suffix(".pub").read_text(
             encoding="ascii"
         ).strip()
-        (self.root / ".engineering-host-approvers").write_text(
+        self.host_allowed_signers = (
             "\n".join(
                 (
                     f"synthetic-host {public_key}",
@@ -11726,7 +11733,30 @@ class Task10ContractTests(unittest.TestCase):
                     f"reviewer-1 {reviewer_public_key}",
                 )
             )
-            + "\n",
+            + "\n"
+        ).encode("ascii")
+        self.host_authority_dir = (
+            self.home / ".agents" / "engineering" / "host-authority"
+        )
+        self.host_authority_dir.mkdir(parents=True)
+        self.host_anchor_path = self.host_authority_dir / "host-trust-anchor.json"
+        self.host_signers_path = self.host_authority_dir / "allowed-signers"
+        self.host_signers_path.write_bytes(self.host_allowed_signers)
+        self.host_anchor_path.write_text(
+            json.dumps(
+                {
+                    "schema": "engineering.host-trust-anchor.v2",
+                    "anchor_id": "host-anchor-synthetic",
+                    "format_version": 1,
+                    "signers_digest": "sha256:"
+                    + hashlib.sha256(self.host_allowed_signers).hexdigest(),
+                    "identity": {"state": "unknown"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.root / ".engineering-host-approvers").write_text(
+            self.host_allowed_signers.decode("ascii"),
             encoding="ascii",
         )
         (self.root / "README.md").write_text("# Authority fixture\n", encoding="utf-8")
@@ -11782,6 +11812,69 @@ class Task10ContractTests(unittest.TestCase):
             self.fail("scripts/engineering.py must exist")
         return engineering
 
+    def host_receipt_for(
+        self,
+        *,
+        contract,
+        authority_epoch="epoch-local-1",
+        repository_id=None,
+        anchor=None,
+    ):
+        anchor = anchor or json.loads(self.host_anchor_path.read_text(encoding="utf-8"))
+        return {
+            "schema": "engineering.host-receipt.v1",
+            "receipt_id": "host-receipt-synthetic",
+            "repository_id": repository_id or self.repository_id,
+            "authority_epoch": authority_epoch,
+            "contract": contract,
+            "identity": {"state": "unknown"},
+            "trust_anchor": anchor,
+        }
+
+    def sign_host_approval(
+        self,
+        *,
+        schema,
+        claims_schema,
+        claims,
+        namespace,
+        contract,
+        authority_epoch,
+        signer=None,
+        approver="synthetic-host",
+        receipt=None,
+    ):
+        module = self.module()
+        receipt = receipt or self.host_receipt_for(
+            contract=contract, authority_epoch=authority_epoch
+        )
+        material = module._canonical_json(
+            {"schema": claims_schema, "claims": claims, "host_receipt": receipt}
+        )
+        claims_path = Path(self.temporary_directory.name) / f"host-approval-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(signer or self.host_key),
+                "-n",
+                namespace,
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": schema,
+            "approver": approver,
+            "claims": claims,
+            "host_receipt": receipt,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
     def binding(self, **changes):
         module = self.module()
         issued = module.datetime.now(module.timezone.utc)
@@ -11801,37 +11894,14 @@ class Task10ContractTests(unittest.TestCase):
     def approval(self, value):
         module = self.module()
         normalized = module._scoped_authority_binding(self.root, value)
-        anchor, _ = module._canonical_host_trust_anchor(self.root)
-        material = module._canonical_json(
-            {
-                "schema": "engineering.host-authority-claims.v2",
-                "claims": normalized,
-                "trust_anchor": anchor,
-            }
+        return self.sign_host_approval(
+            schema=module.HOST_AUTHORITY_APPROVAL_SCHEMA,
+            claims_schema="engineering.host-authority-claims.v3",
+            claims=normalized,
+            namespace="engineering-authority",
+            contract=module.SCOPED_AUTHORITY_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
         )
-        claims_path = Path(self.temporary_directory.name) / f"claims-{time.time_ns()}.json"
-        claims_path.write_bytes(material)
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "sign",
-                "-f",
-                str(self.host_key),
-                "-n",
-                "engineering-authority",
-                str(claims_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return {
-            "schema": "engineering.host-authority-approval.v2",
-            "approver": "synthetic-host",
-            "claims": normalized,
-            "trust_anchor": anchor,
-            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
-        }
 
     def persist(self, binding=None, **changes):
         module = self.module()
@@ -12132,7 +12202,11 @@ class Task10ContractTests(unittest.TestCase):
             worker.start()
         barrier.wait()
         for worker in workers:
-            worker.join(timeout=10)
+            # Authority mutations use the shared completion cleanup boundary,
+            # whose bounded recovery budget is 30 seconds.  Keep this test
+            # fail-closed for a real liveness fault without declaring a busy
+            # Windows host deadlocked halfway through that documented budget.
+            worker.join(timeout=35)
             self.assertFalse(worker.is_alive())
         self.assertEqual(1, sum(item in {"revoked", "consumed"} for item in outcomes))
         self.assertEqual(
@@ -12209,40 +12283,15 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         value.update(changes)
         return value
 
-    def owner_intent_approval(self, binding, *, signer=None, approver="synthetic-host"):
-        module = self.module()
-        normalized = module._owner_intent_binding(self.root, binding)
-        anchor, _ = module._canonical_host_trust_anchor(self.root)
-        material = module._canonical_json(
-            {
-                "schema": "engineering.host-owner-intent-claims.v2",
-                "claims": normalized,
-                "trust_anchor": anchor,
-            }
+    def owner_intent_approval(
+        self, binding, *, receipt_changes=None, signer=None, approver="synthetic-host"
+    ):
+        return self.host_owner_intent_approval(
+            binding,
+            receipt_changes=receipt_changes,
+            signer=signer,
+            approver=approver,
         )
-        claims_path = Path(self.temporary_directory.name) / f"owner-intent-{time.time_ns()}.json"
-        claims_path.write_bytes(material)
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "sign",
-                "-f",
-                str(signer or self.host_key),
-                "-n",
-                "engineering-owner-intent",
-                str(claims_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return {
-            "schema": "engineering.host-owner-intent-approval.v2",
-            "approver": approver,
-            "claims": normalized,
-            "trust_anchor": anchor,
-            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
-        }
 
     def bound_native_owner_intent(self):
         module = self.module()
@@ -12252,7 +12301,14 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         )
 
     def owner_exception(
-        self, intent, outcome_id, disposition, *, signer=None, approver="synthetic-host"
+        self,
+        intent,
+        outcome_id,
+        disposition,
+        *,
+        receipt_changes=None,
+        signer=None,
+        approver="synthetic-host",
     ):
         module = self.module()
         claims = {
@@ -12262,40 +12318,24 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             "outcome_id": outcome_id,
             "disposition": disposition,
         }
-        anchor, _ = module._canonical_host_trust_anchor(self.root)
-        claims_path = Path(self.temporary_directory.name) / f"owner-exception-{time.time_ns()}.json"
-        claims_path.write_bytes(
-            module._canonical_json(
-                {
-                    "schema": "engineering.host-owner-exception-claims.v2",
-                    "claims": claims,
-                    "trust_anchor": anchor,
-                }
-            )
+        receipt = self.host_receipt(
+            contract=module.OWNER_EXCEPTION_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
         )
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "sign",
-                "-f",
-                str(signer or self.host_key),
-                "-n",
-                "engineering-owner-exception",
-                str(claims_path),
-            ],
-            check=True,
-            capture_output=True,
+        receipt.update(receipt_changes or {})
+        return self.sign_host_approval(
+            schema=module.OWNER_EXCEPTION_SCHEMA,
+            claims_schema="engineering.host-owner-exception-claims.v3",
+            claims=claims,
+            namespace="engineering-owner-exception",
+            contract=module.OWNER_EXCEPTION_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            signer=signer,
+            approver=approver,
+            receipt=receipt,
         )
-        return {
-            "schema": "engineering.host-owner-exception.v2",
-            "approver": approver,
-            "claims": claims,
-            "trust_anchor": anchor,
-            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
-        }
 
-    def outcome_equivalence(self, **changes):
+    def outcome_equivalence(self, owner_intent=None, **changes):
         module = self.module()
         value = {
             "schema": "engineering.outcome-equivalence.v2",
@@ -12320,40 +12360,19 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 "evidence_digest",
             )
         }
-        anchor, _ = module._canonical_host_trust_anchor(self.root)
-        claims_path = Path(self.temporary_directory.name) / f"outcome-equivalence-{time.time_ns()}.json"
-        claims_path.write_bytes(
-            module._canonical_json(
-                {
-                    "schema": "engineering.outcome-equivalence-claims.v1",
-                    "claims": claims,
-                    "trust_anchor": anchor,
-                }
-            )
-        )
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "sign",
-                "-f",
-                str(signer),
-                "-n",
-                "engineering-outcome-equivalence",
-                str(claims_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
+        owner_intent = owner_intent or module._active_owner_intent(self.root)
         return {
             **value,
-            "equivalence_attestation": {
-                "schema": "engineering.outcome-equivalence-attestation.v1",
-                "approver": approver,
-                "claims": claims,
-                "trust_anchor": anchor,
-                "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
-            },
+            "equivalence_attestation": self.sign_host_approval(
+                schema=module.OUTCOME_EQUIVALENCE_ATTESTATION_SCHEMA,
+                claims_schema="engineering.outcome-equivalence-claims.v2",
+                claims=claims,
+                namespace="engineering-outcome-equivalence",
+                contract=module.OUTCOME_EQUIVALENCE_SCHEMA,
+                authority_epoch=owner_intent["authority_epoch"],
+                signer=signer,
+                approver=approver,
+            ),
         }
 
     def outcome_survival_v2(self, intent, **changes):
@@ -12410,6 +12429,133 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             text=True,
         )
         return source
+
+    def bootstrap_authorization(self, source, *, artifact_digest=None):
+        module = self.module()
+        _, manifest, source_commit, source_digest = module._bundle_files(source)
+        artifact_digest = artifact_digest or "sha256:" + "a" * 64
+        return {
+            "schema": "engineering.v2.2.6-bootstrap-authorization.v1",
+            "artifact_digest": artifact_digest,
+            "source_bundle": {
+                "source_git_commit": source_commit,
+                "source_digest": source_digest,
+                "skill_version": manifest["version"],
+            },
+            "installed_v225_receipt_digest": "sha256:" + "b" * 64,
+            "owner_approval_reference": "owner-approved-bootstrap",
+            "independent_audits": [
+                {"audit_id": "audit-semantic", "artifact_digest": artifact_digest},
+                {"audit_id": "audit-technical", "artifact_digest": artifact_digest},
+            ],
+            "identity": {"state": "unknown"},
+        }
+
+    def publish_bootstrap_authorization(self, authorization):
+        path = (
+            self.home
+            / ".agents"
+            / "engineering"
+            / "bootstrap-authority"
+            / "v2.2.6-authorization.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(authorization), encoding="utf-8")
+        return authorization
+
+    def host_anchor(self, **changes):
+        value = json.loads(self.host_anchor_path.read_text(encoding="utf-8"))
+        value.update(changes)
+        return value
+
+    def host_receipt(
+        self,
+        *,
+        contract,
+        authority_epoch="epoch-local-1",
+        repository_id=None,
+        anchor=None,
+    ):
+        return {
+            "schema": "engineering.host-receipt.v1",
+            "receipt_id": "host-receipt-synthetic",
+            "repository_id": repository_id or self.repository_id,
+            "authority_epoch": authority_epoch,
+            "contract": contract,
+            "identity": {"state": "unknown"},
+            "trust_anchor": anchor or self.host_anchor(),
+        }
+
+    def host_owner_intent_approval(
+        self, binding, *, receipt_changes=None, signer=None, approver="synthetic-host"
+    ):
+        module = self.module()
+        normalized = module._owner_intent_binding(self.root, binding)
+        receipt = self.host_receipt(
+            contract="engineering.owner-intent.v1",
+            authority_epoch=normalized["authority_epoch"],
+        )
+        receipt.update(receipt_changes or {})
+        return self.sign_host_approval(
+            schema=module.HOST_OWNER_INTENT_APPROVAL_SCHEMA,
+            claims_schema="engineering.host-owner-intent-claims.v3",
+            claims=normalized,
+            namespace="engineering-owner-intent",
+            contract=module.OWNER_INTENT_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
+            signer=signer,
+            approver=approver,
+            receipt=receipt,
+        )
+
+    def owner_intent_import(self, intent):
+        return {
+            "schema": "engineering.owner-intent-import.v1",
+            "import_id": "intent-import-native-graph",
+            "repository_id": intent["repository_id"],
+            "authority_epoch": intent["authority_epoch"],
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "outcome_ids": sorted(item["id"] for item in intent["outcomes"]),
+            "coverage_scopes": ["accepted_owner_outcomes", "product_releases"],
+        }
+
+    def owner_intent_import_approval(self, imported):
+        module = self.module()
+        receipt = self.host_receipt(
+            contract="engineering.owner-intent-import.v1",
+            authority_epoch=imported["authority_epoch"],
+        )
+        material = module._canonical_json(
+            {
+                "schema": "engineering.host-owner-intent-import-claims.v1",
+                "claims": imported,
+                "host_receipt": receipt,
+            }
+        )
+        claims_path = Path(self.temporary_directory.name) / f"owner-intent-import-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(self.host_key),
+                "-n",
+                "engineering-owner-intent-import",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": "engineering.host-owner-intent-import-approval.v1",
+            "approver": "synthetic-host",
+            "claims": imported,
+            "host_receipt": receipt,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
 
     def terminal_completion(self, survival):
         return {
@@ -12477,79 +12623,47 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         value["audit_attestation"] = self.audit_attestation(value)
         return completion, completion_digest, value
 
-    def audit_attestation(self, acceptance, *, signer=None, approver=None):
+    def audit_attestation(
+        self, acceptance, *, receipt_changes=None, signer=None, approver=None
+    ):
         module = self.module()
         claims = module._outcome_audit_claims(acceptance)
-        anchor, _ = module._canonical_host_trust_anchor(self.root)
-        claims_path = Path(self.temporary_directory.name) / f"outcome-audit-{time.time_ns()}.json"
-        claims_path.write_bytes(
-            module._canonical_json(
-                {
-                    "schema": "engineering.independent-outcome-audit-claims.v2",
-                    "claims": claims,
-                    "trust_anchor": anchor,
-                }
-            )
+        intent = module._active_owner_intent(
+            self.root, acceptance["owner_intent_id"], acceptance["owner_intent_digest"]
         )
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "sign",
-                "-f",
-                str(signer or self.auditor_key),
-                "-n",
-                "engineering-independent-audit",
-                str(claims_path),
-            ],
-            check=True,
-            capture_output=True,
+        receipt = self.host_receipt(
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
         )
-        return {
-            "schema": "engineering.independent-outcome-audit.v2",
-            "approver": approver or acceptance["roles"]["auditor_id"],
-            "claims": claims,
-            "trust_anchor": anchor,
-            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
-        }
+        receipt.update(receipt_changes or {})
+        return self.sign_host_approval(
+            schema=module.INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
+            claims_schema="engineering.independent-outcome-audit-claims.v3",
+            claims=claims,
+            namespace="engineering-independent-audit",
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            signer=signer or self.auditor_key,
+            approver=approver or acceptance["roles"]["auditor_id"],
+            receipt=receipt,
+        )
 
     def traceability_host_attestation(
-        self, receipt, *, signer=None, approver="synthetic-host"
+        self, receipt, *, host_receipt=None, signer=None, approver="synthetic-host"
     ):
         module = self.module()
         claims = module._traceability_host_claims(receipt)
-        anchor, _ = module._canonical_host_trust_anchor(self.root)
-        claims_path = Path(self.temporary_directory.name) / f"traceability-host-{time.time_ns()}.json"
-        claims_path.write_bytes(
-            module._canonical_json(
-                {
-                    "schema": "engineering.traceability-host-claims.v2",
-                    "claims": claims,
-                    "trust_anchor": anchor,
-                }
-            )
+        return self.sign_host_approval(
+            schema=module.TRACEABILITY_HOST_ATTESTATION_SCHEMA,
+            claims_schema="engineering.traceability-host-claims.v3",
+            claims=claims,
+            namespace="engineering-traceability",
+            contract="engineering.traceability-host-attestation.v2",
+            authority_epoch="epoch-local-1",
+            signer=signer,
+            approver=approver,
+            receipt=host_receipt,
         )
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "sign",
-                "-f",
-                str(signer or self.host_key),
-                "-n",
-                "engineering-traceability",
-                str(claims_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return {
-            "schema": "engineering.traceability-host-attestation.v2",
-            "approver": approver,
-            "claims": claims,
-            "trust_anchor": anchor,
-            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
-        }
 
     def test_owner_intent_requires_external_host_signature(self):
         """Accepting a forged owner baseline would reintroduce self-approval."""
@@ -12561,8 +12675,195 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 {"fabricated": True},
             )
 
-    def test_candidate_cannot_replace_canonical_trust_anchor(self):
-        """A candidate-local allowed-signers edit cannot mint an owner approval."""
+    def test_v226_bootstrap_acceptance_does_not_call_postactivation_trust(self):
+        """The first v2.2.6 delivery cannot depend on its uninstalled host gate."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        authorization = self.publish_bootstrap_authorization(
+            self.bootstrap_authorization(source)
+        )
+        with patch.object(
+            module,
+            "_host_owned_trust_anchor",
+            create=True,
+            side_effect=AssertionError("post-activation trust must not run"),
+        ):
+            receipt = module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization=authorization,
+            )
+        self.assertEqual("installed", receipt["status"])
+        self.assertEqual(
+            authorization["source_bundle"], receipt["bootstrap_authorization"]["source_bundle"]
+        )
+
+    def test_v226_bootstrap_needs_no_github_policy_collaborator_or_personal_key(self):
+        """Bootstrap facts are sufficient without repository administration or a human key."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        authorization = self.bootstrap_authorization(source)
+        validated = module._v226_bootstrap_authorization(
+            authorization, authorization["source_bundle"]
+        )
+        self.assertEqual(authorization, validated)
+
+    def test_v226_bootstrap_rejects_an_authorization_for_a_different_source_bundle(self):
+        """Bootstrap audit facts for A cannot authorize copying clean bundle B."""
+        module = self.module()
+        source_a = self.installable_bundle_source()
+        authorization = self.publish_bootstrap_authorization(
+            self.bootstrap_authorization(source_a)
+        )
+        other_root = Path(self.temporary_directory.name) / "bootstrap-bundle-b"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(other_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        source_b = other_root / ".agents" / "skills" / "engineering"
+        shutil.copytree(source_a, source_b)
+        (source_b / "scripts" / "engineering.py").write_text(
+            "# distinct clean bootstrap bundle B\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(other_root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(other_root), "commit", "-m", "bootstrap bundle B"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "bootstrap authorization|source bundle"):
+            module.install_bundle(
+                source_b,
+                self.home,
+                bootstrap_authorization=authorization,
+            )
+
+    def test_v226_bootstrap_rejects_candidate_supplied_authorization_absent_from_host_boundary(self):
+        """A candidate cannot invent the durable root package-approval record."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        authorization = self.bootstrap_authorization(source)
+
+        with self.assertRaisesRegex(module.EngineeringError, "host.*bootstrap"):
+            module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization=authorization,
+            )
+
+    def test_candidate_local_signer_substitution_is_rejected_after_activation(self):
+        """A candidate Git signer file cannot replace the host-owned anchor."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        trusted = self.host_owner_intent_approval(binding)
+        attacker_key = Path(self.temporary_directory.name) / "attacker-host-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_signers = (
+            "attacker-host "
+            + attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+            + "\n"
+        ).encode("ascii")
+        (self.root / ".engineering-host-approvers").write_bytes(attacker_signers)
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", ".engineering-host-approvers"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate signer substitution"],
+            check=True,
+            capture_output=True,
+        )
+        trusted_record = module.bind_owner_intent(self.root, binding, trusted)
+        self.assertEqual("intent-native-graph", trusted_record["intent_id"])
+
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(attacker_signers).hexdigest(),
+        )
+        attacker = self.host_owner_intent_approval(
+            self.owner_intent_binding(intent_id="intent-attacker"),
+            receipt_changes={"trust_anchor": attacker_anchor},
+            signer=attacker_key,
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
+            module.bind_owner_intent(
+                self.root, self.owner_intent_binding(intent_id="intent-attacker"), attacker
+            )
+
+    def test_restart_preserves_host_owned_trust_and_intent_state(self):
+        """A fresh controller process rereads the host anchor and retained intent ledger."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        bound = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        first_anchor, _ = module._host_owned_trust_anchor()
+        restarted = load_engineering()
+        with (
+            patch.object(restarted, "_verify_owner_private", return_value=None),
+            patch.object(restarted, "_enforce_owner_private", side_effect=synthetic_owner_private),
+        ):
+            second_anchor, _ = restarted._host_owned_trust_anchor()
+            status = restarted.owner_intent_status(self.root, bound["intent_id"])
+        self.assertEqual(first_anchor, second_anchor)
+        self.assertEqual("bound", status["state"])
+
+    def test_host_receipt_wrong_repository_epoch_or_contract_fails_closed(self):
+        """Host receipt fields are exact admission facts, not advisory metadata."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        cases = (
+            ("repository_id", "sha256:" + "f" * 64, "repository"),
+            ("authority_epoch", "epoch-wrong", "epoch"),
+            ("contract", "engineering.wrong-contract.v1", "contract"),
+        )
+        for field, value, label in cases:
+            with self.subTest(field=field):
+                approval = self.host_owner_intent_approval(
+                    binding, receipt_changes={field: value}
+                )
+                with self.assertRaisesRegex(module.EngineeringError, label):
+                    module.bind_owner_intent(self.root, binding, approval)
+
+    def test_postactivation_import_is_required_before_v061_or_frontend_dispatch(self):
+        """No downstream product-release or owner-outcome admission precedes import."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        intent = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        for scope in ("product_releases", "accepted_owner_outcomes"):
+            with self.subTest(scope=scope), self.assertRaisesRegex(
+                module.EngineeringError, "post-activation.*import"
+            ):
+                module.dependent_dispatch_status(self.root, scope)
+        imported = self.owner_intent_import(intent)
+        module.import_owner_intent(
+            self.root, imported, self.owner_intent_import_approval(imported)
+        )
+        for scope in ("product_releases", "accepted_owner_outcomes"):
+            with self.subTest(scope=scope):
+                admitted = module.dependent_dispatch_status(self.root, scope)
+                self.assertEqual("admitted", admitted["state"])
+
+    def test_candidate_cannot_replace_host_owned_trust_anchor(self):
+        """A candidate-local signer edit cannot replace the private host anchor."""
         module = self.module()
         attacker_key = Path(self.temporary_directory.name) / "attacker-host-key"
         subprocess.run(
@@ -12582,12 +12883,30 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             text=True,
         )
         binding = self.owner_intent_binding()
+        trusted = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        self.assertEqual(binding["intent_id"], trusted["intent_id"])
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-host {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
+        )
+        attacker_binding = self.owner_intent_binding(intent_id="intent-attacker")
         attacker_approval = self.owner_intent_approval(
-            binding, signer=attacker_key, approver="attacker-host"
+            attacker_binding,
+            receipt_changes={"trust_anchor": attacker_anchor},
+            signer=attacker_key,
+            approver="attacker-host",
         )
 
-        with self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
-            module.bind_owner_intent(self.root, binding, attacker_approval)
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
+            module.bind_owner_intent(
+                self.root,
+                attacker_binding,
+                attacker_approval,
+            )
 
     def test_traceability_attestation_cannot_use_candidate_controlled_signers(self):
         """New traceability proof uses the same immutable external signer anchor."""
@@ -12622,10 +12941,22 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             capture_output=True,
             text=True,
         )
-        attacker_attestation = self.traceability_host_attestation(
-            receipt, signer=attacker_key, approver="attacker-host"
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-host {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
         )
-        with self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
+        attacker_attestation = self.traceability_host_attestation(
+            receipt,
+            host_receipt=self.host_receipt(
+                contract="engineering.traceability-host-attestation.v2",
+                anchor=attacker_anchor,
+            ),
+            signer=attacker_key,
+            approver="attacker-host",
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
             module._verify_traceability_host_attestation(
                 self.root, receipt, attacker_attestation
             )
@@ -12843,7 +13174,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         )
         self.assertEqual("EXCLUDED", survival["mappings"][0]["disposition"])
 
-    def test_candidate_cannot_replace_exception_trust_anchor(self):
+    def test_candidate_cannot_replace_host_owned_exception_anchor(self):
         """A candidate signer edit cannot grant itself a core-outcome exception."""
         module = self.module()
         intent = self.bound_native_owner_intent()
@@ -12867,15 +13198,22 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         excluded = self.outcome_survival_v2(intent)
         mapping = excluded["mappings"][0]
         mapping["disposition"] = "EXCLUDED"
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-host {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
+        )
         mapping["owner_exception"] = self.owner_exception(
             intent,
             mapping["outcome_id"],
             "EXCLUDED",
+            receipt_changes={"trust_anchor": attacker_anchor},
             signer=attacker_key,
             approver="attacker-host",
         )
 
-        with self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
             module._outcome_survival_v2(excluded, intent, root=self.root)
 
     def test_replacement_requires_an_independent_equivalence_reviewer(self):
@@ -13021,7 +13359,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 self.root, completion["run_id"], acceptance
             )
 
-    def test_candidate_cannot_replace_independent_audit_trust_anchor(self):
+    def test_candidate_cannot_replace_host_owned_audit_anchor(self):
         """A candidate signer edit cannot manufacture an independently audited acceptance."""
         module = self.module()
         intent = self.bound_native_owner_intent()
@@ -13049,8 +13387,15 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             text=True,
         )
         acceptance["roles"]["auditor_id"] = "attacker-auditor"
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-auditor {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
+        )
         acceptance["audit_attestation"] = self.audit_attestation(
             acceptance,
+            receipt_changes={"trust_anchor": attacker_anchor},
             signer=attacker_key,
             approver="attacker-auditor",
         )
@@ -13059,7 +13404,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             module,
             "_terminal_completion",
             return_value=(completion, completion_digest),
-        ), self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
+        ), self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
             module.record_outcome_acceptance(
                 self.root, completion["run_id"], acceptance
             )
@@ -13583,6 +13928,68 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         ):
             self.assertEqual(0, module.main())
         self.assertEqual(Path(bundle), gate.call_args.kwargs["install_source"])
+
+    def test_postactivation_import_and_dependent_status_cli_dispatch_exact_inputs(self):
+        """The public controller exposes the mandatory import and read-only fence."""
+        module = self.module()
+        imported_path = Path(self.temporary_directory.name) / "owner-intent-import.json"
+        approval_path = Path(self.temporary_directory.name) / "owner-intent-import-approval.json"
+        imported_path.write_text("{}", encoding="utf-8")
+        approval_path.write_text("{}", encoding="utf-8")
+        output = io.StringIO()
+        with (
+            patch.object(
+                module,
+                "import_owner_intent",
+                return_value={"schema": "engineering.owner-intent-import.v1"},
+            ) as imported,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "intent-import",
+                    str(self.root),
+                    "--import-file",
+                    str(imported_path),
+                    "--approval-file",
+                    str(approval_path),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        imported.assert_called_once()
+        self.assertEqual({}, imported.call_args.args[1])
+        self.assertEqual({}, imported.call_args.args[2])
+        self.assertEqual(
+            "engineering.owner-intent-import.v1", json.loads(output.getvalue())["schema"]
+        )
+
+        output = io.StringIO()
+        with (
+            patch.object(
+                module,
+                "dependent_dispatch_status",
+                return_value={"state": "admitted", "dispatch_performed": False},
+            ) as status,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "dependent-dispatch-status",
+                    str(self.root),
+                    "--scope",
+                    "product_releases",
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        status.assert_called_once()
+        self.assertEqual("product_releases", status.call_args.args[1])
+        self.assertEqual(False, json.loads(output.getvalue())["dispatch_performed"])
 
 
 class TraceabilityViewV225ContractTests(unittest.TestCase):
