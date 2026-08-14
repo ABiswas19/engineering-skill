@@ -5808,6 +5808,125 @@ class Task5ContractTests(unittest.TestCase):
         )
         self.assertEqual("owner_intent_unknown", prepared["owner_intent"]["state"])
 
+    def test_prepare_detects_intent_impact_from_authorized_artifact(self):
+        """A capability-linked authorized path cannot be hidden by query underselection."""
+        module = self.module()
+        root, _ = self.prepared_repo("authorized-artifact-intent-impact")
+        (root / "src").mkdir()
+        (root / "src" / "capability_runtime.py").write_text(
+            "def run():\n    return 'native'\n", encoding="utf-8"
+        )
+        links_path = root / "docs" / "engineering-traceability" / "links.json"
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].extend(
+            [
+                {
+                    "id": "CAP-NATIVE-RUNTIME",
+                    "type": "capability",
+                    "title": "Native runtime capability",
+                    "source": {"path": "design.md", "line": 1},
+                },
+                {
+                    "id": "CODE-NATIVE-RUNTIME",
+                    "type": "code_symbol",
+                    "title": "Native runtime",
+                    "source": {"path": "src/capability_runtime.py", "line": 1},
+                },
+            ]
+        )
+        links["edges"].append(
+            {
+                "id": "EDGE-CAP-NATIVE-RUNTIME",
+                "from": "CAP-NATIVE-RUNTIME",
+                "to": "CODE-NATIVE-RUNTIME",
+                "type": "implements",
+                "provenance": "direct",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+        commit = self.commit_all(root, "add capability runtime fixture")
+        self.write_canonical_checkpoint(root, commit)
+        module.approve_checks(root)
+
+        prepared = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": ["src/capability_runtime.py"], "forbidden": []},
+        )
+
+        self.assertEqual("blocked", prepared["readiness"])
+        self.assertIn(
+            "intent-impacting work lacks a matching external owner-intent binding",
+            prepared["blockers"],
+        )
+        self.assertEqual("owner_intent_unknown", prepared["owner_intent"]["state"])
+
+    def test_complete_detects_capability_impact_from_actual_changed_artifact(self):
+        """Completion rechecks touched artifacts so a stale selection cannot bypass survival."""
+        module = self.module()
+        root, prepared = self.prepared_run(
+            "actual-artifact-intent-impact", scope=["README.md"]
+        )
+        checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
+        checkpoint["nodes"].append(
+            {
+                "id": "CAP-LATE-BOUND",
+                "type": "capability",
+                "title": "Late-bound capability",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        checkpoint["edges"].append(
+            {
+                "id": "EDGE-LATE-BOUND",
+                "from": "CAP-LATE-BOUND",
+                "to": "CODE-1",
+                "type": "implements",
+                "provenance": "direct",
+            }
+        )
+        (root / "README.md").write_text("# Changed capability artifact\n", encoding="utf-8")
+
+        with patch.object(module, "_load_checkpoint", return_value=checkpoint), self.assertRaisesRegex(
+            module.EngineeringError,
+            "completion detected unbound intent impact from actual artifacts",
+        ):
+            module.complete(root, prepared["run_id"], [])
+
+    def test_complete_detects_capability_impact_across_authorized_rename(self):
+        """Both rename endpoints are assessed before an approved scope can complete."""
+        module = self.module()
+        root, prepared = self.prepared_run(
+            "renamed-artifact-intent-impact",
+            scope=["README.md", "README-renamed.md"],
+        )
+        checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
+        checkpoint["nodes"].append(
+            {
+                "id": "CAP-RENAMED",
+                "type": "capability",
+                "title": "Renamed capability",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        checkpoint["edges"].append(
+            {
+                "id": "EDGE-RENAMED",
+                "from": "CAP-RENAMED",
+                "to": "CODE-1",
+                "type": "implements",
+                "provenance": "direct",
+            }
+        )
+        (root / "README.md").rename(root / "README-renamed.md")
+
+        with patch.object(module, "_load_checkpoint", return_value=checkpoint), self.assertRaisesRegex(
+            module.EngineeringError,
+            "completion detected unbound intent impact from actual artifacts",
+        ):
+            module.complete(root, prepared["run_id"], [])
+
 
     def test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown(self):
         module = self.module()
@@ -8230,6 +8349,7 @@ class Task7ContractTests(unittest.TestCase):
         """Installation may consume a verified token but never self-authorizes it."""
         module = self.module()
         source = self.bundle_repo("install-release-gate", version="2.2.6")
+        _, source_manifest, source_commit, source_digest = module._bundle_files(source)
         with self.assertRaisesRegex(module.EngineeringError, "requires an exact release token"):
             module.install_bundle(source, self.home)
         self.assertFalse((self.home / ".agents" / "skills" / "engineering").exists())
@@ -8243,11 +8363,18 @@ class Task7ContractTests(unittest.TestCase):
             module,
             "verify_release_token",
             return_value={
-                "schema": "engineering.release-token.v1",
+                "schema": "engineering.release-token.v2",
                 "token_id": "release-token-" + "1" * 32,
+                "token_digest": "sha256:" + "3" * 64,
                 "artifact_digest": "sha256:" + "1" * 64,
                 "action": "install",
+                "acceptance_id": "acceptance-a",
                 "native_approval_required": True,
+                "source_bundle": {
+                    "source_git_commit": source_commit,
+                    "source_digest": source_digest,
+                    "skill_version": source_manifest["version"],
+                },
             },
         ) as verify:
             receipt = module.install_bundle(
@@ -8266,6 +8393,101 @@ class Task7ContractTests(unittest.TestCase):
             "install",
         )
         self.assertTrue(receipt["release_gate"]["native_approval_required"])
+
+    def test_install_rejects_release_token_for_different_source_bundle(self):
+        """Replacing the copied bundle after acceptance must invalidate the install token."""
+        module = self.module()
+        source_a = self.bundle_repo("install-token-bundle-a", version="2.2.6")
+        source_b = self.bundle_repo("install-token-bundle-b", version="2.2.6")
+        (source_b / "SKILL.md").write_bytes(
+            (source_b / "SKILL.md").read_bytes() + b"\n# synthetic bundle B\n"
+        )
+        source_b_root = source_b.parents[2]
+        self.git(source_b_root, "add", ".")
+        self.git(source_b_root, "commit", "-m", "different bundle")
+        _, manifest_a, commit_a, digest_a = module._bundle_files(source_a)
+
+        with patch.object(
+            module,
+            "verify_release_token",
+            return_value={
+                "schema": "engineering.release-token.v2",
+                "token_id": "release-token-" + "1" * 32,
+                "artifact_digest": "sha256:" + "2" * 64,
+                "action": "install",
+                "acceptance_id": "acceptance-a",
+                "native_approval_required": True,
+                "source_bundle": {
+                    "source_git_commit": commit_a,
+                    "source_digest": digest_a,
+                    "skill_version": manifest_a["version"],
+                },
+            },
+        ):
+            with self.assertRaisesRegex(module.EngineeringError, "source bundle"):
+                module.install_bundle(
+                    source_b,
+                    self.home,
+                    release_token={
+                        "root": str(source_b_root),
+                        "token_id": "release-token-" + "1" * 32,
+                    },
+                    release_artifact_digest="sha256:" + "2" * 64,
+                )
+
+        self.assertFalse((self.home / ".agents" / "skills" / "engineering").exists())
+
+    def test_install_receipt_reconciles_release_source_facts(self):
+        """The signed receipt must retain the exact gate and bundle that were installed."""
+        module = self.module()
+        source = self.bundle_repo("install-receipt-source-facts", version="2.2.6")
+        _, manifest, commit, source_digest = module._bundle_files(source)
+        authorization = {
+            "schema": "engineering.install-release-authorization.v1",
+            "token_id": "release-token-" + "1" * 32,
+            "token_digest": "sha256:" + "3" * 64,
+            "artifact_digest": "sha256:" + "2" * 64,
+            "acceptance_id": "acceptance-a",
+            "source_bundle": {
+                "source_git_commit": commit,
+                "source_digest": source_digest,
+                "skill_version": manifest["version"],
+            },
+        }
+        with patch.object(
+            module,
+            "verify_release_token",
+            return_value={
+                "schema": "engineering.release-token.v2",
+                "token_id": authorization["token_id"],
+                "token_digest": authorization["token_digest"],
+                "artifact_digest": authorization["artifact_digest"],
+                "action": "install",
+                "acceptance_id": authorization["acceptance_id"],
+                "native_approval_required": True,
+                "source_bundle": authorization["source_bundle"],
+            },
+        ):
+            receipt = module.install_bundle(
+                source,
+                self.home,
+                release_token={
+                    "root": str(source.parents[2]),
+                    "token_id": authorization["token_id"],
+                },
+                release_artifact_digest=authorization["artifact_digest"],
+            )
+
+        self.assertEqual("engineering.install.v2", receipt["schema"])
+        self.assertEqual(authorization, receipt.get("release_authorization"))
+        self.assertEqual(source_digest, receipt["source_digest"])
+        persisted = {key: value for key, value in receipt.items() if key != "release_gate"}
+        self.assertEqual(
+            persisted,
+            module._load_install_receipt(
+                module._install_paths(self.home)["receipt"], module._install_key(self.home)
+            ),
+        )
 
     def test_install_publishes_a_discoverable_windows_command_launcher(self):
         module = self.module()
@@ -11480,9 +11702,32 @@ class Task10ContractTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
+        self.auditor_key = Path(self.temporary_directory.name) / "auditor-1-key"
+        self.reviewer_key = Path(self.temporary_directory.name) / "reviewer-1-key"
+        for key in (self.auditor_key, self.reviewer_key):
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+                check=True,
+                capture_output=True,
+            )
         public_key = self.host_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        auditor_public_key = self.auditor_key.with_suffix(".pub").read_text(
+            encoding="ascii"
+        ).strip()
+        reviewer_public_key = self.reviewer_key.with_suffix(".pub").read_text(
+            encoding="ascii"
+        ).strip()
         (self.root / ".engineering-host-approvers").write_text(
-            f"synthetic-host {public_key}\n", encoding="ascii"
+            "\n".join(
+                (
+                    f"synthetic-host {public_key}",
+                    f"writer-1 {public_key}",
+                    f"auditor-1 {auditor_public_key}",
+                    f"reviewer-1 {reviewer_public_key}",
+                )
+            )
+            + "\n",
+            encoding="ascii",
         )
         (self.root / "README.md").write_text("# Authority fixture\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
@@ -11492,17 +11737,28 @@ class Task10ContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        self.authority_remote = Path(self.temporary_directory.name) / "authority-origin.git"
         subprocess.run(
-            ["git", "-C", str(self.root), "remote", "add", "origin", "https://example.invalid/authority.git"],
+            ["git", "init", "--bare", "--initial-branch=main", str(self.authority_remote)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "remote", "add", "origin", str(self.authority_remote)],
             check=True,
         )
         subprocess.run(
-            ["git", "-C", str(self.root), "update-ref", "refs/remotes/origin/main", "HEAD"],
+            ["git", "-C", str(self.root), "push", "-u", "origin", "main"],
             check=True,
+            capture_output=True,
+            text=True,
         )
         subprocess.run(
-            ["git", "-C", str(self.root), "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            ["git", "-C", str(self.root), "remote", "set-head", "origin", "-a"],
             check=True,
+            capture_output=True,
+            text=True,
         )
         self.repository_id = engineering._project_contribution_digest(self.root)
         self.repository_identity = patch.object(
@@ -11545,8 +11801,13 @@ class Task10ContractTests(unittest.TestCase):
     def approval(self, value):
         module = self.module()
         normalized = module._scoped_authority_binding(self.root, value)
+        anchor, _ = module._canonical_host_trust_anchor(self.root)
         material = module._canonical_json(
-            {"schema": "engineering.host-authority-claims.v1", "claims": normalized}
+            {
+                "schema": "engineering.host-authority-claims.v2",
+                "claims": normalized,
+                "trust_anchor": anchor,
+            }
         )
         claims_path = Path(self.temporary_directory.name) / f"claims-{time.time_ns()}.json"
         claims_path.write_bytes(material)
@@ -11565,9 +11826,10 @@ class Task10ContractTests(unittest.TestCase):
             capture_output=True,
         )
         return {
-            "schema": "engineering.host-authority-approval.v1",
+            "schema": "engineering.host-authority-approval.v2",
             "approver": "synthetic-host",
             "claims": normalized,
+            "trust_anchor": anchor,
             "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
         }
 
@@ -11947,13 +12209,15 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         value.update(changes)
         return value
 
-    def owner_intent_approval(self, binding):
+    def owner_intent_approval(self, binding, *, signer=None, approver="synthetic-host"):
         module = self.module()
         normalized = module._owner_intent_binding(self.root, binding)
+        anchor, _ = module._canonical_host_trust_anchor(self.root)
         material = module._canonical_json(
             {
-                "schema": "engineering.host-owner-intent-claims.v1",
+                "schema": "engineering.host-owner-intent-claims.v2",
                 "claims": normalized,
+                "trust_anchor": anchor,
             }
         )
         claims_path = Path(self.temporary_directory.name) / f"owner-intent-{time.time_ns()}.json"
@@ -11964,7 +12228,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 "-Y",
                 "sign",
                 "-f",
-                str(self.host_key),
+                str(signer or self.host_key),
                 "-n",
                 "engineering-owner-intent",
                 str(claims_path),
@@ -11973,9 +12237,10 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             capture_output=True,
         )
         return {
-            "schema": "engineering.host-owner-intent-approval.v1",
-            "approver": "synthetic-host",
+            "schema": "engineering.host-owner-intent-approval.v2",
+            "approver": approver,
             "claims": normalized,
+            "trust_anchor": anchor,
             "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
         }
 
@@ -11986,7 +12251,9 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             self.root, binding, self.owner_intent_approval(binding)
         )
 
-    def owner_exception(self, intent, outcome_id, disposition):
+    def owner_exception(
+        self, intent, outcome_id, disposition, *, signer=None, approver="synthetic-host"
+    ):
         module = self.module()
         claims = {
             "exception_id": "exception-native-graph",
@@ -11995,12 +12262,14 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             "outcome_id": outcome_id,
             "disposition": disposition,
         }
+        anchor, _ = module._canonical_host_trust_anchor(self.root)
         claims_path = Path(self.temporary_directory.name) / f"owner-exception-{time.time_ns()}.json"
         claims_path.write_bytes(
             module._canonical_json(
                 {
-                    "schema": "engineering.host-owner-exception-claims.v1",
+                    "schema": "engineering.host-owner-exception-claims.v2",
                     "claims": claims,
+                    "trust_anchor": anchor,
                 }
             )
         )
@@ -12010,7 +12279,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 "-Y",
                 "sign",
                 "-f",
-                str(self.host_key),
+                str(signer or self.host_key),
                 "-n",
                 "engineering-owner-exception",
                 str(claims_path),
@@ -12019,14 +12288,72 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             capture_output=True,
         )
         return {
-            "schema": "engineering.host-owner-exception.v1",
-            "approver": "synthetic-host",
-            "exception_id": claims["exception_id"],
-            "owner_intent_id": claims["owner_intent_id"],
-            "owner_intent_digest": claims["owner_intent_digest"],
-            "outcome_id": claims["outcome_id"],
-            "disposition": claims["disposition"],
+            "schema": "engineering.host-owner-exception.v2",
+            "approver": approver,
+            "claims": claims,
+            "trust_anchor": anchor,
             "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def outcome_equivalence(self, **changes):
+        module = self.module()
+        value = {
+            "schema": "engineering.outcome-equivalence.v2",
+            "reviewer_id": "reviewer-1",
+            "architect_id": "architect-1",
+            "implementer_id": "implementer-1",
+            "writer_id": "writer-1",
+            "evidence_id": "evidence-equivalence",
+            "evidence_digest": "sha256:" + "6" * 64,
+        }
+        signer = changes.pop("signer", self.reviewer_key)
+        approver = changes.pop("approver", value["reviewer_id"])
+        value.update(changes)
+        claims = {
+            name: value[name]
+            for name in (
+                "reviewer_id",
+                "architect_id",
+                "implementer_id",
+                "writer_id",
+                "evidence_id",
+                "evidence_digest",
+            )
+        }
+        anchor, _ = module._canonical_host_trust_anchor(self.root)
+        claims_path = Path(self.temporary_directory.name) / f"outcome-equivalence-{time.time_ns()}.json"
+        claims_path.write_bytes(
+            module._canonical_json(
+                {
+                    "schema": "engineering.outcome-equivalence-claims.v1",
+                    "claims": claims,
+                    "trust_anchor": anchor,
+                }
+            )
+        )
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(signer),
+                "-n",
+                "engineering-outcome-equivalence",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            **value,
+            "equivalence_attestation": {
+                "schema": "engineering.outcome-equivalence-attestation.v1",
+                "approver": approver,
+                "claims": claims,
+                "trust_anchor": anchor,
+                "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+            },
         }
 
     def outcome_survival_v2(self, intent, **changes):
@@ -12049,6 +12376,40 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         }
         value.update(changes)
         return value
+
+    def installable_bundle_source(self):
+        module = self.module()
+        source = self.root / ".agents" / "skills" / "engineering"
+        (source / "scripts").mkdir(parents=True)
+        (source / "references").mkdir()
+        (source / "SKILL.md").write_text(
+            "---\nname: engineering\ndescription: synthetic release bundle\n---\n",
+            encoding="utf-8",
+        )
+        (source / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "name": "engineering",
+                    "version": "2.2.6",
+                    "graphify": {"commit": module.GRAPHIFY_COMMIT},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (source / "scripts" / "engineering.py").write_text(
+            "# synthetic release bundle\n", encoding="utf-8"
+        )
+        (source / "references" / "controller-contract.md").write_text(
+            "# Synthetic controller contract\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".agents"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "add release bundle"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return source
 
     def terminal_completion(self, survival):
         return {
@@ -12116,18 +12477,27 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         value["audit_attestation"] = self.audit_attestation(value)
         return completion, completion_digest, value
 
-    def audit_attestation(self, acceptance):
+    def audit_attestation(self, acceptance, *, signer=None, approver=None):
         module = self.module()
         claims = module._outcome_audit_claims(acceptance)
+        anchor, _ = module._canonical_host_trust_anchor(self.root)
         claims_path = Path(self.temporary_directory.name) / f"outcome-audit-{time.time_ns()}.json"
-        claims_path.write_bytes(module._canonical_json(claims))
+        claims_path.write_bytes(
+            module._canonical_json(
+                {
+                    "schema": "engineering.independent-outcome-audit-claims.v2",
+                    "claims": claims,
+                    "trust_anchor": anchor,
+                }
+            )
+        )
         subprocess.run(
             [
                 "ssh-keygen",
                 "-Y",
                 "sign",
                 "-f",
-                str(self.host_key),
+                str(signer or self.auditor_key),
                 "-n",
                 "engineering-independent-audit",
                 str(claims_path),
@@ -12136,9 +12506,48 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             capture_output=True,
         )
         return {
-            "schema": "engineering.independent-outcome-audit.v1",
-            "approver": "synthetic-host",
+            "schema": "engineering.independent-outcome-audit.v2",
+            "approver": approver or acceptance["roles"]["auditor_id"],
             "claims": claims,
+            "trust_anchor": anchor,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def traceability_host_attestation(
+        self, receipt, *, signer=None, approver="synthetic-host"
+    ):
+        module = self.module()
+        claims = module._traceability_host_claims(receipt)
+        anchor, _ = module._canonical_host_trust_anchor(self.root)
+        claims_path = Path(self.temporary_directory.name) / f"traceability-host-{time.time_ns()}.json"
+        claims_path.write_bytes(
+            module._canonical_json(
+                {
+                    "schema": "engineering.traceability-host-claims.v2",
+                    "claims": claims,
+                    "trust_anchor": anchor,
+                }
+            )
+        )
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(signer or self.host_key),
+                "-n",
+                "engineering-traceability",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": "engineering.traceability-host-attestation.v2",
+            "approver": approver,
+            "claims": claims,
+            "trust_anchor": anchor,
             "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
         }
 
@@ -12150,6 +12559,75 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 self.root,
                 self.owner_intent_binding(),
                 {"fabricated": True},
+            )
+
+    def test_candidate_cannot_replace_canonical_trust_anchor(self):
+        """A candidate-local allowed-signers edit cannot mint an owner approval."""
+        module = self.module()
+        attacker_key = Path(self.temporary_directory.name) / "attacker-host-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-host {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        binding = self.owner_intent_binding()
+        attacker_approval = self.owner_intent_approval(
+            binding, signer=attacker_key, approver="attacker-host"
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
+            module.bind_owner_intent(self.root, binding, attacker_approval)
+
+    def test_traceability_attestation_cannot_use_candidate_controlled_signers(self):
+        """New traceability proof uses the same immutable external signer anchor."""
+        module = self.module()
+        receipt = {
+            "project_id": "project-a",
+            "worktree_id": "worktree-a",
+            "commit": "a" * 40,
+            "checkpoint": "checkpoint-a",
+        }
+        trusted = self.traceability_host_attestation(receipt)
+        self.assertTrue(
+            module._verify_traceability_host_attestation(self.root, receipt, trusted).startswith(
+                "traceability-host-attestation-"
+            )
+        )
+
+        attacker_key = Path(self.temporary_directory.name) / "attacker-traceability-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-host {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate traceability signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        attacker_attestation = self.traceability_host_attestation(
+            receipt, signer=attacker_key, approver="attacker-host"
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
+            module._verify_traceability_host_attestation(
+                self.root, receipt, attacker_attestation
             )
 
     def test_intent_bind_and_status_cli_return_only_bound_owner_identity(self):
@@ -12263,9 +12741,21 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         checkpoint = {
             "nodes": [
                 {"id": "REQ-NATIVE", "type": "requirement"},
-                {"id": "CAP-NATIVE", "type": "capability"},
-                {"id": "code-native", "type": "code_symbol"},
-                {"id": "code-isolated", "type": "code_symbol"},
+                {
+                    "id": "CAP-NATIVE",
+                    "type": "capability",
+                    "source": {"path": "docs/native-capability.md"},
+                },
+                {
+                    "id": "code-native",
+                    "type": "code_symbol",
+                    "source": {"path": "src/native_graph.py"},
+                },
+                {
+                    "id": "code-isolated",
+                    "type": "code_symbol",
+                    "source": {"path": "src/capability_runtime.py"},
+                },
             ],
             "edges": [
                 {
@@ -12292,6 +12782,15 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         self.assertTrue(
             module._intent_impacting(
                 checkpoint, ["code-isolated"], None, None
+            )
+        )
+        self.assertTrue(
+            module._intent_impacting(
+                checkpoint,
+                [],
+                None,
+                None,
+                artifact_paths=["src/capability_runtime.py"],
             )
         )
         nodes = {item["id"]: item for item in checkpoint["nodes"]}
@@ -12344,6 +12843,41 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         )
         self.assertEqual("EXCLUDED", survival["mappings"][0]["disposition"])
 
+    def test_candidate_cannot_replace_exception_trust_anchor(self):
+        """A candidate signer edit cannot grant itself a core-outcome exception."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        attacker_key = Path(self.temporary_directory.name) / "attacker-exception-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-host {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate exception signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        excluded = self.outcome_survival_v2(intent)
+        mapping = excluded["mappings"][0]
+        mapping["disposition"] = "EXCLUDED"
+        mapping["owner_exception"] = self.owner_exception(
+            intent,
+            mapping["outcome_id"],
+            "EXCLUDED",
+            signer=attacker_key,
+            approver="attacker-host",
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
+            module._outcome_survival_v2(excluded, intent, root=self.root)
+
     def test_replacement_requires_an_independent_equivalence_reviewer(self):
         """A candidate cannot call its own replacement equivalent to the baseline."""
         module = self.module()
@@ -12352,21 +12886,37 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         mapping = replacement["mappings"][0]
         mapping["disposition"] = "REPLACED"
         mapping["replacement_ids"] = ["replacement-native-graph"]
+        mapping["equivalence"] = self.outcome_equivalence(
+            reviewer_id="writer-1",
+            signer=self.host_key,
+            approver="writer-1",
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "not independent"):
+            module._outcome_survival_v2(replacement, intent, root=self.root)
+
+        mapping["equivalence"] = self.outcome_equivalence()
+        normalized = module._outcome_survival_v2(replacement, intent, root=self.root)
+        self.assertEqual("REPLACED", normalized["mappings"][0]["disposition"])
+
+    def test_replaced_outcome_requires_external_equivalence_attestation(self):
+        """A candidate-supplied reviewer field is not independent equivalence evidence."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        replacement = self.outcome_survival_v2(intent)
+        mapping = replacement["mappings"][0]
+        mapping["disposition"] = "REPLACED"
+        mapping["replacement_ids"] = ["replacement-native-graph"]
         mapping["equivalence"] = {
-            "schema": "engineering.outcome-equivalence.v1",
-            "reviewer_id": "writer-1",
+            "schema": "engineering.outcome-equivalence.v2",
+            "reviewer_id": "reviewer-1",
             "architect_id": "architect-1",
             "implementer_id": "implementer-1",
             "writer_id": "writer-1",
             "evidence_id": "evidence-equivalence",
             "evidence_digest": "sha256:" + "6" * 64,
         }
-        with self.assertRaisesRegex(module.EngineeringError, "not independent"):
-            module._outcome_survival_v2(replacement, intent)
-
-        mapping["equivalence"]["reviewer_id"] = "reviewer-1"
-        normalized = module._outcome_survival_v2(replacement, intent)
-        self.assertEqual("REPLACED", normalized["mappings"][0]["disposition"])
+        with self.assertRaisesRegex(module.EngineeringError, "external equivalence attestation"):
+            module._outcome_survival_v2(replacement, intent, root=self.root)
 
     def test_execution_context_carries_owner_intent_digest_and_rejects_tampering(self):
         """A dispatched continuation cannot shed or replace the bound owner intent."""
@@ -12443,6 +12993,73 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             "_terminal_completion",
             return_value=(completion, completion_digest),
         ), self.assertRaisesRegex(module.EngineeringError, "independent outcome audit"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_audit_principal_must_equal_declared_auditor(self):
+        """A trusted host cannot stand in for the named independent auditor."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(
+            acceptance,
+            signer=self.host_key,
+            approver="synthetic-host",
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "principal.*declared independent reviewer"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_candidate_cannot_replace_independent_audit_trust_anchor(self):
+        """A candidate signer edit cannot manufacture an independently audited acceptance."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        attacker_key = Path(self.temporary_directory.name) / "attacker-audit-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-auditor {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate audit signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        acceptance["roles"]["auditor_id"] = "attacker-auditor"
+        acceptance["audit_attestation"] = self.audit_attestation(
+            acceptance,
+            signer=attacker_key,
+            approver="attacker-auditor",
+        )
+
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "canonical.*trust|signature"):
             module.record_outcome_acceptance(
                 self.root, completion["run_id"], acceptance
             )
@@ -12676,8 +13293,212 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             verified = module.verify_release_token(
                 self.root, token["token_id"], token["artifact_digest"], "activation"
             )
-        self.assertEqual("engineering.release-token.v1", token["schema"])
+        self.assertEqual("engineering.release-token.v2", token["schema"])
+        self.assertNotIn("install", token["actions"])
         self.assertEqual("activation", verified["action"])
+
+    def test_install_release_token_binds_the_exact_clean_source_bundle(self):
+        """An install token is issued only for the clean accepted bundle it names."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(self.outcome_survival_v2(intent), intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(intent, survival)
+        completion["result_identity"]["commit"] = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        acceptance["artifact_digest"] = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root,
+                completion["run_id"],
+                recorded["acceptance_id"],
+                install_source=source,
+            )
+            verified = module.verify_release_token(
+                self.root, token["token_id"], token["artifact_digest"], "install"
+            )
+        _, manifest, commit, digest = module._bundle_files(source)
+        self.assertEqual(
+            {
+                "source_git_commit": commit,
+                "source_digest": digest,
+                "skill_version": manifest["version"],
+            },
+            verified["source_bundle"],
+        )
+        self.assertRegex(verified["token_digest"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_actual_install_rejects_a_release_token_for_a_different_bundle(self):
+        """A signed token for A cannot authorize copying the distinct clean bundle B."""
+        module = self.module()
+        source_a = self.installable_bundle_source()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(self.outcome_survival_v2(intent), intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(intent, survival)
+        completion["result_identity"]["commit"] = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        acceptance["artifact_digest"] = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root,
+                completion["run_id"],
+                recorded["acceptance_id"],
+                install_source=source_a,
+            )
+
+        other_root = Path(self.temporary_directory.name) / "other-bundle-project"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(other_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        source_b = other_root / ".agents" / "skills" / "engineering"
+        shutil.copytree(source_a, source_b)
+        (source_b / "scripts" / "engineering.py").write_text(
+            "# distinct clean bundle B\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(other_root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(other_root), "commit", "-m", "bundle B"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "exact source bundle"):
+            module.install_bundle(
+                source_b,
+                Path(self.temporary_directory.name) / "installed-home",
+                release_token={"root": str(self.root), "token_id": token["token_id"]},
+                release_artifact_digest=token["artifact_digest"],
+            )
+
+    def test_actual_install_receipt_reconciles_the_signed_source_bundle(self):
+        """The installed receipt retains the signed source facts after the actual copy."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(self.outcome_survival_v2(intent), intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(intent, survival)
+        completion["result_identity"]["commit"] = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        acceptance["artifact_digest"] = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root,
+                completion["run_id"],
+                recorded["acceptance_id"],
+                install_source=source,
+            )
+        home = Path(self.temporary_directory.name) / "installed-home"
+        with (
+            patch.object(module, "_engineering_user_home", return_value=home),
+            patch.object(module, "_register_windows_command_directory"),
+        ):
+            receipt = module.install_bundle(
+                source,
+                home,
+                release_token={"root": str(self.root), "token_id": token["token_id"]},
+                release_artifact_digest=token["artifact_digest"],
+            )
+        _, manifest, commit, digest = module._bundle_files(source)
+        self.assertEqual("engineering.install.v2", receipt["schema"])
+        self.assertEqual(
+            {
+                "source_git_commit": commit,
+                "source_digest": digest,
+                "skill_version": manifest["version"],
+            },
+            receipt["release_authorization"]["source_bundle"],
+        )
+        self.assertEqual(receipt["source_digest"], module._tree_digest(home / ".agents" / "skills" / "engineering"))
+
+    def test_legacy_release_token_stays_readable_but_cannot_authorize_new_install(self):
+        """Historical tokens remain inspectable but cannot acquire a v2 install privilege."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        token = {
+            "schema": "engineering.release-token.v1",
+            "token_id": "release-token-" + "1" * 32,
+            "completion_id": "run-a1b2c3",
+            "completion_digest": "sha256:" + "2" * 64,
+            "artifact_digest": "sha256:" + "3" * 64,
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "mapping_digest": "sha256:" + "4" * 64,
+            "evidence_digest": "sha256:" + "5" * 64,
+            "acceptance_id": "acceptance-legacy",
+            "acceptance_digest": "sha256:" + "6" * 64,
+            "actions": ["activation", "install", "merge"],
+        }
+        key = module._controller_key(module._project_controller_dir(self.root), required=True)
+        record = {"token": token, "issued_at": module._utc_now()}
+        record["signature"] = module._release_token_signature(key, record)
+        module._publish_release_tokens(
+            self.root,
+            {"schema": module.RELEASE_TOKEN_LEDGER_SCHEMA, "tokens": [record]},
+            None,
+        )
+
+        verified = module.verify_release_token(
+            self.root, token["token_id"], token["artifact_digest"], "activation"
+        )
+        self.assertEqual("engineering.release-token.v1", verified["schema"])
+        with self.assertRaisesRegex(module.EngineeringError, "exact install source bundle"):
+            module.verify_release_token(
+                self.root, token["token_id"], token["artifact_digest"], "install"
+            )
 
     def test_outcome_acceptance_and_release_gate_cli_dispatch_exact_inputs(self):
         """The public controller commands preserve exact local gate inputs."""
@@ -12715,7 +13536,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             patch.object(
                 module,
                 "release_gate",
-                return_value={"schema": "engineering.release-token.v1"},
+                return_value={"schema": "engineering.release-token.v2"},
             ) as gate,
             patch.object(
                 sys,
@@ -12736,6 +13557,32 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         self.assertEqual(
             ("run-a1b2c3", "acceptance-native-graph"), gate.call_args.args[1:]
         )
+
+        bundle = Path(self.temporary_directory.name) / "bundle-source"
+        with (
+            patch.object(
+                module,
+                "release_gate",
+                return_value={"schema": "engineering.release-token.v2"},
+            ) as gate,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "release-gate",
+                    str(self.root),
+                    "run-a1b2c3",
+                    "--acceptance-id",
+                    "acceptance-native-graph",
+                    "--install-source",
+                    str(bundle),
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(0, module.main())
+        self.assertEqual(Path(bundle), gate.call_args.kwargs["install_source"])
 
 
 class TraceabilityViewV225ContractTests(unittest.TestCase):
@@ -12972,6 +13819,30 @@ class TraceabilityViewV225ContractTests(unittest.TestCase):
         payload["receipts"][0]["receipt"]["route"] = "other-route"
         with self.assertRaisesRegex(module.EngineeringError, "admission|receipt"):
             module._load_signed_traceability_receipts_payload(payload, key)
+
+    def test_legacy_host_attestation_remains_readable_but_cannot_become_trusted(self):
+        """v1 history is retained as evidence, never upgraded by the v2 trust path."""
+        module = self.module()
+        receipt = self.receipt()
+        key = b"a" * 32
+        normalized = module._traceability_receipt(
+            receipt,
+            module._assurance_timestamp(receipt["observed_at"]) + module.timedelta(minutes=5),
+        )
+        digest = json.loads(
+            module._receipt_admission_material(normalized).decode("utf-8")
+        )["receipt_digest"]
+        payload = module._signed_traceability_receipt_payload(
+            [receipt],
+            key,
+            host_attestations={
+                digest: {"schema": "engineering.traceability-host-attestation.v1"}
+            },
+        )
+        loaded = module._load_signed_traceability_receipts_payload(
+            payload, key, root=Path("not-a-canonical-project")
+        )
+        self.assertNotIn("_traceability_trust_token", loaded[0])
 
     def test_map_uses_the_canonical_view_and_digest_matched_renderer(self):
         module = self.module()

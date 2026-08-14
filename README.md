@@ -250,7 +250,10 @@ injects its complete outcome baseline into the signed scope handoff, so a
 candidate cannot substitute a shorter list. Each outcome is `INCLUDED`,
 `REPLACED`, `DEFERRED`, or `EXCLUDED`: replacement needs independently reviewed
 equivalence, and deferral or exclusion needs a separately host-attested owner
-exception. Historical v2.2.5 records stay readable but their missing owner
+exception. New owner approvals, exceptions, equivalence reviews, and outcome
+audits are verified against a receipt for the live canonical remote default
+branch and exact signer blob, never against candidate `HEAD`; the signer
+principal must equal the declared independent role. Historical v2.2.5 records stay readable but their missing owner
 intent is `owner_intent_unknown` and cannot receive a new release token.
 
 `outcome-accept` records independent exact-artifact acceptance using typed
@@ -259,11 +262,14 @@ evidence (`design`, `proxy`, `unit`, `integration`, `end_to_end`, or
 requirement, and interface and environment must match exactly. The independent
 auditor must be distinct from architect, implementer, and writer and attest to
 the original owner intent. `release-gate` emits a signed
-`engineering.release-token.v1` only when every core outcome is accepted for the
-exact artifact; `verify-release-token` checks that token for exactly `merge`,
-`install`, or `activation`. A v2.2.6+ installation requires the exact
-`install` token before its separate native approval. Neither operation performs
-or authorizes the native action.
+`engineering.release-token.v2` only when every core outcome is accepted for the
+exact artifact. It can authorize `install` only when `--install-source` resolves
+to the accepted clean bundle commit and digest; otherwise it authorizes only
+`merge` and `activation`. `verify-release-token` returns the token digest and
+source-bundle receipt, and the installer recomputes that bundle before copying
+and after staging. A v2.2.6+ installation requires that exact `install` token
+before its separate native approval. Neither operation performs or authorizes
+the native action.
 
 Version 2.2.4 distinguishes business-authority presence from whether approval
 must be requested again. Exact scoped authority can persist across unchanged

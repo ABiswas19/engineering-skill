@@ -33,9 +33,9 @@ and destructive action remain separately approved native actions.
 `engineering.owner-intent.v1` is supplied through an explicit local binding
 file and a separately supplied host approval file. Both are validated before
 the controller writes a compact signed record under the Git-common private
-controller directory. The tracked repository supplies only the pinned allowed
-host signer list; the private signing key and the intent body never enter the
-candidate tree.
+controller directory. The canonical remote default branch supplies the pinned
+allowed-host signer list; the private signing key and the intent body never
+enter the candidate tree.
 
 The normalized binding is:
 
@@ -61,9 +61,13 @@ The normalized binding is:
 
 Validation bounds every list, rejects credentials and source bodies, requires
 the current immutable repository digest, and canonicalizes identifiers and
-digests. The host approval uses the existing pinned SSH signer trust mechanism
-but a distinct `engineering-owner-intent` signing namespace and claim schema.
-Only that external signature can bind or replace owner intent.
+digests. New host approval uses a distinct `engineering-owner-intent` signing
+namespace and a signed `engineering.host-trust-anchor.v1` receipt: `origin`'s
+advertised default branch, its exact commit/tree/signer blob, and their
+digests. The controller verifies against that receipt rather than candidate
+`HEAD`, retains the receipt in the private binding record, and fails closed if
+the live remote, local tracking ref, or signer blob is unavailable or
+mismatched. Only that external signature can bind or replace owner intent.
 
 The retained record is keyed by the deterministic binding digest. Binding an
 identical approved intent is idempotent. A changed binding creates a new intent
@@ -77,10 +81,13 @@ from the active bound owner intent, never from the candidate handoff. The
 scope-handoff schema carries the `owner_intent_id` and digest, but does not
 accept caller-provided `baseline_ids`.
 
-Intent impact is determined from the exact checkpoint graph as well as declared
-material change class. Any selected context or exact downstream impact reaching
-an explicit capability, assurance, or obligation node is intent-impacting. The
-controller also treats redesign, replacement,
+Intent impact is determined from the exact checkpoint graph, declared material
+change class, normalized authorized paths, and approved result-artifact paths.
+Any selected context, authorized/touched source path, or exact downstream impact
+reaching an explicit capability, assurance, or obligation node is
+intent-impacting. Completion repeats that determination against every observed
+changed path, including both sides of a rename, before it retains a completion.
+The controller also treats redesign, replacement,
 simplification, capability deletion, and a handoff carrying outcome survival as
 intent-impacting. This prevents a candidate from escaping the gate by renaming
 the request or omitting a caller flag, while preserving ordinary legacy
@@ -89,8 +96,9 @@ requirement links as readable history rather than silently upgrading them.
 Each baseline outcome receives exactly one mapping:
 
 - `INCLUDED` retains its required evidence.
-- `REPLACED` supplies a replacement identity plus an independent equivalence
-  reviewer distinct from architect, implementer, and writer.
+- `REPLACED` supplies a replacement identity plus an externally attested
+  equivalence reviewer distinct from architect, implementer, and writer; the
+  SSH principal must be that declared reviewer.
 - `DEFERRED` and `EXCLUDED` require an externally attested owner exception ID
   bound to the active owner-intent digest.
 
@@ -132,22 +140,28 @@ original owner intent, rather than a candidate-local contract, was compared.
 
 ## Exact-artifact release gate
 
-`engineering release-gate <root> <completion-id> --acceptance-id <id>` verifies
+`engineering release-gate <root> <completion-id> --acceptance-id <id>
+--install-source <path>` verifies
 the retained terminal completion, its active owner intent, the exact outcome
 acceptance record, and every core outcome. It emits one controller-signed
-`engineering.release-token.v1` only when every core outcome is accepted at the
-required evidence class and all bindings match byte-for-byte.
+`engineering.release-token.v2` only when every core outcome is accepted at the
+required evidence class and all bindings match byte-for-byte. Omitting
+`--install-source` creates a merge/activation-only token. Supplying it creates
+an install-capable token only when the clean source bundle is in the accepted
+repository and its commit equals the terminal accepted commit.
 
 The token contains only opaque IDs/digests, the exact artifact digest, intent
-digest, acceptance digest, issue time, and supported action gates. It does not
-authorize an action. `verify-release-token` validates it for one requested
-action (`merge`, `install`, or `activation`) and exact artifact. Calls made by
-these action workflows must require this verification before their existing
-native approval checks; a valid token never substitutes for those approvals.
-`install_bundle` requires the exact token/root/artifact pair before any
-v2.2.6+ install mutation and calls the `install` verification first. The
-retained v2.2.5 two-argument installer path stays readable and rollback safe;
-it cannot be retrospectively upgraded into a v2.2.6 release token.
+digest, acceptance digest, supported action gates, and—only for install—the
+accepted source commit/digest/version. It does not authorize an action.
+`verify-release-token` validates it for one requested action (`merge`,
+`install`, or `activation`) and exact artifact, returning the token digest and
+source-bundle receipt. Calls made by these action workflows must require this
+verification before their existing native approval checks; a valid token never
+substitutes for those approvals. `install_bundle` recomputes that source before
+copy and the staged-tree digest after copy, then reconciles the signed token
+facts in `engineering.install.v2`. The retained v2.2.5 two-argument installer
+path stays readable and rollback safe; it cannot be retrospectively upgraded
+into a v2.2.6 release token.
 
 Completion remains `implementation_complete` evidence. Release readiness,
 installation, activation, and verified-current outcome remain separate states.

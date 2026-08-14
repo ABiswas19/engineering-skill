@@ -53,13 +53,15 @@ AUTHORITY_AUDIT_SCHEMA = "engineering.authority-audit.v1"
 OWNER_INTENT_SCHEMA = "engineering.owner-intent.v1"
 OWNER_INTENT_LEDGER_SCHEMA = "engineering.owner-intents.v1"
 OWNER_INTENT_STATUS_SCHEMA = "engineering.owner-intent-status.v1"
+HOST_TRUST_ANCHOR_SCHEMA = "engineering.host-trust-anchor.v1"
 OUTCOME_SURVIVAL_V2_SCHEMA = "engineering.outcome-survival.v2"
-OUTCOME_EQUIVALENCE_SCHEMA = "engineering.outcome-equivalence.v1"
-OWNER_EXCEPTION_SCHEMA = "engineering.host-owner-exception.v1"
+OUTCOME_EQUIVALENCE_SCHEMA = "engineering.outcome-equivalence.v2"
+OWNER_EXCEPTION_SCHEMA = "engineering.host-owner-exception.v2"
 OUTCOME_ACCEPTANCE_SCHEMA = "engineering.outcome-acceptance.v1"
 OUTCOME_ACCEPTANCE_LEDGER_SCHEMA = "engineering.outcome-acceptances.v1"
-INDEPENDENT_OUTCOME_AUDIT_SCHEMA = "engineering.independent-outcome-audit.v1"
-RELEASE_TOKEN_SCHEMA = "engineering.release-token.v1"
+INDEPENDENT_OUTCOME_AUDIT_SCHEMA = "engineering.independent-outcome-audit.v2"
+LEGACY_RELEASE_TOKEN_SCHEMA = "engineering.release-token.v1"
+RELEASE_TOKEN_SCHEMA = "engineering.release-token.v2"
 RELEASE_TOKEN_LEDGER_SCHEMA = "engineering.release-tokens.v1"
 NATIVE_APPROVAL_REQUIREMENTS = {"connector", "credential", "destructive", "system"}
 MAX_SCOPED_AUTHORITIES = 256
@@ -337,6 +339,211 @@ def _identity_git(root: Path, *arguments: str) -> str:
         ["git", "--no-replace-objects", "-C", str(root), *arguments],
         env=environment,
     )
+
+
+def _identity_git_bytes(root: Path, *arguments: str) -> bytes:
+    """Read an exact Git object with hostile Git environment variables removed."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }
+    )
+    try:
+        result = subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(root), *arguments],
+            capture_output=True,
+            shell=False,
+            timeout=15,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise EngineeringError("Engineering canonical host trust is unavailable.") from error
+    if result.returncode != 0:
+        raise EngineeringError("Engineering canonical host trust is unavailable.")
+    return result.stdout
+
+
+def _host_trust_anchor(value: object) -> dict:
+    """Validate the immutable remote/default-branch signer receipt shape."""
+    expected = {
+        "schema",
+        "remote_url_digest",
+        "default_ref",
+        "commit",
+        "tree",
+        "signers_blob",
+        "signers_digest",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise EngineeringError("Engineering canonical host trust is invalid.")
+    default_ref = value.get("default_ref")
+    if (
+        value.get("schema") != HOST_TRUST_ANCHOR_SCHEMA
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("remote_url_digest", "")))
+        or not isinstance(default_ref, str)
+        or not default_ref.startswith("refs/heads/")
+        or not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*", default_ref)
+        or ".." in default_ref
+        or "//" in default_ref
+        or "@{" in default_ref
+        or any(
+            not re.fullmatch(r"[0-9a-f]{40}", str(value.get(name, "")))
+            for name in ("commit", "tree", "signers_blob")
+        )
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("signers_digest", "")))
+    ):
+        raise EngineeringError("Engineering canonical host trust is invalid.")
+    return dict(value)
+
+
+def _canonical_host_trust_anchor(root: Path) -> tuple[dict, bytes]:
+    """Read the exact signer blob from the live canonical remote default branch."""
+    try:
+        remote_url = _identity_git(root, "remote", "get-url", "origin")
+        symref_output = _identity_git(root, "ls-remote", "--symref", "origin", "HEAD")
+    except (EngineeringError, OSError, subprocess.TimeoutExpired) as error:
+        raise EngineeringError("Engineering canonical host trust is unavailable.") from error
+    if not remote_url or len(remote_url) > 4096 or "\x00" in remote_url:
+        raise EngineeringError("Engineering canonical host trust is invalid.")
+    default_refs = []
+    advertised_heads = []
+    for line in symref_output.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0] == "ref:" and fields[2] == "HEAD":
+            default_refs.append(fields[1])
+        elif len(fields) == 2 and fields[1] == "HEAD":
+            advertised_heads.append(fields[0])
+    if len(default_refs) != 1 or len(advertised_heads) != 1:
+        raise EngineeringError("Engineering canonical host trust is invalid.")
+    default_ref = default_refs[0]
+    if (
+        not default_ref.startswith("refs/heads/")
+        or not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*", default_ref)
+        or ".." in default_ref
+        or "//" in default_ref
+        or "@{" in default_ref
+    ):
+        raise EngineeringError("Engineering canonical host trust is invalid.")
+    remote_commit = advertised_heads[0]
+    if not re.fullmatch(r"[0-9a-f]{40}", remote_commit):
+        raise EngineeringError("Engineering canonical host trust is invalid.")
+    try:
+        head_output = _identity_git(root, "ls-remote", "--heads", "origin", default_ref)
+        head_rows = [line.split() for line in head_output.splitlines() if line.strip()]
+        local_ref = "refs/remotes/origin/" + default_ref.removeprefix("refs/heads/")
+        local_commit = _identity_git(root, "rev-parse", "--verify", f"{local_ref}^{{commit}}")
+        candidate_commit = _identity_git(root, "rev-parse", "HEAD^{commit}")
+        anchor_tree = _identity_git(root, "rev-parse", f"{remote_commit}^{{tree}}")
+        signer_blob = _identity_git(
+            root, "rev-parse", f"{remote_commit}:.engineering-host-approvers"
+        )
+        allowed = _identity_git_bytes(
+            root, "show", f"{remote_commit}:.engineering-host-approvers"
+        )
+        common = _identity_git(root, "merge-base", remote_commit, candidate_commit)
+    except (EngineeringError, OSError, subprocess.TimeoutExpired) as error:
+        raise EngineeringError("Engineering canonical host trust is unavailable.") from error
+    if (
+        len(head_rows) != 1
+        or len(head_rows[0]) != 2
+        or head_rows[0][0] != remote_commit
+        or head_rows[0][1] != default_ref
+        or local_commit != remote_commit
+        or common != remote_commit
+        or not re.fullmatch(r"[0-9a-f]{40}", anchor_tree)
+        or not re.fullmatch(r"[0-9a-f]{40}", signer_blob)
+        or not allowed
+        or len(allowed) > 65536
+        or b"\x00" in allowed
+    ):
+        raise EngineeringError("Engineering canonical host trust is mismatched.")
+    return _host_trust_anchor({
+        "schema": HOST_TRUST_ANCHOR_SCHEMA,
+        "remote_url_digest": "sha256:" + hashlib.sha256(remote_url.encode("utf-8")).hexdigest(),
+        "default_ref": default_ref,
+        "commit": remote_commit,
+        "tree": anchor_tree,
+        "signers_blob": signer_blob,
+        "signers_digest": "sha256:" + hashlib.sha256(allowed).hexdigest(),
+    }), allowed
+
+
+def _verify_external_host_signature(
+    root: Path,
+    approval: object,
+    *,
+    approval_schema: str,
+    claims_schema: str,
+    claims: dict,
+    namespace: str,
+    label: str,
+    reference_prefix: str,
+    required_principal: str | None = None,
+) -> tuple[str, dict]:
+    """Verify a new external approval against a canonical, non-candidate anchor."""
+    anchor, allowed = _canonical_host_trust_anchor(root)
+    expected = {"schema", "approver", "claims", "trust_anchor", "signature"}
+    if (
+        not isinstance(approval, dict)
+        or set(approval) != expected
+        or approval.get("schema") != approval_schema
+        or approval.get("claims") != claims
+        or approval.get("trust_anchor") != anchor
+        or not isinstance(approval.get("signature"), str)
+        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(approval["signature"]) > 16384
+    ):
+        raise EngineeringError(f"{label} is invalid.")
+    try:
+        approver = _assurance_id(approval.get("approver"), f"{label} approver")
+    except EngineeringError as error:
+        raise EngineeringError(f"{label} is invalid.") from error
+    if required_principal is not None and approver != required_principal:
+        raise EngineeringError(f"{label} principal is not the declared independent reviewer.")
+    material = _canonical_json(
+        {"schema": claims_schema, "claims": claims, "trust_anchor": anchor}
+    )
+    with tempfile.TemporaryDirectory(prefix="engineering-external-host-") as temporary:
+        allowed_path = Path(temporary) / "allowed_signers"
+        signature_path = Path(temporary) / "approval.sig"
+        allowed_path.write_bytes(allowed)
+        signature_path.write_text(approval["signature"], encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_path),
+                    "-I",
+                    approver,
+                    "-n",
+                    namespace,
+                    "-s",
+                    str(signature_path),
+                ],
+                input=material,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EngineeringError(f"{label} verification is unavailable.") from error
+    if verified.returncode != 0:
+        raise EngineeringError(f"{label} signature is invalid.")
+    reference = reference_prefix + hashlib.sha256(
+        _canonical_json({"approval": approval, "trust_anchor": anchor})
+    ).hexdigest()[:32]
+    return reference, anchor
 
 
 def resolve_project_root(candidate: str) -> Path:
@@ -6092,6 +6299,8 @@ def _active_owner_intent(
     if not active:
         raise EngineeringError("Engineering owner intent is unknown.")
     record = active[0]
+    if "approval_trust_anchor" not in record:
+        raise EngineeringError("Engineering owner intent is historical and cannot govern new release work.")
     if intent_id is not None and record["intent_id"] != intent_id:
         raise EngineeringError("Engineering owner intent is not active for this scope.")
     if (
@@ -6110,97 +6319,61 @@ def _verify_host_owner_exception(
     value: object,
 ) -> dict:
     """Verify the narrow owner exception required to defer or exclude one outcome."""
-    expected = {
-        "schema",
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "approver", "claims", "trust_anchor", "signature"
+    }:
+        raise EngineeringError("Engineering owner exception is invalid.")
+    raw_claims = value.get("claims")
+    if not isinstance(raw_claims, dict) or set(raw_claims) != {
         "exception_id",
-        "approver",
         "owner_intent_id",
         "owner_intent_digest",
         "outcome_id",
         "disposition",
-        "signature",
-    }
-    if (
-        not isinstance(value, dict)
-        or set(value) != expected
-        or value.get("schema") != OWNER_EXCEPTION_SCHEMA
-        or value.get("owner_intent_id") != owner_intent["intent_id"]
-        or value.get("owner_intent_digest") != owner_intent["owner_intent_digest"]
-        or value.get("outcome_id") != outcome_id
-        or value.get("disposition") != disposition
-        or disposition not in {"DEFERRED", "EXCLUDED"}
-        or not isinstance(value.get("signature"), str)
-        or not value["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
-        or len(value["signature"]) > 16384
-    ):
+    }:
         raise EngineeringError("Engineering owner exception is invalid.")
     try:
-        exception_id = _assurance_id(value["exception_id"], "owner exception")
-        approver = _assurance_id(value["approver"], "owner exception approver")
-    except EngineeringError as error:
+        claims = {
+            "exception_id": _assurance_id(raw_claims["exception_id"], "owner exception"),
+            "owner_intent_id": _assurance_id(
+                raw_claims["owner_intent_id"], "owner exception owner intent"
+            ),
+            "owner_intent_digest": raw_claims["owner_intent_digest"],
+            "outcome_id": _assurance_id(raw_claims["outcome_id"], "owner exception outcome"),
+            "disposition": raw_claims["disposition"],
+        }
+    except (EngineeringError, KeyError) as error:
         raise EngineeringError("Engineering owner exception is invalid.") from error
-    claims = {
-        "exception_id": exception_id,
-        "owner_intent_id": owner_intent["intent_id"],
-        "owner_intent_digest": owner_intent["owner_intent_digest"],
-        "outcome_id": outcome_id,
-        "disposition": disposition,
-    }
-    try:
-        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
-    except EngineeringError as error:
-        raise EngineeringError(
-            "Engineering owner exception host approver trust is unavailable."
-        ) from error
-    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
-        raise EngineeringError("Engineering owner exception host approver trust is invalid.")
-    material = _canonical_json(
-        {"schema": "engineering.host-owner-exception-claims.v1", "claims": claims}
+    if (
+        not re.fullmatch(r"sha256:[0-9a-f]{64}", str(claims["owner_intent_digest"]))
+        or claims["owner_intent_id"] != owner_intent["intent_id"]
+        or claims["owner_intent_digest"] != owner_intent["owner_intent_digest"]
+        or claims["outcome_id"] != outcome_id
+        or claims["disposition"] != disposition
+        or disposition not in {"DEFERRED", "EXCLUDED"}
+    ):
+        raise EngineeringError("Engineering owner exception is invalid.")
+    _, anchor = _verify_external_host_signature(
+        root,
+        value,
+        approval_schema=OWNER_EXCEPTION_SCHEMA,
+        claims_schema="engineering.host-owner-exception-claims.v2",
+        claims=claims,
+        namespace="engineering-owner-exception",
+        label="Engineering owner exception",
+        reference_prefix="owner-exception-",
     )
-    with tempfile.TemporaryDirectory(prefix="engineering-owner-exception-") as temporary:
-        allowed_path = Path(temporary) / "allowed_signers"
-        signature_path = Path(temporary) / "exception.sig"
-        allowed_path.write_bytes(allowed)
-        signature_path.write_text(value["signature"], encoding="ascii")
-        try:
-            verified = subprocess.run(
-                [
-                    "ssh-keygen",
-                    "-Y",
-                    "verify",
-                    "-f",
-                    str(allowed_path),
-                    "-I",
-                    approver,
-                    "-n",
-                    "engineering-owner-exception",
-                    "-s",
-                    str(signature_path),
-                ],
-                input=material,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise EngineeringError(
-                "Engineering owner exception host approval verification is unavailable."
-            ) from error
-    if verified.returncode != 0:
-        raise EngineeringError("Engineering owner exception signature is invalid.")
     return {
         "schema": OWNER_EXCEPTION_SCHEMA,
-        "exception_id": exception_id,
-        "approver": approver,
-        "owner_intent_id": owner_intent["intent_id"],
-        "owner_intent_digest": owner_intent["owner_intent_digest"],
-        "outcome_id": outcome_id,
-        "disposition": disposition,
+        "approver": value["approver"],
+        "claims": claims,
+        "trust_anchor": anchor,
         "signature": value["signature"],
     }
 
 
-def _outcome_equivalence(value: object) -> dict:
+def _outcome_equivalence(root: Path, value: object) -> dict:
+    """Require an externally attested, role-bound replacement equivalence claim."""
     expected = {
         "schema",
         "reviewer_id",
@@ -6209,10 +6382,16 @@ def _outcome_equivalence(value: object) -> dict:
         "writer_id",
         "evidence_id",
         "evidence_digest",
+        "equivalence_attestation",
     }
+    if not isinstance(value, dict):
+        raise EngineeringError("Engineering outcome equivalence is invalid.")
+    if "equivalence_attestation" not in value:
+        raise EngineeringError(
+            "Engineering REPLACED outcome requires external equivalence attestation."
+        )
     if (
-        not isinstance(value, dict)
-        or set(value) != expected
+        set(value) != expected
         or value.get("schema") != OUTCOME_EQUIVALENCE_SCHEMA
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("evidence_digest", "")))
     ):
@@ -6235,7 +6414,38 @@ def _outcome_equivalence(value: object) -> dict:
         normalized["writer_id"],
     }:
         raise EngineeringError("Engineering outcome equivalence reviewer is not independent.")
-    return normalized
+    claims = {
+        name: normalized[name]
+        for name in (
+            "reviewer_id",
+            "architect_id",
+            "implementer_id",
+            "writer_id",
+            "evidence_id",
+            "evidence_digest",
+        )
+    }
+    _, anchor = _verify_external_host_signature(
+        root,
+        value["equivalence_attestation"],
+        approval_schema="engineering.outcome-equivalence-attestation.v1",
+        claims_schema="engineering.outcome-equivalence-claims.v1",
+        claims=claims,
+        namespace="engineering-outcome-equivalence",
+        label="Engineering outcome equivalence attestation",
+        reference_prefix="outcome-equivalence-",
+        required_principal=normalized["reviewer_id"],
+    )
+    return {
+        **normalized,
+        "equivalence_attestation": {
+            "schema": "engineering.outcome-equivalence-attestation.v1",
+            "approver": normalized["reviewer_id"],
+            "claims": claims,
+            "trust_anchor": anchor,
+            "signature": value["equivalence_attestation"]["signature"],
+        },
+    }
 
 
 def _outcome_survival_v2(
@@ -6351,7 +6561,11 @@ def _outcome_survival_v2(
         elif disposition == "REPLACED":
             if not lists["replacement_ids"] or equivalence is None or owner_exception is not None:
                 raise EngineeringError("Engineering REPLACED outcome lacks independent equivalence evidence.")
-            normalized_equivalence = _outcome_equivalence(equivalence)
+            if root is None:
+                raise EngineeringError(
+                    "Engineering REPLACED outcome requires an externally attested equivalence root."
+                )
+            normalized_equivalence = _outcome_equivalence(root, equivalence)
             normalized_exception = None
         else:
             if lists["replacement_ids"] or equivalence is not None or owner_exception is None:
@@ -6781,6 +6995,8 @@ def _intent_impacting(
     selected_ids: list[str],
     change_class: str | None,
     scope_handoff: object,
+    *,
+    artifact_paths: object = (),
 ) -> bool:
     """Conservatively identify intent scope from exact graph connectivity.
 
@@ -6805,7 +7021,30 @@ def _intent_impacting(
         for item in raw_nodes
         if isinstance(item, dict) and isinstance(item.get("id"), str)
     }
-    queue = deque(identifier for identifier in selected_ids if identifier in nodes)
+    artifact_ids: list[str] = []
+    if isinstance(artifact_paths, (list, tuple, set, frozenset)):
+        normalized_paths = {
+            item.replace("\\", "/")
+            for item in artifact_paths
+            if isinstance(item, str)
+            and item
+            and not Path(item).is_absolute()
+            and ".." not in Path(item).parts
+        }
+        artifact_ids = [
+            identifier
+            for identifier, node in nodes.items()
+            if isinstance(node.get("source"), dict)
+            and isinstance(node["source"].get("path"), str)
+            and node["source"]["path"].replace("\\", "/") in normalized_paths
+        ]
+    queue = deque(
+        dict.fromkeys(
+            identifier
+            for identifier in [*selected_ids, *artifact_ids]
+            if identifier in nodes
+        )
+    )
     seen = set(queue)
     while queue:
         current = queue.popleft()
@@ -7666,8 +7905,15 @@ def prepare(
     context = _merge_context(context)
 
     impact = _context_impact(checkpoint, selected_ids)
+    intent_artifact_paths = list(authorization["scope"])
+    if isinstance(scope_handoff, dict):
+        intent_artifact_paths.extend(scope_handoff["result_artifacts"])
     intent_impact = _intent_impacting(
-        checkpoint, selected_ids, change_class, scope_handoff
+        checkpoint,
+        selected_ids,
+        change_class,
+        scope_handoff,
+        artifact_paths=intent_artifact_paths,
     )
     owner_intent_projection = None
     if intent_impact:
@@ -8710,6 +8956,36 @@ def complete(
         }
         authorization = preparation["authorization"]
         scope_handoff = authorization.get("scope_handoff")
+        actual_checkpoint = _load_checkpoint(
+            project.root, preparation["project"]["commit"]
+        )
+        actual_intent_impact = _intent_impacting(
+            actual_checkpoint,
+            [],
+            authorization.get("change_class"),
+            scope_handoff,
+            artifact_paths=changed,
+        )
+        if actual_intent_impact:
+            bound_owner_intent = _bound_preparation_owner_intent(preparation)
+            survival = (
+                scope_handoff.get("outcome_survival")
+                if isinstance(scope_handoff, dict)
+                else None
+            )
+            if (
+                bound_owner_intent is None
+                or not isinstance(survival, dict)
+                or survival.get("schema") != OUTCOME_SURVIVAL_V2_SCHEMA
+            ):
+                raise EngineeringError(
+                    "Engineering completion detected unbound intent impact from actual artifacts."
+                )
+            _active_owner_intent(
+                project.root,
+                bound_owner_intent["intent_id"],
+                bound_owner_intent["owner_intent_digest"],
+            )
         if authorization.get("change_class") in MATERIAL_CHANGE_CLASSES and (
             not isinstance(scope_handoff, dict)
             or "outcome_survival" not in scope_handoff
@@ -10107,51 +10383,23 @@ def _traceability_host_claims(receipt: dict) -> dict:
 
 
 def _verify_traceability_host_attestation(root: Path, receipt: dict, approval: object) -> str:
-    """Verify a detached host/adapter signature; local HMAC is never enough."""
-    required = {"schema", "approver", "claims", "signature"}
-    if (
-        not isinstance(approval, dict)
-        or set(approval) != required
-        or approval.get("schema") != "engineering.traceability-host-attestation.v1"
-        or approval.get("claims") != _traceability_host_claims(receipt)
-        or not isinstance(approval.get("signature"), str)
-        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
-        or len(approval["signature"]) > 16384
-    ):
-        raise EngineeringError("Engineering traceability host attestation is invalid.")
-    approver = _assurance_id(approval.get("approver"), "traceability host approver")
-    try:
-        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
-    except EngineeringError as error:
-        raise EngineeringError("Engineering traceability host approver trust is unavailable.") from error
-    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
-        raise EngineeringError("Engineering traceability host approver trust is invalid.")
-    material = _canonical_json({
-        "schema": "engineering.traceability-host-claims.v1",
-        "claims": approval["claims"],
-    })
-    with tempfile.TemporaryDirectory(prefix="engineering-traceability-host-") as temporary:
-        allowed_path = Path(temporary) / "allowed_signers"
-        signature_path = Path(temporary) / "traceability.sig"
-        allowed_path.write_bytes(allowed)
-        signature_path.write_text(approval["signature"], encoding="ascii")
-        try:
-            verified = subprocess.run(
-                [
-                    "ssh-keygen", "-Y", "verify", "-f", str(allowed_path),
-                    "-I", approver, "-n", "engineering-traceability",
-                    "-s", str(signature_path),
-                ],
-                input=material,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise EngineeringError("Engineering traceability host attestation verification is unavailable.") from error
-    if verified.returncode != 0:
-        raise EngineeringError("Engineering traceability host attestation signature is invalid.")
-    return "approval-" + hashlib.sha256(_canonical_json(approval)).hexdigest()[:32]
+    """Verify a new host attestation against the canonical remote trust anchor."""
+    reference, _ = _verify_external_host_signature(
+        root,
+        approval,
+        approval_schema="engineering.traceability-host-attestation.v2",
+        claims_schema="engineering.traceability-host-claims.v2",
+        claims=_traceability_host_claims(receipt),
+        namespace="engineering-traceability",
+        label="Engineering traceability host attestation",
+        reference_prefix="traceability-host-attestation-",
+    )
+    return reference
+
+
+def _legacy_traceability_host_attestation(value: object) -> bool:
+    """Keep v1 receipts readable without admitting their candidate-controlled proof."""
+    return isinstance(value, dict) and value.get("schema") == "engineering.traceability-host-attestation.v1"
 
 
 def _signed_traceability_receipt_payload(
@@ -10211,7 +10459,11 @@ def _load_signed_traceability_receipts_payload(
         # host/adapter proof is required before this process-local token is
         # attached and the receipt can participate in verified-live reduction.
         host_attestation = admission.get("host_attestation")
-        if host_attestation is not None:
+        if _legacy_traceability_host_attestation(host_attestation):
+            # Historical v1 evidence remains inspectable, but it was bound to
+            # candidate HEAD and therefore cannot establish present trust.
+            pass
+        elif host_attestation is not None:
             if root is None:
                 raise EngineeringError("Engineering traceability host attestation requires a project root.")
             _verify_traceability_host_attestation(root, receipt, host_attestation)
@@ -10226,8 +10478,8 @@ def issue_traceability_receipt_admission(
     """Bind storage integrity to a detached, trusted host/adapter signature.
 
     This helper deliberately does not mint host authority.  The detached
-    signature must already be produced by an approver in the repository's
-    `.engineering-host-approvers` trust route.
+    signature must already be produced by an approver in the canonical remote
+    default branch's `.engineering-host-approvers` trust route.
     """
     project_root = resolve_project_root(str(root))
     normalized = _traceability_receipt(receipt, datetime.now(timezone.utc))
@@ -10676,7 +10928,7 @@ def _load_scoped_authorities(root: Path) -> dict:
     ):
         raise EngineeringError("Engineering scoped authority ledger is invalid.")
     authority_ids: set[str] = set()
-    authority_fields = {
+    legacy_authority_fields = {
         "schema",
         "authority_id",
         "repository_id",
@@ -10694,10 +10946,14 @@ def _load_scoped_authorities(root: Path) -> dict:
         "transitioned_at",
         "signature",
     }
+    authority_fields = legacy_authority_fields | {"approval_trust_anchor"}
     for record in payload["authorities"]:
         if (
             not isinstance(record, dict)
-            or set(record) != authority_fields
+            or frozenset(record) not in {
+                frozenset(legacy_authority_fields),
+                frozenset(authority_fields),
+            }
             or record.get("schema") != SCOPED_AUTHORITY_SCHEMA
             or not re.fullmatch(r"authority-[0-9a-f]{32}", str(record.get("authority_id", "")))
             or record["authority_id"] in authority_ids
@@ -10714,6 +10970,8 @@ def _load_scoped_authorities(root: Path) -> dict:
             _assurance_id(record["target"], "authority target")
             _assurance_id(record["action_class"], "authority action class")
             _assurance_id(record["approval_reference"], "authority approval reference")
+            if "approval_trust_anchor" in record:
+                _host_trust_anchor(record["approval_trust_anchor"])
             native = _scoped_authority_values(
                 record["native_requirements"], "native requirements", allow_empty=True
             )
@@ -10809,64 +11067,17 @@ def _begin_authority_mutation(root: Path, kind: str) -> dict:
     return _read_operation(root, record["operation_id"])
 
 
-def _verify_host_authority_approval(root: Path, normalized: dict, approval: object) -> str:
-    required = {"schema", "approver", "claims", "signature"}
-    if (
-        not isinstance(approval, dict)
-        or set(approval) != required
-        or approval.get("schema") != "engineering.host-authority-approval.v1"
-        or approval.get("claims") != normalized
-        or not isinstance(approval.get("signature"), str)
-        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
-        or len(approval["signature"]) > 16384
-    ):
-        raise EngineeringError("Engineering scoped authority host approval is invalid.")
-    approver = _assurance_id(approval.get("approver"), "authority host approver")
-    try:
-        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
-    except EngineeringError as error:
-        raise EngineeringError(
-            "Engineering scoped authority host approver trust is unavailable."
-        ) from error
-    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
-        raise EngineeringError("Engineering scoped authority host approver trust is invalid.")
-    material = _canonical_json(
-        {"schema": "engineering.host-authority-claims.v1", "claims": normalized}
+def _verify_host_authority_approval(root: Path, normalized: dict, approval: object) -> tuple[str, dict]:
+    return _verify_external_host_signature(
+        root,
+        approval,
+        approval_schema="engineering.host-authority-approval.v2",
+        claims_schema="engineering.host-authority-claims.v2",
+        claims=normalized,
+        namespace="engineering-authority",
+        label="Engineering scoped authority host approval",
+        reference_prefix="approval-",
     )
-    with tempfile.TemporaryDirectory(prefix="engineering-host-approval-") as temporary:
-        allowed_path = Path(temporary) / "allowed_signers"
-        signature_path = Path(temporary) / "approval.sig"
-        allowed_path.write_bytes(allowed)
-        signature_path.write_text(approval["signature"], encoding="ascii")
-        try:
-            verified = subprocess.run(
-                [
-                    "ssh-keygen",
-                    "-Y",
-                    "verify",
-                    "-f",
-                    str(allowed_path),
-                    "-I",
-                    approver,
-                    "-n",
-                    "engineering-authority",
-                    "-s",
-                    str(signature_path),
-                ],
-                input=material,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise EngineeringError(
-                "Engineering scoped authority host approval verification is unavailable."
-            ) from error
-    if verified.returncode != 0:
-        raise EngineeringError("Engineering scoped authority host approval signature is invalid.")
-    return "approval-" + hashlib.sha256(_canonical_json(approval)).hexdigest()[:32]
-
-
 def _owner_intent_path(root: Path) -> Path:
     path = _project_controller_dir(root) / "owner-intents.json"
     _reject_reparse_ancestors(path)
@@ -11004,7 +11215,7 @@ def _load_owner_intents(root: Path) -> dict:
     active = 0
     digests: set[str] = set()
     for record in ledger["intents"]:
-        expected = {
+        legacy_expected = {
             "schema",
             "intent_id",
             "repository_id",
@@ -11017,7 +11228,11 @@ def _load_owner_intents(root: Path) -> dict:
             "status",
             "signature",
         }
-        if not isinstance(record, dict) or set(record) != expected:
+        anchored_expected = legacy_expected | {"approval_trust_anchor"}
+        if not isinstance(record, dict) or frozenset(record) not in {
+            frozenset(legacy_expected),
+            frozenset(anchored_expected),
+        }:
             raise EngineeringError("Engineering owner intent ledger is invalid.")
         binding = {name: record[name] for name in (
             "schema", "intent_id", "repository_id", "authority_epoch", "source_evidence", "outcomes"
@@ -11026,6 +11241,8 @@ def _load_owner_intents(root: Path) -> dict:
             normalized = _owner_intent_binding(root, binding)
             _assurance_id(record["approval_reference"], "owner intent approval reference")
             _assurance_timestamp(record["bound_at"])
+            if "approval_trust_anchor" in record:
+                _host_trust_anchor(record["approval_trust_anchor"])
         except EngineeringError as error:
             raise EngineeringError("Engineering owner intent ledger is invalid.") from error
         if (
@@ -11061,65 +11278,22 @@ def _publish_owner_intents(root: Path, ledger: dict, new_key: bytes | None) -> N
     _transactional_json_documents([(_owner_intent_path(root), ledger)], binary)
 
 
-def _verify_host_owner_intent_approval(root: Path, normalized: dict, approval: object) -> str:
-    required = {"schema", "approver", "claims", "signature"}
-    if (
-        not isinstance(approval, dict)
-        or set(approval) != required
-        or approval.get("schema") != "engineering.host-owner-intent-approval.v1"
-        or approval.get("claims") != normalized
-        or not isinstance(approval.get("signature"), str)
-        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
-        or len(approval["signature"]) > 16384
-    ):
-        raise EngineeringError("Engineering owner intent host approval is invalid.")
-    approver = _assurance_id(approval.get("approver"), "owner intent host approver")
-    try:
-        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
-    except EngineeringError as error:
-        raise EngineeringError("Engineering owner intent host approver trust is unavailable.") from error
-    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
-        raise EngineeringError("Engineering owner intent host approver trust is invalid.")
-    material = _canonical_json(
-        {"schema": "engineering.host-owner-intent-claims.v1", "claims": normalized}
+def _verify_host_owner_intent_approval(root: Path, normalized: dict, approval: object) -> tuple[str, dict]:
+    return _verify_external_host_signature(
+        root,
+        approval,
+        approval_schema="engineering.host-owner-intent-approval.v2",
+        claims_schema="engineering.host-owner-intent-claims.v2",
+        claims=normalized,
+        namespace="engineering-owner-intent",
+        label="Engineering owner intent host approval",
+        reference_prefix="owner-intent-approval-",
     )
-    with tempfile.TemporaryDirectory(prefix="engineering-owner-intent-") as temporary:
-        allowed_path = Path(temporary) / "allowed_signers"
-        signature_path = Path(temporary) / "approval.sig"
-        allowed_path.write_bytes(allowed)
-        signature_path.write_text(approval["signature"], encoding="ascii")
-        try:
-            verified = subprocess.run(
-                [
-                    "ssh-keygen",
-                    "-Y",
-                    "verify",
-                    "-f",
-                    str(allowed_path),
-                    "-I",
-                    approver,
-                    "-n",
-                    "engineering-owner-intent",
-                    "-s",
-                    str(signature_path),
-                ],
-                input=material,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise EngineeringError("Engineering owner intent host approval verification is unavailable.") from error
-    if verified.returncode != 0:
-        raise EngineeringError("Engineering owner intent host approval signature is invalid.")
-    return "owner-intent-approval-" + hashlib.sha256(_canonical_json(approval)).hexdigest()[:32]
-
-
 def bind_owner_intent(root: Path, binding: object, approval: object) -> dict:
     """Persist a host-approved owner baseline; callers cannot self-approve it."""
     project_root = resolve_project_root(str(root))
     normalized = _owner_intent_binding(project_root, binding)
-    approval_reference = _verify_host_owner_intent_approval(
+    approval_reference, approval_trust_anchor = _verify_host_owner_intent_approval(
         project_root, normalized, approval
     )
     operation = _begin_authority_mutation(project_root, "owner-intent-bind")
@@ -11132,7 +11306,11 @@ def bind_owner_intent(root: Path, binding: object, approval: object) -> dict:
             if record["owner_intent_digest"] == digest
         ]
         if matches:
-            if len(matches) != 1 or matches[0]["approval_reference"] != approval_reference:
+            if (
+                len(matches) != 1
+                or matches[0]["approval_reference"] != approval_reference
+                or matches[0].get("approval_trust_anchor") != approval_trust_anchor
+            ):
                 raise EngineeringError("Engineering owner intent replay conflicts with retained state.")
             return dict(matches[0])
         controller = _project_controller_dir(project_root)
@@ -11148,6 +11326,7 @@ def bind_owner_intent(root: Path, binding: object, approval: object) -> dict:
             **normalized,
             "owner_intent_digest": digest,
             "approval_reference": approval_reference,
+            "approval_trust_anchor": approval_trust_anchor,
             "bound_at": datetime.now(timezone.utc).isoformat(),
             "status": "active",
         }
@@ -11173,7 +11352,7 @@ def owner_intent_status(root: Path, authority_id: str | None = None) -> dict:
     active = [record for record in candidates if record["status"] == "active"]
     if len(active) > 1:
         raise EngineeringError("Engineering owner intent status is ambiguous.")
-    record = active[0] if active else None
+    record = active[0] if active and "approval_trust_anchor" in active[0] else None
     return {
         "schema": OWNER_INTENT_STATUS_SCHEMA,
         "state": "bound" if record is not None else "owner_intent_unknown",
@@ -11247,7 +11426,7 @@ def _outcome_audit_claims(value: object) -> dict:
     if len({item["outcome_id"] for item in states}) != len(states):
         raise EngineeringError("Engineering independent outcome audit is invalid.")
     return {
-        "schema": "engineering.independent-outcome-audit-claims.v1",
+        "schema": "engineering.independent-outcome-audit-claims.v2",
         "acceptance_id": value.get("acceptance_id"),
         "completion_digest": value.get("completion_digest"),
         "artifact_digest": value.get("artifact_digest"),
@@ -11263,65 +11442,29 @@ def _outcome_audit_claims(value: object) -> dict:
 
 def _verify_independent_outcome_audit(root: Path, value: dict) -> dict:
     attestation = value.get("audit_attestation")
-    expected = {"schema", "approver", "claims", "signature"}
     claims = _outcome_audit_claims(value)
-    if (
-        not isinstance(attestation, dict)
-        or set(attestation) != expected
-        or attestation.get("schema") != INDEPENDENT_OUTCOME_AUDIT_SCHEMA
-        or attestation.get("claims") != claims
-        or not isinstance(attestation.get("signature"), str)
-        or not attestation["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
-        or len(attestation["signature"]) > 16384
-    ):
-        raise EngineeringError("Engineering independent outcome audit is invalid.")
     try:
-        approver = _assurance_id(attestation["approver"], "independent outcome audit approver")
+        auditor_id = _assurance_id(
+            value["roles"]["auditor_id"], "independent outcome audit auditor"
+        )
     except EngineeringError as error:
         raise EngineeringError("Engineering independent outcome audit is invalid.") from error
-    try:
-        allowed = _git_bytes(root, "show", "HEAD:.engineering-host-approvers")
-    except EngineeringError as error:
-        raise EngineeringError(
-            "Engineering independent outcome audit trust is unavailable."
-        ) from error
-    if not allowed or len(allowed) > 65536 or b"\x00" in allowed:
-        raise EngineeringError("Engineering independent outcome audit trust is invalid.")
-    with tempfile.TemporaryDirectory(prefix="engineering-outcome-audit-") as temporary:
-        allowed_path = Path(temporary) / "allowed_signers"
-        signature_path = Path(temporary) / "audit.sig"
-        allowed_path.write_bytes(allowed)
-        signature_path.write_text(attestation["signature"], encoding="ascii")
-        try:
-            verified = subprocess.run(
-                [
-                    "ssh-keygen",
-                    "-Y",
-                    "verify",
-                    "-f",
-                    str(allowed_path),
-                    "-I",
-                    approver,
-                    "-n",
-                    "engineering-independent-audit",
-                    "-s",
-                    str(signature_path),
-                ],
-                input=_canonical_json(claims),
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise EngineeringError(
-                "Engineering independent outcome audit verification is unavailable."
-            ) from error
-    if verified.returncode != 0:
-        raise EngineeringError("Engineering independent outcome audit signature is invalid.")
+    _, anchor = _verify_external_host_signature(
+        root,
+        attestation,
+        approval_schema=INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
+        claims_schema="engineering.independent-outcome-audit-claims.v2",
+        claims=claims,
+        namespace="engineering-independent-audit",
+        label="Engineering independent outcome audit",
+        reference_prefix="independent-outcome-audit-",
+        required_principal=auditor_id,
+    )
     return {
         "schema": INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
-        "approver": approver,
+        "approver": auditor_id,
         "claims": claims,
+        "trust_anchor": anchor,
         "signature": attestation["signature"],
     }
 
@@ -11719,7 +11862,7 @@ def _load_release_tokens(root: Path) -> dict:
     for record in ledger["tokens"]:
         expected = {"token", "issued_at", "signature"}
         token = record.get("token") if isinstance(record, dict) else None
-        token_keys = {
+        legacy_token_keys = {
             "schema",
             "token_id",
             "completion_id",
@@ -11733,14 +11876,52 @@ def _load_release_tokens(root: Path) -> dict:
             "acceptance_digest",
             "actions",
         }
+        token_keys = legacy_token_keys | {"install_source_bundle"}
+        source_bundle = (
+            token.get("install_source_bundle") if isinstance(token, dict) else None
+        )
+        valid_source_bundle = (
+            isinstance(source_bundle, dict)
+            and set(source_bundle)
+            == {"source_git_commit", "source_digest", "skill_version"}
+            and re.fullmatch(
+                r"[0-9a-f]{40}", str(source_bundle.get("source_git_commit", ""))
+            )
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(source_bundle.get("source_digest", ""))
+            )
+            and re.fullmatch(
+                r"[0-9]+\.[0-9]+\.[0-9]+", str(source_bundle.get("skill_version", ""))
+            )
+        )
+        valid_legacy = (
+            isinstance(token, dict)
+            and set(token) == legacy_token_keys
+            and token.get("schema") == LEGACY_RELEASE_TOKEN_SCHEMA
+            and token.get("actions") == sorted(RELEASE_TOKEN_ACTIONS)
+        )
+        valid_current = (
+            isinstance(token, dict)
+            and set(token) == token_keys
+            and token.get("schema") == RELEASE_TOKEN_SCHEMA
+            and isinstance(token.get("actions"), list)
+            and (
+                (
+                    source_bundle is None
+                    and token["actions"]
+                    == sorted(RELEASE_TOKEN_ACTIONS - {"install"})
+                )
+                or (
+                    valid_source_bundle
+                    and token["actions"] == sorted(RELEASE_TOKEN_ACTIONS)
+                )
+            )
+        )
         if (
             not isinstance(record, dict)
             or set(record) != expected
             or not isinstance(token, dict)
-            or set(token) != token_keys
-            or token.get("schema") != RELEASE_TOKEN_SCHEMA
-            or not isinstance(token.get("actions"), list)
-            or token["actions"] != sorted(RELEASE_TOKEN_ACTIONS)
+            or not (valid_legacy or valid_current)
             or any(
                 not re.fullmatch(r"sha256:[0-9a-f]{64}", str(token.get(name, "")))
                 for name in (
@@ -11872,11 +12053,60 @@ def _release_gate_acceptance(
     return acceptance, intent, acceptance_digest
 
 
-def release_gate(root: Path, completion_id: str, acceptance_id: str) -> dict:
+def _release_install_source_bundle(
+    project_root: Path, completion_id: str, install_source: Path | str | None
+) -> dict | None:
+    """Resolve the only clean bundle an install-capable release token may name."""
+    if install_source is None:
+        return None
+    source = _expand_install_path(install_source)
+    try:
+        source_repository = Path(
+            _identity_git(source, "rev-parse", "--show-toplevel")
+        ).resolve()
+    except (EngineeringError, OSError) as error:
+        raise EngineeringError("Engineering release install source is unavailable.") from error
+    if source_repository != project_root.resolve():
+        raise EngineeringError(
+            "Engineering release install source is not the accepted project repository."
+        )
+    _, manifest, source_commit, source_digest = _bundle_files(source)
+    completion, completion_digest = _terminal_completion(project_root, completion_id)
+    _completion_artifact_digest(completion, completion_digest)
+    result_identity = completion.get("result_identity")
+    accepted_commit = (
+        result_identity.get("commit") if isinstance(result_identity, dict) else None
+    )
+    if source_commit != accepted_commit:
+        raise EngineeringError(
+            "Engineering release install source is not the exact accepted commit."
+        )
+    return {
+        "source_git_commit": source_commit,
+        "source_digest": source_digest,
+        "skill_version": manifest["version"],
+    }
+
+
+def release_gate(
+    root: Path,
+    completion_id: str,
+    acceptance_id: str,
+    *,
+    install_source: Path | str | None = None,
+) -> dict:
     """Issue an opaque exact-artifact token only after every core owner outcome passes."""
     project_root = resolve_project_root(str(root))
     acceptance, intent, acceptance_digest = _release_gate_acceptance(
         project_root, completion_id, acceptance_id
+    )
+    install_source_bundle = _release_install_source_bundle(
+        project_root, completion_id, install_source
+    )
+    actions = sorted(
+        RELEASE_TOKEN_ACTIONS
+        if install_source_bundle is not None
+        else RELEASE_TOKEN_ACTIONS - {"install"}
     )
     token_seed = {
         "completion_id": completion_id,
@@ -11886,6 +12116,8 @@ def release_gate(root: Path, completion_id: str, acceptance_id: str) -> dict:
         "mapping_digest": acceptance["mapping_digest"],
         "evidence_digest": acceptance["evidence_digest"],
         "acceptance_digest": acceptance_digest,
+        "install_source_bundle": install_source_bundle,
+        "actions": actions,
     }
     token_id = "release-token-" + hashlib.sha256(_canonical_json(token_seed)).hexdigest()[:32]
     token = {
@@ -11900,7 +12132,8 @@ def release_gate(root: Path, completion_id: str, acceptance_id: str) -> dict:
         "evidence_digest": acceptance["evidence_digest"],
         "acceptance_id": acceptance["acceptance_id"],
         "acceptance_digest": acceptance_digest,
-        "actions": sorted(RELEASE_TOKEN_ACTIONS),
+        "install_source_bundle": install_source_bundle,
+        "actions": actions,
     }
     operation = _begin_authority_mutation(project_root, "release-gate")
     try:
@@ -11947,16 +12180,26 @@ def verify_release_token(
     token = matches[0]["token"]
     if token["artifact_digest"] != artifact_digest or action not in token["actions"]:
         raise EngineeringError("Engineering release token does not authorize this exact artifact action.")
+    source_bundle = token.get("install_source_bundle")
+    if action == "install" and (
+        token.get("schema") != RELEASE_TOKEN_SCHEMA
+        or not isinstance(source_bundle, dict)
+    ):
+        raise EngineeringError(
+            "Engineering release token does not authorize an exact install source bundle."
+        )
     _active_owner_intent(
         project_root, token["owner_intent_id"], token["owner_intent_digest"]
     )
     return {
-        "schema": RELEASE_TOKEN_SCHEMA,
+        "schema": token["schema"],
         "token_id": token_id,
+        "token_digest": _json_digest(token),
         "artifact_digest": artifact_digest,
         "action": action,
         "acceptance_id": token["acceptance_id"],
         "owner_intent_digest": token["owner_intent_digest"],
+        "source_bundle": source_bundle,
         "native_approval_required": True,
     }
 
@@ -11965,7 +12208,9 @@ def persist_scoped_authority(root: Path, binding: object, approval: object) -> d
     """Persist exact business authority from a retained host approval attestation."""
     project_root = resolve_project_root(str(root))
     normalized = _scoped_authority_binding(project_root, binding)
-    approval_id = _verify_host_authority_approval(project_root, normalized, approval)
+    approval_id, approval_trust_anchor = _verify_host_authority_approval(
+        project_root, normalized, approval
+    )
     operation = _begin_authority_mutation(project_root, "authority-persist")
     try:
         controller = _project_controller_dir(project_root)
@@ -11973,6 +12218,7 @@ def persist_scoped_authority(root: Path, binding: object, approval: object) -> d
         comparable = {
             **normalized,
             "approval_reference": approval_id,
+            "approval_trust_anchor": approval_trust_anchor,
             "parent_authority_id": None,
         }
         for retained in ledger["authorities"]:
@@ -11987,6 +12233,7 @@ def persist_scoped_authority(root: Path, binding: object, approval: object) -> d
             "authority_id": "authority-" + uuid.uuid4().hex,
             **normalized,
             "approval_reference": approval_id,
+            "approval_trust_anchor": approval_trust_anchor,
             "parent_authority_id": None,
             "status": "active",
             "transitioned_at": None,
@@ -12095,6 +12342,8 @@ def resolve_scoped_authority(root: Path, request: object) -> dict:
     if len(matches) != 1:
         return _authority_resolution(normalized, reason="missing_authority")
     record = matches[0]
+    if "approval_trust_anchor" not in record:
+        return _authority_resolution(normalized, reason="historical_unanchored")
     if record["status"] != "active":
         return _authority_resolution(normalized, reason=record["status"])
     if _assurance_timestamp(record["expires_at"]) <= datetime.now(timezone.utc):
@@ -12137,6 +12386,10 @@ def _delegate_scoped_authority_unlocked(root: Path, parent_id: str, binding: obj
     if len(matches) != 1:
         raise EngineeringError("Engineering scoped authority parent is missing.")
     parent = matches[0]
+    if "approval_trust_anchor" not in parent:
+        raise EngineeringError(
+            "Engineering scoped authority parent is historical and cannot delegate new work."
+        )
     if parent["status"] != "active" or _assurance_timestamp(parent["expires_at"]) <= datetime.now(timezone.utc):
         raise EngineeringError("Engineering scoped authority parent is not active.")
     for field in (
@@ -12158,6 +12411,7 @@ def _delegate_scoped_authority_unlocked(root: Path, parent_id: str, binding: obj
     comparable = {
         **normalized,
         "approval_reference": parent["approval_reference"],
+        "approval_trust_anchor": parent["approval_trust_anchor"],
         "parent_authority_id": parent_id,
     }
     for retained in ledger["authorities"]:
@@ -12171,6 +12425,7 @@ def _delegate_scoped_authority_unlocked(root: Path, parent_id: str, binding: obj
         "authority_id": "authority-" + uuid.uuid4().hex,
         **normalized,
         "approval_reference": parent["approval_reference"],
+        "approval_trust_anchor": parent["approval_trust_anchor"],
         "parent_authority_id": parent_id,
         "status": "active",
         "transitioned_at": None,
@@ -14310,7 +14565,7 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
         receipt = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise EngineeringError("Engineering install receipt is invalid.") from error
-    required = {
+    legacy_required = {
         "schema",
         "status",
         "skill_version",
@@ -14322,10 +14577,48 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
         "claude_parity_hash",
         "signature",
     }
+    authorization_required = {
+        "schema",
+        "token_id",
+        "token_digest",
+        "artifact_digest",
+        "acceptance_id",
+        "source_bundle",
+    }
+    authorization = receipt.get("release_authorization") if isinstance(receipt, dict) else None
+    v2_required = legacy_required | {"release_authorization"}
+    valid_legacy = (
+        isinstance(receipt, dict)
+        and set(receipt) == legacy_required
+        and receipt.get("schema") == "engineering.install.v1"
+    )
+    valid_v2 = (
+        isinstance(receipt, dict)
+        and set(receipt) == v2_required
+        and receipt.get("schema") == "engineering.install.v2"
+        and isinstance(authorization, dict)
+        and set(authorization) == authorization_required
+        and authorization.get("schema") == "engineering.install-release-authorization.v1"
+        and isinstance(authorization.get("source_bundle"), dict)
+        and set(authorization["source_bundle"])
+        == {"source_git_commit", "source_digest", "skill_version"}
+        and authorization["source_bundle"].get("source_git_commit")
+        == receipt.get("source_git_commit")
+        and authorization["source_bundle"].get("source_digest")
+        == receipt.get("source_digest")
+        and authorization["source_bundle"].get("skill_version")
+        == receipt.get("skill_version")
+        and isinstance(authorization.get("token_id"), str)
+        and re.fullmatch(r"release-token-[0-9a-f]{32}", authorization["token_id"])
+        and all(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(authorization.get(name, "")))
+            for name in ("token_digest", "artifact_digest")
+        )
+        and isinstance(authorization.get("acceptance_id"), str)
+        and re.fullmatch(r"acceptance-[A-Za-z0-9][A-Za-z0-9._-]*", authorization["acceptance_id"])
+    )
     if (
-        not isinstance(receipt, dict)
-        or set(receipt) != required
-        or receipt.get("schema") != "engineering.install.v1"
+        not (valid_legacy or valid_v2)
         or receipt.get("status") not in {"installed", "rolled_back"}
         or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_git_commit", "")))
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("source_digest", "")))
@@ -14565,6 +14858,40 @@ def install_bundle(
             release_artifact_digest,
             "install",
         )
+        source_bundle = release_gate.get("source_bundle") if isinstance(release_gate, dict) else None
+        expected_source_bundle = {
+            "source_git_commit": commit,
+            "source_digest": source_digest,
+            "skill_version": manifest["version"],
+        }
+        if source_bundle != expected_source_bundle:
+            raise EngineeringError(
+                "Engineering release token does not authorize this exact source bundle."
+            )
+        release_authorization = {
+            "schema": "engineering.install-release-authorization.v1",
+            "token_id": release_gate.get("token_id"),
+            "token_digest": release_gate.get("token_digest"),
+            "artifact_digest": release_gate.get("artifact_digest"),
+            "acceptance_id": release_gate.get("acceptance_id"),
+            "source_bundle": expected_source_bundle,
+        }
+        if (
+            not isinstance(release_authorization["token_id"], str)
+            or not re.fullmatch(r"release-token-[0-9a-f]{32}", release_authorization["token_id"])
+            or any(
+                not re.fullmatch(r"sha256:[0-9a-f]{64}", str(release_authorization[name]))
+                for name in ("token_digest", "artifact_digest")
+            )
+            or not isinstance(release_authorization["acceptance_id"], str)
+            or not re.fullmatch(
+                r"acceptance-[A-Za-z0-9][A-Za-z0-9._-]*",
+                release_authorization["acceptance_id"],
+            )
+        ):
+            raise EngineeringError("Engineering release token authorization facts are invalid.")
+    else:
+        release_authorization = None
     paths = _install_paths(home)
     _validate_install_paths(home, paths)
     home = home.resolve()
@@ -14591,6 +14918,12 @@ def install_bundle(
                 and _valid_forwarder(paths["shim"], "engineering-traceability")
                 and _valid_command_launchers(paths["command"])
             ):
+                if release_authorization is not None and (
+                    current.get("release_authorization") != release_authorization
+                ):
+                    raise EngineeringError(
+                        "Engineering installed bundle release authorization is mismatched."
+                    )
                 return {
                     **current,
                     **({"release_gate": release_gate} if release_gate is not None else {}),
@@ -14610,8 +14943,12 @@ def install_bundle(
         )
         _write_command_launchers(stages["command"])
         parity = _validated_installed_bundle(stages["canonical"])
-        receipt = _sign_install_receipt({
-            "schema": "engineering.install.v1",
+        if _tree_digest(stages["canonical"]) != source_digest:
+            raise EngineeringError(
+                "Engineering staged bundle does not match the authorized source bundle."
+            )
+        receipt_payload = {
+            "schema": "engineering.install.v2" if release_authorization is not None else "engineering.install.v1",
             "status": "installed",
             "skill_version": manifest["version"],
             "source_git_commit": commit,
@@ -14620,7 +14957,10 @@ def install_bundle(
             "installed_at": _utc_now(),
             "codex_parity_hash": parity,
             "claude_parity_hash": parity,
-        }, install_key)
+        }
+        if release_authorization is not None:
+            receipt_payload["release_authorization"] = release_authorization
+        receipt = _sign_install_receipt(receipt_payload, install_key)
         stages["receipt"].parent.mkdir(parents=True, exist_ok=True)
         stages["receipt"].write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         replacements = [
@@ -15458,6 +15798,7 @@ def main() -> int:
     release_gate_parser.add_argument("root")
     release_gate_parser.add_argument("completion_id")
     release_gate_parser.add_argument("--acceptance-id", required=True)
+    release_gate_parser.add_argument("--install-source")
     verify_release_token_parser = commands.add_parser("verify-release-token")
     verify_release_token_parser.add_argument("root")
     verify_release_token_parser.add_argument("token_id")
@@ -15705,7 +16046,17 @@ def main() -> int:
                 raise EngineeringError("Engineering outcome acceptance input is invalid.") from error
             result = record_outcome_acceptance(root, arguments.completion_id, acceptance)
         elif arguments.command == "release-gate":
-            result = release_gate(root, arguments.completion_id, arguments.acceptance_id)
+            release_kwargs = (
+                {"install_source": Path(arguments.install_source)}
+                if arguments.install_source is not None
+                else {}
+            )
+            result = release_gate(
+                root,
+                arguments.completion_id,
+                arguments.acceptance_id,
+                **release_kwargs,
+            )
         elif arguments.command == "verify-release-token":
             result = verify_release_token(
                 root,

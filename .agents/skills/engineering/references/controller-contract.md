@@ -428,10 +428,21 @@ its criticality, statement digest, and required evidence class, interface, and
 environment. Intent bodies, approvals, credentials, and runtime evidence are
 never stored in Git. `engineering intent-bind <root> --binding-file <path|->
 --approval-file <path|->` verifies a distinct `engineering-owner-intent` SSH
-signature against the committed host signer list, then retains a signed private
-controller record. Engineering does not mint approval. `engineering
+signature against a signed `engineering.host-trust-anchor.v1` receipt for the
+live canonical `origin` default branch, then retains the exact anchor in a
+signed private controller record. The receipt includes the remote/default ref,
+commit, tree, signer blob, and digests; candidate `HEAD` signer files are never
+trust anchors. Missing, stale, or mismatched remote/tracking/blob facts fail
+closed. Engineering does not mint approval. `engineering
 intent-status <root> [--authority-id <intent-id>]` is read-only and returns
 only `bound` or `owner_intent_unknown` plus opaque identity facts.
+
+The same canonical-anchor rule applies to every new detached traceability host
+attestation. `engineering.traceability-host-attestation.v2` signs its bounded
+receipt claims and the exact anchor receipt. A v1 host attestation remains
+readable historical evidence but cannot attach the current-trust token or
+upgrade a lifecycle reduction. New ingestion rejects it; unavailable or
+mismatched canonical anchor facts fail closed.
 
 For v2 handoffs, `engineering approve-scope <root> --decision-id <id>
 --handoff-file <path|-> --owner-intent-id <intent-id>` requires that exact
@@ -441,12 +452,21 @@ candidate mapping proposals, but no candidate baseline. The controller injects
 the complete baseline from the active owner intent and rejects an omitted,
 narrowed, duplicated, or substituted list. Every owner outcome maps exactly
 once to `INCLUDED`, `REPLACED`, `DEFERRED`, or `EXCLUDED`. `REPLACED` requires
-a replacement identity and `engineering.outcome-equivalence.v1` evidence from
-a reviewer distinct from architect, implementer, and writer. `DEFERRED` and
-`EXCLUDED` require their own externally verified
-`engineering.host-owner-exception.v1` signature bound to the exact intent,
-outcome, and disposition. The normalized mapping digest remains in scope
+a replacement identity and externally attested
+`engineering.outcome-equivalence.v2` evidence from a reviewer distinct from
+architect, implementer, and writer; the SSH signature principal must equal that
+declared reviewer. `DEFERRED` and `EXCLUDED` require their own externally
+verified `engineering.host-owner-exception.v2` signature bound to the exact
+intent, outcome, disposition, and anchor receipt. The normalized mapping digest remains in scope
 handoff, preparation, completion, and replay records.
+
+Preparation derives intent impact from explicit/query graph selection **and**
+the normalized authorized scope and approved result-artifact source paths.
+Completion repeats that exact-edge analysis for every observed changed artifact,
+including both rename endpoints, before it retains a completion. If observed
+impact requires owner intent but the preparation lacks the matching active
+owner-intent binding and outcome-survival v2 mapping, completion fails closed;
+a candidate cannot repair the omission after execution starts.
 
 `engineering outcome-accept <root> <completion-id> --input-file <path|->`
 retains `engineering.outcome-acceptance.v1` only after it verifies the exact
@@ -454,7 +474,8 @@ terminal completion and artifact digest, active owner-intent and mapping
 digests, a canonical evidence-matrix digest, and a separate
 `engineering-independent-audit` signature. The auditor
 is distinct from architect, implementer, and writer and signs a comparison to
-the original owner intent. Each core outcome is `accepted`, `failed`, or
+the original owner intent. The attestation carries the canonical trust-anchor
+receipt and its SSH principal must equal the declared auditor identity. Each core outcome is `accepted`, `failed`, or
 `unknown`; all three states remain distinct. Evidence entries are ordered as
 `design`, `proxy`, `unit`, `integration`, `end_to_end`, and `real_outcome`.
 Only an equal-or-higher class at the exact required interface and environment
@@ -472,18 +493,25 @@ the active owner intent ID, digest, and authority epoch. Its own digest covers
 those facts. A resumed or compacted handoff whose intent digest changes is not a
 valid continuation and fails closed before execution.
 
-`engineering release-gate <root> <completion-id> --acceptance-id <id>` emits
-one signed opaque `engineering.release-token.v1` only when the current exact
-artifact has independently accepted evidence for every core owner outcome.
+`engineering release-gate <root> <completion-id> --acceptance-id <id>
+--install-source <path>` emits one signed opaque
+`engineering.release-token.v2` only when the current exact artifact has
+independently accepted evidence for every core owner outcome. Omitting
+`--install-source` emits a merge/activation-only token. An install action is
+included only when the controller computes a clean source bundle in the
+accepted repository whose commit equals the accepted terminal commit.
 `engineering verify-release-token <root> <token-id> <artifact-digest> --action
 <merge|install|activation>` validates only that exact action/artifact binding
-and returns `native_approval_required`. It does not merge, install, activate,
-deploy, or replace the separate native approval for any of those actions.
+and returns its signed-token digest, source-bundle receipt when applicable, and
+`native_approval_required`. It does not merge, install, activate, deploy, or
+replace the separate native approval for any of those actions.
 The native `install_bundle(source, home, release_token={"root": ..., "token_id":
 ...}, release_artifact_digest=...)` boundary requires the same `install` token
-preflight for every v2.2.6+ bundle; it never manufactures a token and still
-leaves native install approval required. Its legacy two-argument form remains
-readable only for the preserved v2.2.5 receipt and rollback path.
+preflight for every v2.2.6+ bundle; it recomputes the source commit/digest
+before copy and the staged-tree digest after copy, reconciles those facts in
+`engineering.install.v2`, never manufactures a token, and still leaves native
+install approval required. Its legacy two-argument form remains readable only
+for the preserved v2.2.5 receipt and rollback path.
 Legacy v1 handoffs and v2.2.5 completion evidence remain readable but lack this
 binding and are `owner_intent_unknown`; they cannot receive a v2.2.6 release
 token.
@@ -555,17 +583,17 @@ an authority claim made by Engineering.
 Approval presence is distinct from whether the host should request approval
 again. After the trusted host observes approval through its native boundary,
 the host adapter signs the exact normalized binding with an external SSH
-signing key. The corresponding allowed signer must be pinned in the governed
-repository's committed `.engineering-host-approvers` file; the private key is
-never available to Engineering. Engineering exposes no approval-minting API.
-`persist_scoped_authority` verifies the `engineering-authority` SSH signature
-against the approver file at `HEAD`, rejects arbitrary or locally minted
-references, and stores
+signing key. The corresponding signer must be admitted by the exact
+canonical-default-branch `engineering.host-trust-anchor.v1` receipt; the
+private key is never available to Engineering. Engineering exposes no
+approval-minting API. `persist_scoped_authority` verifies the
+`engineering-authority` SSH signature and its anchor receipt, rejects
+candidate-HEAD, arbitrary, or locally minted references, and stores
 one controller-signed `engineering.scoped-authority.v1` record only from that
 retained attestation under the
 Git-common project controller. It binds immutable repository lineage,
 authority epoch, target, action class, normalized scope, safeguards, approval
-reference, native approval requirements, issue time, and expiry. Turn, retry, callback, and bounded-repair
+reference, anchor receipt, native approval requirements, issue time, and expiry. Turn, retry, callback, and bounded-repair
 metadata are deliberately excluded from that binding, so unchanged work
 retains authority without repeated prompts.
 
@@ -1002,9 +1030,12 @@ diff, command, commit, publication, release, or installation action.
 validates the tracked Git source closure and rejects symlinks, junctions,
 reparse points, unpinned Graphify metadata, and non-Git sources. Under one
 foreground install lock it stages beside the canonical target, replaces the
-canonical bundle, generic loaders, and command launchers, and writes `engineering.install.v1` with
-the skill version, source commit, source digest, Graphify commit, UTC timestamp,
-and equal Codex/Claude canonical-skill hashes. A failure restores the exact
+canonical bundle, generic loaders, and command launchers, and writes
+`engineering.install.v1` for preserved legacy bundles or
+`engineering.install.v2` for release-gated v2.2.6+ bundles. The v2 receipt
+reconciles the signed token digest, exact accepted artifact digest, source
+commit, source digest, skill version, Graphify commit, UTC timestamp, and equal
+Codex/Claude canonical-skill hashes. A failure restores the exact
 prior surfaces. Publication of every bundle, loader, receipt, and rollback
 surface uses one shared transaction. One fully digest-validated prior canonical
 bundle and receipt are retained;

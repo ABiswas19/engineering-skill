@@ -70,7 +70,7 @@ class RepositoryContractTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, contract)
         self.assertIn("engineering.owner-intent.v1", contract)
-        self.assertIn("engineering.release-token.v1", contract)
+        self.assertIn("engineering.release-token.v2", contract)
 
     def test_ci_installs_the_pinned_graphify_dependency(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(

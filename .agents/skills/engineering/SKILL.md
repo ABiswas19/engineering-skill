@@ -7,55 +7,51 @@ description: Use when a non-trivial software task needs setup, planning, impleme
 
 ## What Engineering does
 
-Engineering makes changes verifiable from request through completion, adapting
-to instructions, decisions, contracts, tests, toolchain, and approval
-boundaries. Skip conversation, translation, formatting, or inspection.
+Engineering makes non-trivial changes verifiable from request through
+completion, across instructions, contracts, tests, and approval boundaries.
 
-The orchestrator independently accepts or rejects the exact artifact.
-Engineering preserves native Codex and Claude semantics, tools, permissions,
-autonomy, and concurrency, with one writer per shared resource.
+The orchestrator independently accepts the exact artifact. Engineering preserves
+native Codex and Claude semantics, tools, permissions, autonomy, concurrency,
+and one writer per shared resource.
 
-Treat user feedback as seed evidence. Before dispatch, reconstruct the decision
+Treat feedback as seed evidence. Before dispatch, reconstruct the decision
 ledger, approved intent, dependencies, sibling flows, and bounded workspace.
-For a material redesign, replacement, deletion, or simplification, map every
-baseline outcome as INCLUDED, REPLACED, DEFERRED, or EXCLUDED. Replacement needs
-outcome-equivalence evidence; deferral or exclusion needs exact owner authority.
-Unknown traceability permits advisory analysis only, never accepted design or
-implementation readiness. Independent acceptance verifies original outcome
-survival, not merely the candidate's narrower contract.
-Intent-impacting work needs external owner intent. A controller-injected
-baseline and independently accepted exact-artifact token precede separate
-native approval.
-For material risk, architecture or the narrowest specialist checks adjacent
-omissions and gives the implementer approved scope. Reject narrow handoffs and
-proxy-only results.
+For material redesign, replacement, deletion, or simplification, map every
+baseline outcome as INCLUDED, REPLACED, DEFERRED, or EXCLUDED. Replacement
+needs independent equivalence; deferral/exclusion needs exact owner authority.
+Unknown traceability permits advisory analysis, never accepted readiness.
+Intent-impacting work needs external owner intent, a controller-injected
+baseline, and an independently accepted exact-artifact token before separate
+native approval. New owner approvals, exceptions, audits, equivalence, and
+traceability host attestations use a signed canonical-default-branch anchor,
+not a candidate signer file; auditor/reviewer principal equals declared role.
+Legacy traceability attestations remain readable but cannot establish current
+trust. Impact derives from graph context plus authorized, approved, and changed
+paths; completion checks rename endpoints. An install token binds the accepted
+clean source bundle and is rechecked before/after staging; it never replaces
+native install approval. Reject narrow handoffs and proxy-only results.
 
-Model selection stays native. Delivery evaluation records requested, actual,
-and fallback model facts. Research separates facts, assumptions, citations,
-and Unknowns and never invents organization-specific facts.
+Model selection stays native; delivery records requested, actual, and fallback
+facts. Research separates facts, assumptions, citations, and Unknowns.
 
-Engineering completion runs automatically before claiming non-trivial work is
-ready and records applicable evidence. Controller commands are diagnostics and
-CI interfaces.
+Completion runs automatically before claiming non-trivial work ready; controller
+commands are diagnostic and CI interfaces.
 Use `engineering map`; see `references/controller-contract.md` for protocols.
 
 ## Graph and context
 
-Engineering is local-first. Graphify supplies the base graph; the deterministic
-Engineering overlay supplies verified links, decisions, and checks. Claims use
-the canonical default-branch checkpoint. Missing or incompatible Graphify
-blocks graph claims; stale or conflicting evidence remains Unknown.
-Same-machine worktrees share the Git-common local checkpoint catalogue.
-Separate machines recreate their own evidence. Enterprise graph sharing is an
-inactive opt-in. A cold start builds, an incremental change updates affected
-material, and a cache hit reuses validated evidence.
+Engineering is local-first. Graphify supplies the base graph and a deterministic
+overlay supplies verified links, decisions, and checks. Claims use the canonical default-branch checkpoint; missing/incompatible Graphify blocks graph claims.
+Same-machine worktrees share Git-common checkpoints; other machines recreate
+evidence. A cold start builds, an incremental change updates, and a cache hit
+reuses validated evidence.
 
 ## Setup and autonomy
 
-For an unmanaged project, work remains advisory with traceability Unknown and
-writes nothing. Setup is always a preview first, requires explicit setup authority,
-and preserves instructions and hooks. Installing or upgrading Graphify is a
-separate approval. The first eligible commit establishes the canonical checkpoint.
+For an unmanaged project, work is advisory and writes nothing. Setup previews
+first, needs explicit authority, and preserves instructions/hooks. Graphify
+installation or upgrade is separately approved; the first eligible commit
+establishes the canonical checkpoint.
 
 Autonomy is Guided, Collaborative (default), or Steward. Guided asks before
 project changes; Collaborative handles routine in-scope work; Steward may also
