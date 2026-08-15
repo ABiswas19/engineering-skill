@@ -72,7 +72,14 @@ POST_ACTIVATION_IMPORT_SCOPES = {"accepted_owner_outcomes", "product_releases"}
 LEGACY_RELEASE_TOKEN_SCHEMA = "engineering.release-token.v1"
 RELEASE_TOKEN_SCHEMA = "engineering.release-token.v2"
 RELEASE_TOKEN_LEDGER_SCHEMA = "engineering.release-tokens.v1"
-V226_BOOTSTRAP_AUTHORIZATION_SCHEMA = "engineering.v2.2.6-bootstrap-authorization.v1"
+LEGACY_V226_BOOTSTRAP_AUTHORIZATION_SCHEMA = "engineering.v2.2.6-bootstrap-authorization.v1"
+V226_BOOTSTRAP_AUTHORIZATION_SCHEMA = "engineering.v2.2.6-bootstrap-authorization.v2"
+V226_BOOTSTRAP_HOST_RECORD_SCHEMA = "engineering.v2.2.6-bootstrap-host-record.v1"
+V226_BOOTSTRAP_TRUST_ANCHOR_SCHEMA = "engineering.v2.2.6-bootstrap-trust-anchor.v1"
+V226_BOOTSTRAP_HOST_RECEIPT_SCHEMA = "engineering.v2.2.6-bootstrap-host-receipt.v1"
+V226_BOOTSTRAP_OWNER_APPROVAL_SCHEMA = "engineering.v2.2.6-bootstrap-owner-approval.v1"
+V226_BOOTSTRAP_AUDIT_SCHEMA = "engineering.v2.2.6-bootstrap-audit.v1"
+V226_BOOTSTRAP_MAX_EVIDENCE_AGE = timedelta(days=30)
 NATIVE_APPROVAL_REQUIREMENTS = {"connector", "credential", "destructive", "system"}
 MAX_SCOPED_AUTHORITIES = 256
 MAX_AUTHORITY_AUDITS = 512
@@ -7094,6 +7101,160 @@ def _intent_impacting(
     return False
 
 
+def _checkpoint_source_paths(checkpoint: dict) -> set[str]:
+    """Return the normalized artifact paths represented by one exact checkpoint."""
+    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("nodes"), list):
+        return set()
+    return {
+        source["path"].replace("\\", "/")
+        for node in checkpoint["nodes"]
+        if isinstance(node, dict)
+        and isinstance(node.get("source"), dict)
+        and isinstance((source := node["source"]).get("path"), str)
+        and source["path"]
+        and not Path(source["path"]).is_absolute()
+        and ".." not in Path(source["path"]).parts
+    }
+
+
+def _path_exists_at_commit(root: Path, commit: str, path: str) -> bool:
+    """Check a bounded repository-relative path without interpreting it as an argument."""
+    if (
+        not isinstance(path, str)
+        or not path
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+    ):
+        return False
+    return (
+        subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", f"{commit}:{path}"],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
+def _requires_refreshed_intent_checkpoint(
+    root: Path,
+    preparation_commit: str,
+    base: dict,
+    changed: list[str],
+) -> bool:
+    """Return whether base evidence cannot safely cover the exact result.
+
+    A result checkpoint is mandatory when the result introduces a non-document
+    artifact which the preparation checkpoint could not have represented, or
+    when it alters the traceability mapping itself.  Ordinary documentation and
+    test follow-ups remain governed by their existing scope/contract checks;
+    they are not silently promoted into a capability merely because they are
+    new dirty-overlay files.
+    """
+    known = _checkpoint_source_paths(base)
+    for path in changed:
+        normalized = path.replace("\\", "/")
+        if normalized == "docs/engineering-traceability/links.json":
+            return True
+        if normalized in known or _path_exists_at_commit(root, preparation_commit, normalized):
+            continue
+        parts = PurePosixPath(normalized).parts
+        if parts and parts[0] in {"docs", "tests"}:
+            continue
+        if normalized.startswith("README") and normalized.endswith(".md"):
+            continue
+        return True
+    return False
+
+
+def _completion_intent_impact(
+    root: Path,
+    preparation_commit: str,
+    head: str,
+    dirty: bool,
+    changed: list[str],
+    authorization: dict,
+    scope_handoff: object,
+    checkpoint_status: dict,
+) -> bool:
+    """Assess both the preparation and exact result graph before completion.
+
+    The preparation graph is retained for historical links and dirty-overlay
+    continuity.  An exact result checkpoint is mandatory when the result adds
+    an artifact that base evidence cannot safely classify, or changes the
+    traceability mapping itself.  This blocks a newly introduced capability
+    path from evading the owner-intent fence while preserving ordinary
+    documentation/test follow-ups and their existing scope/contract checks.
+    """
+    base = _load_checkpoint(root, preparation_commit)
+    base_impact = _intent_impacting(
+        base,
+        [],
+        authorization.get("change_class"),
+        scope_handoff,
+        artifact_paths=changed,
+    )
+    requires_refreshed = _requires_refreshed_intent_checkpoint(
+        root, preparation_commit, base, changed
+    )
+    if dirty:
+        if base_impact:
+            return True
+        if requires_refreshed:
+            raise EngineeringError(
+                "Engineering completion cannot assess new result artifacts without a refreshed exact checkpoint."
+            )
+        return False
+    if (
+        not isinstance(checkpoint_status, dict)
+        or checkpoint_status.get("ready") is not True
+        or checkpoint_status.get("commit") != head
+    ):
+        if requires_refreshed:
+            raise EngineeringError("Engineering feature checkpoint refresh failed.")
+        return base_impact
+    try:
+        current = _load_checkpoint(root, head)
+    except (EngineeringError, TraceabilityError) as error:
+        if requires_refreshed:
+            raise EngineeringError(
+                "Engineering completion cannot assess result artifacts: refreshed exact checkpoint is unavailable."
+            ) from error
+        return base_impact
+    return base_impact or _intent_impacting(
+        current,
+        [],
+        authorization.get("change_class"),
+        scope_handoff,
+        artifact_paths=changed,
+    )
+
+
+def _require_completion_owner_intent(
+    root: Path, preparation: dict, scope_handoff: object
+) -> None:
+    """Require the externally bound intent and survival baseline for impact."""
+    bound_owner_intent = _bound_preparation_owner_intent(preparation)
+    survival = (
+        scope_handoff.get("outcome_survival")
+        if isinstance(scope_handoff, dict)
+        else None
+    )
+    if (
+        bound_owner_intent is None
+        or not isinstance(survival, dict)
+        or survival.get("schema") != OUTCOME_SURVIVAL_V2_SCHEMA
+    ):
+        raise EngineeringError(
+            "Engineering completion detected unbound intent impact from actual artifacts."
+        )
+    _active_owner_intent(
+        root,
+        bound_owner_intent["intent_id"],
+        bound_owner_intent["owner_intent_digest"],
+    )
+
+
 def _dirty_paths(root: Path) -> list[str]:
     output = subprocess.run(
         ["git", "-C", str(root), "status", "--porcelain", "-z", "--untracked-files=all"],
@@ -8987,35 +9148,19 @@ def complete(
         }
         authorization = preparation["authorization"]
         scope_handoff = authorization.get("scope_handoff")
-        actual_checkpoint = _load_checkpoint(
+        checkpoint_status = check_merge_readiness(project.root)
+        base_checkpoint = _load_checkpoint(
             project.root, preparation["project"]["commit"]
         )
-        actual_intent_impact = _intent_impacting(
-            actual_checkpoint,
+        if _intent_impacting(
+            base_checkpoint,
             [],
             authorization.get("change_class"),
             scope_handoff,
             artifact_paths=changed,
-        )
-        if actual_intent_impact:
-            bound_owner_intent = _bound_preparation_owner_intent(preparation)
-            survival = (
-                scope_handoff.get("outcome_survival")
-                if isinstance(scope_handoff, dict)
-                else None
-            )
-            if (
-                bound_owner_intent is None
-                or not isinstance(survival, dict)
-                or survival.get("schema") != OUTCOME_SURVIVAL_V2_SCHEMA
-            ):
-                raise EngineeringError(
-                    "Engineering completion detected unbound intent impact from actual artifacts."
-                )
-            _active_owner_intent(
-                project.root,
-                bound_owner_intent["intent_id"],
-                bound_owner_intent["owner_intent_digest"],
+        ):
+            _require_completion_owner_intent(
+                project.root, preparation, scope_handoff
             )
         if authorization.get("change_class") in MATERIAL_CHANGE_CLASSES and (
             not isinstance(scope_handoff, dict)
@@ -9061,9 +9206,6 @@ def complete(
         ]
         if expanded:
             raise EngineeringError("Engineering completion detected scope expansion.")
-        checkpoint_status = check_merge_readiness(project.root)
-        if not dirty and not checkpoint_status["ready"]:
-            raise EngineeringError("Engineering feature checkpoint refresh failed.")
         maintenance_observations = []
         if dirty or not checkpoint_status["ready"]:
             maintenance_observations.append(
@@ -9144,6 +9286,21 @@ def complete(
             contract_paths.update(_contract_paths_at(project.root, "WORKTREE"))
         if any(path in contract_paths and path not in predicted_paths for path in changed):
             raise EngineeringError("Engineering completion detected unpredicted public contract impact.")
+
+        actual_intent_impact = _completion_intent_impact(
+            project.root,
+            preparation["project"]["commit"],
+            head,
+            dirty,
+            changed,
+            authorization,
+            scope_handoff,
+            checkpoint_status,
+        )
+        if actual_intent_impact:
+            _require_completion_owner_intent(
+                project.root, preparation, scope_handoff
+            )
 
         required = preparation["required_checks"]
         if discover_checks(project.root) != required:
@@ -14861,8 +15018,8 @@ def _sign_install_receipt(receipt: dict, key: bytes) -> dict:
     }
 
 
-def _v226_bootstrap_authorization(value: object, source_bundle: object) -> dict:
-    """Validate root-provided first-delivery facts without invoking host trust.
+def _legacy_v226_bootstrap_authorization(value: object, source_bundle: object) -> dict:
+    """Read the superseded v1 bootstrap envelope for historical receipts only.
 
     This deliberately verifies only the exact source/artifact envelope.  The
     installed v2.2.5 controller, recorded owner approval, and independent
@@ -14882,7 +15039,7 @@ def _v226_bootstrap_authorization(value: object, source_bundle: object) -> dict:
     if (
         not isinstance(value, dict)
         or set(value) != expected
-        or value.get("schema") != V226_BOOTSTRAP_AUTHORIZATION_SCHEMA
+        or value.get("schema") != LEGACY_V226_BOOTSTRAP_AUTHORIZATION_SCHEMA
         or not isinstance(source_bundle, dict)
         or set(source_bundle) != source_expected
         or value.get("source_bundle") != source_bundle
@@ -14932,7 +15089,7 @@ def _v226_bootstrap_authorization(value: object, source_bundle: object) -> dict:
             {"audit_id": audit_id, "artifact_digest": value["artifact_digest"]}
         )
     return {
-        "schema": V226_BOOTSTRAP_AUTHORIZATION_SCHEMA,
+        "schema": LEGACY_V226_BOOTSTRAP_AUTHORIZATION_SCHEMA,
         "artifact_digest": value["artifact_digest"],
         "source_bundle": dict(source_bundle),
         "installed_v225_receipt_digest": value["installed_v225_receipt_digest"],
@@ -14942,33 +15099,744 @@ def _v226_bootstrap_authorization(value: object, source_bundle: object) -> dict:
     }
 
 
-def _v226_bootstrap_authorization_path(home: Path) -> Path:
-    """Return the native/root-owned first-delivery record outside candidate Git."""
-    path = (
-        home
-        / ".agents"
-        / "engineering"
-        / "bootstrap-authority"
-        / "v2.2.6-authorization.json"
+def _v226_bootstrap_source_bundle(value: object) -> dict:
+    expected = {"source_git_commit", "source_digest", "skill_version"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("source_git_commit", "")))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("source_digest", "")))
+        or value.get("skill_version") != "2.2.6"
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap source bundle is invalid.")
+    return {
+        "source_git_commit": value["source_git_commit"],
+        "source_digest": value["source_digest"],
+        "skill_version": "2.2.6",
+    }
+
+
+def _v226_bootstrap_authorization(value: object, source_bundle: object) -> dict:
+    """Validate the caller's reference to a root-owned, post-audit record."""
+    expected = {"schema", "record_id", "record_digest", "source_bundle"}
+    source = _v226_bootstrap_source_bundle(source_bundle)
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != V226_BOOTSTRAP_AUTHORIZATION_SCHEMA
+        or value.get("source_bundle") != source
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("record_digest", "")))
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap authorization is invalid.")
+    try:
+        record_id = _assurance_id(value.get("record_id"), "v2.2.6 bootstrap record")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering v2.2.6 bootstrap authorization is invalid.") from error
+    return {
+        "schema": V226_BOOTSTRAP_AUTHORIZATION_SCHEMA,
+        "record_id": record_id,
+        "record_digest": value["record_digest"],
+        "source_bundle": source,
+    }
+
+
+def _v226_bootstrap_candidate_artifact_digest(candidate: dict) -> str:
+    return _json_digest(
+        {
+            name: candidate[name]
+            for name in (
+                "role",
+                "repository_id",
+                "source_git_commit",
+                "source_git_tree",
+                "source_digest",
+                "skill_version",
+                "base_commit",
+            )
+        }
     )
+
+
+def _v226_bootstrap_candidate(value: object) -> dict:
+    expected = {
+        "role",
+        "repository_id",
+        "source_git_commit",
+        "source_git_tree",
+        "source_digest",
+        "skill_version",
+        "base_commit",
+        "artifact_digest",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("role") not in {"internal", "public"}
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("repository_id", "")))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("source_git_commit", "")))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("source_git_tree", "")))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("source_digest", "")))
+        or value.get("skill_version") != "2.2.6"
+        or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("base_commit", "")))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("artifact_digest", "")))
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap candidate is invalid.")
+    normalized = {
+        "role": value["role"],
+        "repository_id": value["repository_id"],
+        "source_git_commit": value["source_git_commit"],
+        "source_git_tree": value["source_git_tree"],
+        "source_digest": value["source_digest"],
+        "skill_version": "2.2.6",
+        "base_commit": value["base_commit"],
+        "artifact_digest": value["artifact_digest"],
+    }
+    if normalized["artifact_digest"] != _v226_bootstrap_candidate_artifact_digest(normalized):
+        raise EngineeringError("Engineering v2.2.6 bootstrap candidate artifact is mismatched.")
+    return normalized
+
+
+def _v226_bootstrap_pair(value: object) -> tuple[list[dict], str, str]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise EngineeringError("Engineering v2.2.6 bootstrap candidate pair is invalid.")
+    candidates = sorted(
+        (_v226_bootstrap_candidate(item) for item in value), key=lambda item: item["role"]
+    )
+    if [item["role"] for item in candidates] != ["internal", "public"]:
+        raise EngineeringError("Engineering v2.2.6 bootstrap candidate pair is invalid.")
+    pair_digest = _json_digest(candidates)
+    ancestry_digest = _json_digest(
+        [
+            {
+                "role": item["role"],
+                "base_commit": item["base_commit"],
+                "source_git_commit": item["source_git_commit"],
+            }
+            for item in candidates
+        ]
+    )
+    return candidates, pair_digest, ancestry_digest
+
+
+def _v226_bootstrap_authority_dir(home: Path) -> Path:
+    directory = home / ".agents" / "engineering" / "bootstrap-authority"
+    _reject_reparse_ancestors(directory)
+    return directory
+
+
+def _v226_bootstrap_trust_anchor(value: object) -> dict:
+    expected = {"schema", "anchor_id", "format_version", "signers_digest", "identity"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != V226_BOOTSTRAP_TRUST_ANCHOR_SCHEMA
+        or value.get("format_version") != 1
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("signers_digest", "")))
+        or value.get("identity") != {"state": "unknown"}
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap trust anchor is invalid.")
+    try:
+        anchor_id = _assurance_id(value.get("anchor_id"), "v2.2.6 bootstrap trust anchor")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering v2.2.6 bootstrap trust anchor is invalid.") from error
+    return {
+        "schema": V226_BOOTSTRAP_TRUST_ANCHOR_SCHEMA,
+        "anchor_id": anchor_id,
+        "format_version": 1,
+        "signers_digest": value["signers_digest"],
+        "identity": {"state": "unknown"},
+    }
+
+
+def _v226_bootstrap_host_trust_anchor(source: Path, home: Path) -> tuple[dict, bytes]:
+    """Read the one-time host-owned delivery anchor, never the installed gate."""
+    directory = _v226_bootstrap_authority_dir(home)
+    anchor_path = directory / "bootstrap-trust-anchor.json"
+    signers_path = directory / "allowed-signers"
+    try:
+        source_root = resolve_project_root(str(source)).resolve()
+        if directory.resolve().is_relative_to(source_root):
+            raise EngineeringError("Engineering host bootstrap authority is inside candidate Git.")
+        _reject_reparse_ancestors(directory)
+        _reject_reparse_ancestors(anchor_path, directory)
+        _reject_reparse_ancestors(signers_path, directory)
+        _verify_owner_private(directory, directory=True)
+        _verify_owner_private(anchor_path, directory=False)
+        _verify_owner_private(signers_path, directory=False)
+        anchor = _v226_bootstrap_trust_anchor(
+            json.loads(anchor_path.read_text(encoding="utf-8"))
+        )
+        allowed = signers_path.read_bytes()
+    except (OSError, ValueError, json.JSONDecodeError, EngineeringError) as error:
+        raise EngineeringError("Engineering host bootstrap trust is unavailable.") from error
+    if (
+        not allowed
+        or len(allowed) > 65536
+        or b"\x00" in allowed
+        or anchor["signers_digest"] != "sha256:" + hashlib.sha256(allowed).hexdigest()
+    ):
+        raise EngineeringError("Engineering host bootstrap trust is invalid.")
+    return anchor, allowed
+
+
+def _v226_bootstrap_host_receipt(
+    source: Path,
+    value: object,
+    *,
+    anchor: dict,
+    authority_epoch: str,
+    contract: str,
+) -> dict:
+    expected = {
+        "schema",
+        "receipt_id",
+        "repository_id",
+        "authority_epoch",
+        "contract",
+        "identity",
+        "trust_anchor",
+    }
+    try:
+        source_root = resolve_project_root(str(source))
+        repository_id = _project_contribution_digest(source_root)
+    except (OSError, EngineeringError) as error:
+        raise EngineeringError("Engineering bootstrap source repository is unavailable.") from error
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != V226_BOOTSTRAP_HOST_RECEIPT_SCHEMA
+        or value.get("repository_id") != repository_id
+        or value.get("authority_epoch") != authority_epoch
+        or value.get("contract") != contract
+        or value.get("identity") != {"state": "unknown"}
+        or value.get("trust_anchor") != anchor
+    ):
+        raise EngineeringError("Engineering bootstrap host receipt is mismatched.")
+    try:
+        receipt_id = _assurance_id(value.get("receipt_id"), "v2.2.6 bootstrap host receipt")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering bootstrap host receipt is invalid.") from error
+    return {
+        "schema": V226_BOOTSTRAP_HOST_RECEIPT_SCHEMA,
+        "receipt_id": receipt_id,
+        "repository_id": repository_id,
+        "authority_epoch": authority_epoch,
+        "contract": contract,
+        "identity": {"state": "unknown"},
+        "trust_anchor": anchor,
+    }
+
+
+def _v226_bootstrap_signer_fingerprint(allowed: bytes, principal: str) -> str:
+    """Require simple, exact service-principal signer entries for distinct audits."""
+    try:
+        lines = allowed.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise EngineeringError("Engineering host bootstrap trust is invalid.") from error
+    matches = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 3 or parts[0] != principal:
+            continue
+        if not re.fullmatch(r"ssh-[A-Za-z0-9@._+-]+", parts[1]) or not re.fullmatch(
+            r"[A-Za-z0-9+/=]+", parts[2]
+        ):
+            raise EngineeringError("Engineering host bootstrap trust is invalid.")
+        matches.append(parts[1] + " " + parts[2])
+    if len(matches) != 1:
+        raise EngineeringError("Engineering host bootstrap signer is unavailable or ambiguous.")
+    return "sha256:" + hashlib.sha256(matches[0].encode("ascii")).hexdigest()
+
+
+def _v226_bootstrap_timestamp(value: object, label: str) -> str:
+    try:
+        issued = _assurance_timestamp(value)
+    except EngineeringError as error:
+        raise EngineeringError(f"Engineering v2.2.6 bootstrap {label} timestamp is invalid.") from error
+    now = datetime.now(timezone.utc)
+    if issued > now + timedelta(minutes=5) or now - issued > V226_BOOTSTRAP_MAX_EVIDENCE_AGE:
+        raise EngineeringError(f"Engineering v2.2.6 bootstrap {label} evidence is stale.")
+    return value
+
+
+def _v226_verify_bootstrap_signature(
+    source: Path,
+    home: Path,
+    approval: object,
+    *,
+    approval_schema: str,
+    claims_schema: str,
+    claims: dict,
+    namespace: str,
+    contract: str,
+    authority_epoch: str,
+    label: str,
+) -> tuple[str, str, str]:
+    """Verify pre-activation root/audit evidence against a separate host anchor."""
+    anchor, allowed = _v226_bootstrap_host_trust_anchor(source, home)
+    expected = {"schema", "approver", "claims", "host_receipt", "signature"}
+    if (
+        not isinstance(approval, dict)
+        or set(approval) != expected
+        or approval.get("schema") != approval_schema
+        or approval.get("claims") != claims
+        or not isinstance(approval.get("signature"), str)
+        or not approval["signature"].startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(approval["signature"]) > 16384
+    ):
+        raise EngineeringError(f"Engineering v2.2.6 bootstrap {label} is invalid.")
+    try:
+        approver = _assurance_id(approval.get("approver"), f"v2.2.6 bootstrap {label} approver")
+    except EngineeringError as error:
+        raise EngineeringError(f"Engineering v2.2.6 bootstrap {label} is invalid.") from error
+    receipt = _v226_bootstrap_host_receipt(
+        source,
+        approval.get("host_receipt"),
+        anchor=anchor,
+        authority_epoch=authority_epoch,
+        contract=contract,
+    )
+    fingerprint = _v226_bootstrap_signer_fingerprint(allowed, approver)
+    material = _canonical_json(
+        {"schema": claims_schema, "claims": claims, "host_receipt": receipt}
+    )
+    with tempfile.TemporaryDirectory(prefix="engineering-v226-bootstrap-") as temporary:
+        allowed_path = Path(temporary) / "allowed_signers"
+        signature_path = Path(temporary) / "approval.sig"
+        allowed_path.write_bytes(allowed)
+        signature_path.write_text(approval["signature"], encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_path),
+                    "-I",
+                    approver,
+                    "-n",
+                    namespace,
+                    "-s",
+                    str(signature_path),
+                ],
+                input=material,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EngineeringError(
+                f"Engineering v2.2.6 bootstrap {label} verification is unavailable."
+            ) from error
+    if verified.returncode != 0:
+        raise EngineeringError(f"Engineering v2.2.6 bootstrap {label} signature is invalid.")
+    reference = "bootstrap-" + hashlib.sha256(
+        _canonical_json({"approval": approval, "host_receipt": receipt})
+    ).hexdigest()[:32]
+    return reference, approver, fingerprint
+
+
+def _v226_bootstrap_source_candidate(source: Path, role: str, base_commit: str) -> dict:
+    files, manifest, commit, source_digest = _bundle_files(source)
+    del files
+    try:
+        repository = _expand_install_path(git(source, "rev-parse", "--show-toplevel")).resolve()
+        tree = git(repository, "rev-parse", "HEAD^{tree}")
+        repository_id = _project_contribution_digest(repository)
+    except (OSError, EngineeringError) as error:
+        raise EngineeringError("Engineering v2.2.6 bootstrap source identity is unavailable.") from error
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        raise EngineeringError("Engineering v2.2.6 bootstrap source identity is invalid.")
+    candidate = {
+        "role": role,
+        "repository_id": repository_id,
+        "source_git_commit": commit,
+        "source_git_tree": tree,
+        "source_digest": source_digest,
+        "skill_version": manifest["version"],
+        "base_commit": base_commit,
+    }
+    candidate["artifact_digest"] = _v226_bootstrap_candidate_artifact_digest(candidate)
+    return candidate
+
+
+def _v226_bootstrap_public_source(source: Path, value: object) -> Path:
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise EngineeringError("Engineering v2.2.6 bootstrap public source is invalid.")
+    public_source = _expand_install_path(value)
+    if not public_source.is_absolute() or str(public_source).startswith("\\\\"):
+        raise EngineeringError("Engineering v2.2.6 bootstrap public source is invalid.")
+    try:
+        _reject_reparse_ancestors(public_source)
+        source_root = resolve_project_root(str(source)).resolve()
+        public_root = resolve_project_root(str(public_source)).resolve()
+        if public_root == source_root or public_root.is_relative_to(source_root):
+            raise EngineeringError("Engineering v2.2.6 bootstrap public source is not independent.")
+    except (OSError, ValueError, EngineeringError) as error:
+        raise EngineeringError("Engineering v2.2.6 bootstrap public source is unavailable.") from error
+    return public_source
+
+
+def _v226_installed_v225(home: Path) -> dict:
+    """Resolve the actual installed v2.2.5 receipt before a first v2.2.6 copy."""
+    paths = _install_paths(home)
+    controller = home / ".agents" / "engineering" / "controller"
+    try:
+        _reject_reparse_ancestors(controller)
+        _reject_reparse_ancestors(paths["receipt"])
+        _verify_owner_private(controller, directory=True)
+        key = _controller_key(controller, required=True)
+        if key is None:
+            raise EngineeringError("Engineering v2.2.5 controller key is unavailable.")
+        candidates = (
+            (paths["receipt"], paths["canonical"]),
+            (paths["previous_receipt"], paths["previous"]),
+        )
+        receipt = None
+        for receipt_path, bundle_path in candidates:
+            if not receipt_path.is_file():
+                continue
+            _reject_reparse_ancestors(receipt_path)
+            _verify_owner_private(receipt_path, directory=False)
+            candidate = _load_install_receipt(receipt_path, key)
+            if candidate is None:
+                continue
+            if (
+                candidate.get("schema") == "engineering.install.v1"
+                and candidate.get("status") == "installed"
+                and candidate.get("skill_version") == "2.2.5"
+            ):
+                _validated_installed_bundle(bundle_path, candidate)
+                receipt = candidate
+                break
+        if receipt is None:
+            raise EngineeringError("Engineering v2.2.5 installed receipt is unavailable.")
+    except (OSError, EngineeringError) as error:
+        raise EngineeringError("Engineering v2.2.5 installed receipt is unavailable.") from error
+    return {
+        "receipt_digest": _json_digest(receipt),
+        "skill_version": receipt["skill_version"],
+        "source_git_commit": receipt["source_git_commit"],
+        "source_digest": receipt["source_digest"],
+    }
+
+
+def _v226_bootstrap_owner_claims(
+    value: object,
+    *,
+    repository_id: str,
+    authority_epoch: str,
+    pair_digest: str,
+    installed_v225_digest: str,
+) -> dict:
+    expected = {
+        "approval_id",
+        "repository_id",
+        "authority_epoch",
+        "candidate_pair_digest",
+        "installed_v225_receipt_digest",
+        "decision",
+        "issued_at",
+        "replay_nonce",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("repository_id") != repository_id
+        or value.get("authority_epoch") != authority_epoch
+        or value.get("candidate_pair_digest") != pair_digest
+        or value.get("installed_v225_receipt_digest") != installed_v225_digest
+        or value.get("decision") != "owner_approved"
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap owner approval is mismatched.")
+    try:
+        approval_id = _assurance_id(value.get("approval_id"), "v2.2.6 bootstrap owner approval")
+        replay_nonce = _assurance_id(value.get("replay_nonce"), "v2.2.6 bootstrap owner replay")
+        issued_at = _v226_bootstrap_timestamp(value.get("issued_at"), "owner approval")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering v2.2.6 bootstrap owner approval is invalid.") from error
+    return {
+        "approval_id": approval_id,
+        "repository_id": repository_id,
+        "authority_epoch": authority_epoch,
+        "candidate_pair_digest": pair_digest,
+        "installed_v225_receipt_digest": installed_v225_digest,
+        "decision": "owner_approved",
+        "issued_at": issued_at,
+        "replay_nonce": replay_nonce,
+    }
+
+
+def _v226_bootstrap_audit_claims(
+    value: object,
+    *,
+    repository_id: str,
+    authority_epoch: str,
+    pair_digest: str,
+    ancestry_digest: str,
+) -> dict:
+    expected = {
+        "audit_id",
+        "auditor_role",
+        "repository_id",
+        "authority_epoch",
+        "candidate_pair_digest",
+        "candidate_ancestry_digest",
+        "decision",
+        "issued_at",
+        "replay_nonce",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("repository_id") != repository_id
+        or value.get("authority_epoch") != authority_epoch
+        or value.get("candidate_pair_digest") != pair_digest
+        or value.get("candidate_ancestry_digest") != ancestry_digest
+        or value.get("decision") != "accepted"
+    ):
+        raise EngineeringError("Engineering v2.2.6 bootstrap audit is mismatched.")
+    try:
+        audit_id = _assurance_id(value.get("audit_id"), "v2.2.6 bootstrap audit")
+        auditor_role = _assurance_id(value.get("auditor_role"), "v2.2.6 bootstrap auditor role")
+        replay_nonce = _assurance_id(value.get("replay_nonce"), "v2.2.6 bootstrap audit replay")
+        issued_at = _v226_bootstrap_timestamp(value.get("issued_at"), "audit")
+    except EngineeringError as error:
+        raise EngineeringError("Engineering v2.2.6 bootstrap audit is invalid.") from error
+    return {
+        "audit_id": audit_id,
+        "auditor_role": auditor_role,
+        "repository_id": repository_id,
+        "authority_epoch": authority_epoch,
+        "candidate_pair_digest": pair_digest,
+        "candidate_ancestry_digest": ancestry_digest,
+        "decision": "accepted",
+        "issued_at": issued_at,
+        "replay_nonce": replay_nonce,
+    }
+
+
+def _v226_bootstrap_host_record(
+    source: Path, home: Path, value: object, source_bundle: dict
+) -> dict:
+    """Resolve the root-owned post-audit evidence record for the first delivery."""
+    expected = {
+        "schema",
+        "record_id",
+        "repository_id",
+        "authority_epoch",
+        "candidate_pair",
+        "candidate_pair_digest",
+        "installed_v225",
+        "owner_approval",
+        "independent_audits",
+        "issued_at",
+        "replay_nonce",
+        "public_source",
+        "identity",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != V226_BOOTSTRAP_HOST_RECORD_SCHEMA
+        or value.get("identity") != {"state": "unknown"}
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("repository_id", "")))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("candidate_pair_digest", "")))
+    ):
+        raise EngineeringError("Engineering host bootstrap record is invalid.")
+    try:
+        record_id = _assurance_id(value.get("record_id"), "v2.2.6 bootstrap record")
+        authority_epoch = _assurance_id(value.get("authority_epoch"), "v2.2.6 bootstrap epoch")
+        record_nonce = _assurance_id(value.get("replay_nonce"), "v2.2.6 bootstrap record replay")
+        issued_at = _v226_bootstrap_timestamp(value.get("issued_at"), "record")
+        source_root = resolve_project_root(str(source))
+        repository_id = _project_contribution_digest(source_root)
+    except (OSError, EngineeringError) as error:
+        raise EngineeringError("Engineering host bootstrap record is invalid.") from error
+    if value["repository_id"] != repository_id:
+        raise EngineeringError("Engineering host bootstrap record repository is mismatched.")
+    candidates, pair_digest, ancestry_digest = _v226_bootstrap_pair(value["candidate_pair"])
+    if value["candidate_pair_digest"] != pair_digest:
+        raise EngineeringError("Engineering host bootstrap record artifact pair is mismatched.")
+    internal, public = candidates
+    actual_internal = _v226_bootstrap_source_candidate(
+        source, "internal", internal["base_commit"]
+    )
+    public_source = _v226_bootstrap_public_source(source, value.get("public_source"))
+    actual_public = _v226_bootstrap_source_candidate(
+        public_source, "public", public["base_commit"]
+    )
+    if internal != actual_internal or public != actual_public:
+        raise EngineeringError("Engineering host bootstrap record source artifact is mismatched.")
+    for candidate, candidate_source in ((internal, source), (public, public_source)):
+        try:
+            candidate_root = resolve_project_root(str(candidate_source))
+        except (OSError, EngineeringError) as error:
+            raise EngineeringError("Engineering host bootstrap record ancestry is unavailable.") from error
+        if not _is_ancestor_or_equal(
+            candidate_root, candidate["base_commit"], candidate["source_git_commit"]
+        ):
+            raise EngineeringError("Engineering host bootstrap record ancestry is mismatched.")
+    installed = value.get("installed_v225")
+    installed_expected = {
+        "receipt_digest",
+        "skill_version",
+        "source_git_commit",
+        "source_digest",
+    }
+    actual_v225 = _v226_installed_v225(home)
+    if (
+        not isinstance(installed, dict)
+        or set(installed) != installed_expected
+        or installed != actual_v225
+    ):
+        raise EngineeringError("Engineering host bootstrap v2.2.5 receipt is mismatched.")
+    owner_claims = _v226_bootstrap_owner_claims(
+        value.get("owner_approval", {}).get("claims")
+        if isinstance(value.get("owner_approval"), dict)
+        else None,
+        repository_id=repository_id,
+        authority_epoch=authority_epoch,
+        pair_digest=pair_digest,
+        installed_v225_digest=actual_v225["receipt_digest"],
+    )
+    owner_reference, owner_principal, owner_fingerprint = _v226_verify_bootstrap_signature(
+        source,
+        home,
+        value["owner_approval"],
+        approval_schema=V226_BOOTSTRAP_OWNER_APPROVAL_SCHEMA,
+        claims_schema="engineering.v2.2.6-bootstrap-owner-claims.v1",
+        claims=owner_claims,
+        namespace="engineering-v226-bootstrap-owner",
+        contract=V226_BOOTSTRAP_OWNER_APPROVAL_SCHEMA,
+        authority_epoch=authority_epoch,
+        label="owner approval",
+    )
+    audits = value.get("independent_audits")
+    if not isinstance(audits, list) or not 2 <= len(audits) <= 16:
+        raise EngineeringError("Engineering host bootstrap independent audits are invalid.")
+    normalized_audits = []
+    audit_ids: set[str] = set()
+    audit_roles: set[str] = set()
+    # Independent audit must be independent of the package approval as well
+    # as the other audit.  A valid owner signature is still not audit evidence.
+    audit_principals: set[str] = {owner_principal}
+    audit_fingerprints: set[str] = {owner_fingerprint}
+    replay_nonces = {record_nonce, owner_claims["replay_nonce"]}
+    for audit in audits:
+        claims = _v226_bootstrap_audit_claims(
+            audit.get("claims") if isinstance(audit, dict) else None,
+            repository_id=repository_id,
+            authority_epoch=authority_epoch,
+            pair_digest=pair_digest,
+            ancestry_digest=ancestry_digest,
+        )
+        reference, principal, fingerprint = _v226_verify_bootstrap_signature(
+            source,
+            home,
+            audit,
+            approval_schema=V226_BOOTSTRAP_AUDIT_SCHEMA,
+            claims_schema="engineering.v2.2.6-bootstrap-audit-claims.v1",
+            claims=claims,
+            namespace="engineering-v226-bootstrap-audit",
+            contract=V226_BOOTSTRAP_AUDIT_SCHEMA,
+            authority_epoch=authority_epoch,
+            label="independent audit",
+        )
+        if (
+            claims["audit_id"] in audit_ids
+            or claims["auditor_role"] in audit_roles
+            or principal in audit_principals
+            or fingerprint in audit_fingerprints
+            or claims["replay_nonce"] in replay_nonces
+        ):
+            raise EngineeringError("Engineering host bootstrap independent audits are not distinct.")
+        audit_ids.add(claims["audit_id"])
+        audit_roles.add(claims["auditor_role"])
+        audit_principals.add(principal)
+        audit_fingerprints.add(fingerprint)
+        replay_nonces.add(claims["replay_nonce"])
+        normalized_audits.append(
+            {
+                "audit_id": claims["audit_id"],
+                "auditor_role": claims["auditor_role"],
+                "reference": reference,
+                "principal": principal,
+                "signer_fingerprint": fingerprint,
+            }
+        )
+    if len(replay_nonces) != len(audits) + 2:
+        raise EngineeringError("Engineering host bootstrap replay evidence is duplicated.")
+    if source_bundle != {
+        name: internal[name]
+        for name in ("source_git_commit", "source_digest", "skill_version")
+    }:
+        raise EngineeringError("Engineering host bootstrap record source bundle is mismatched.")
+    return {
+        "schema": V226_BOOTSTRAP_AUTHORIZATION_SCHEMA,
+        "record_id": record_id,
+        "record_digest": _json_digest(value),
+        "source_bundle": dict(source_bundle),
+        "candidate_pair_digest": pair_digest,
+        "installed_v225_receipt_digest": actual_v225["receipt_digest"],
+        "owner_approval_id": owner_claims["approval_id"],
+        "owner_approval_reference": owner_reference,
+        "owner_principal": owner_principal,
+        "owner_signer_fingerprint": owner_fingerprint,
+        "independent_audits": sorted(normalized_audits, key=lambda item: item["audit_id"]),
+        "identity": {"state": "unknown"},
+        "issued_at": issued_at,
+    }
+
+
+def _v226_bootstrap_authorization_path(home: Path) -> Path:
+    """Return the root-owned post-audit record outside candidate Git."""
+    path = _v226_bootstrap_authority_dir(home) / "v2.2.6-authorization.json"
     _reject_reparse_ancestors(path)
     return path
 
 
-def _host_v226_bootstrap_authorization(
-    source: Path, home: Path, supplied: object, source_bundle: dict
-) -> dict:
-    """Require the caller's bootstrap facts to equal the host-captured record.
+def v226_bootstrap_handoff_status(source: Path, home: Path) -> dict:
+    """Expose the non-circular bootstrap state without creating any authority.
 
-    This is deliberately separate from the post-activation signer boundary.
-    It makes the installed-v2.2.5/root/auditor bootstrap decision durable and
-    external to candidate Git without asserting a human cryptographic identity
-    that the native host cannot prove.
+    Before independent audits exist, this returns only deterministic exact source
+    and installed-v2.2.5 evidence for root's external post-audit action.  Once
+    root has written its private signed record, the same read-only function
+    resolves that record before returning an install authorization reference.
     """
-    supplied_normalized = _v226_bootstrap_authorization(supplied, source_bundle)
+    source = _expand_install_path(source)
+    home = _expand_install_path(home)
+    if not home.is_absolute() or str(home).startswith("\\\\"):
+        raise EngineeringError("Engineering bootstrap home must be absolute.")
+    _, manifest, commit, source_digest = _bundle_files(source)
+    source_bundle = _v226_bootstrap_source_bundle(
+        {
+            "source_git_commit": commit,
+            "source_digest": source_digest,
+            "skill_version": manifest["version"],
+        }
+    )
+    installed_v225 = _v226_installed_v225(home)
     path = _v226_bootstrap_authorization_path(home)
-    directory = path.parent
+    if not path.exists():
+        return {
+            "schema": "engineering.v2.2.6-bootstrap-handoff.v1",
+            "state": "pre_audit_capability_evidence",
+            "source_bundle": source_bundle,
+            "installed_v225": installed_v225,
+            "required_external_evidence": [
+                "installed_v225",
+                "owner_approval",
+                "independent_audits",
+            ],
+            "post_audit_authority": "root",
+        }
     try:
+        directory = path.parent
         source_root = resolve_project_root(str(source)).resolve()
         if directory.resolve().is_relative_to(source_root):
             raise EngineeringError("Engineering host bootstrap authority is inside candidate Git.")
@@ -14976,12 +15844,41 @@ def _host_v226_bootstrap_authorization(
         _reject_reparse_ancestors(path, directory)
         _verify_owner_private(directory, directory=True)
         _verify_owner_private(path, directory=False)
-        host_value = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError, EngineeringError) as error:
         raise EngineeringError("Engineering host bootstrap authority is unavailable.") from error
-    host_normalized = _v226_bootstrap_authorization(host_value, source_bundle)
+    resolved = _v226_bootstrap_host_record(source, home, record, source_bundle)
+    authorization = {
+        name: resolved[name]
+        for name in ("schema", "record_id", "record_digest", "source_bundle")
+    }
+    return {
+        "schema": "engineering.v2.2.6-bootstrap-handoff.v1",
+        "state": "post_audit_authorization_available",
+        "source_bundle": source_bundle,
+        "installed_v225": installed_v225,
+        "bootstrap_authorization": authorization,
+        "candidate_pair_digest": resolved["candidate_pair_digest"],
+        "independent_audit_ids": [
+            item["audit_id"] for item in resolved["independent_audits"]
+        ],
+        "post_audit_authority": "root",
+    }
+
+
+def _host_v226_bootstrap_authorization(
+    source: Path, home: Path, supplied: object, source_bundle: dict
+) -> dict:
+    """Require a caller reference to equal the resolved root post-audit record."""
+    supplied_normalized = _v226_bootstrap_authorization(supplied, source_bundle)
+    status = v226_bootstrap_handoff_status(source, home)
+    if status.get("state") != "post_audit_authorization_available":
+        raise EngineeringError(
+            "Engineering host bootstrap authorization is unavailable pending root post-audit evidence."
+        )
+    host_normalized = status.get("bootstrap_authorization")
     if host_normalized != supplied_normalized:
-        raise EngineeringError("Engineering host bootstrap authority is mismatched.")
+        raise EngineeringError("Engineering host bootstrap authorization is mismatched.")
     return host_normalized
 
 
@@ -15018,6 +15915,7 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
     )
     v2_required = legacy_required | {"release_authorization"}
     v3_required = legacy_required | {"bootstrap_authorization"}
+    v4_required = legacy_required | {"bootstrap_authorization"}
     valid_legacy = (
         isinstance(receipt, dict)
         and set(receipt) == legacy_required
@@ -15058,13 +15956,23 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
             isinstance(receipt, dict)
             and set(receipt) == v3_required
             and receipt.get("schema") == "engineering.install.v3"
-            and _v226_bootstrap_authorization(bootstrap_authorization, source_bundle)
+            and _legacy_v226_bootstrap_authorization(bootstrap_authorization, source_bundle)
             == bootstrap_authorization
         )
     except EngineeringError:
         valid_v3 = False
+    try:
+        valid_v4 = (
+            isinstance(receipt, dict)
+            and set(receipt) == v4_required
+            and receipt.get("schema") == "engineering.install.v4"
+            and _v226_bootstrap_authorization(bootstrap_authorization, source_bundle)
+            == bootstrap_authorization
+        )
+    except EngineeringError:
+        valid_v4 = False
     if (
-        not (valid_legacy or valid_v2 or valid_v3)
+        not (valid_legacy or valid_v2 or valid_v3 or valid_v4)
         or receipt.get("status") not in {"installed", "rolled_back"}
         or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_git_commit", "")))
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("source_digest", "")))
@@ -15418,7 +16326,7 @@ def install_bundle(
             "schema": (
                 "engineering.install.v2"
                 if release_authorization is not None
-                else "engineering.install.v3"
+                else "engineering.install.v4"
                 if validated_bootstrap is not None
                 else "engineering.install.v1"
             ),
@@ -16274,6 +17182,9 @@ def main() -> int:
     dependent_dispatch_parser.add_argument(
         "--scope", choices=sorted(POST_ACTIVATION_IMPORT_SCOPES), required=True
     )
+    bootstrap_handoff_parser = commands.add_parser("bootstrap-handoff-status")
+    bootstrap_handoff_parser.add_argument("source")
+    bootstrap_handoff_parser.add_argument("--home", required=True)
     outcome_accept_parser = commands.add_parser("outcome-accept")
     outcome_accept_parser.add_argument("root")
     outcome_accept_parser.add_argument("completion_id")
@@ -16441,12 +17352,19 @@ def main() -> int:
                 print(json.dumps(result))
                 return 1 if arguments.command == "setup" else 0
             root = resolve_project_root(arguments.root)
-        elif arguments.command != "delivery-trends" and not arguments.command.startswith("learning-"):
+        elif arguments.command not in {
+            "delivery-trends",
+            "bootstrap-handoff-status",
+        } and not arguments.command.startswith("learning-"):
             root = resolve_project_root(arguments.root)
         if arguments.command.startswith("learning-"):
             print(json.dumps(result))
             return 0
-        if arguments.command == "delivery-trends":
+        if arguments.command == "bootstrap-handoff-status":
+            result = v226_bootstrap_handoff_status(
+                Path(arguments.source), Path(arguments.home)
+            )
+        elif arguments.command == "delivery-trends":
             result = delivery_trends(arguments.window)
         elif arguments.command == "delivery-eval":
             try:

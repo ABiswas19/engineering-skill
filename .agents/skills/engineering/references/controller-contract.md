@@ -422,16 +422,25 @@ the retained completion manifest records that exact result for replay.
 
 The first v2.2.6 delivery is a one-time bootstrap. Before v2.2.6 is active,
 its durable owner record is `OWNER_APPROVED`, not an Engineering
-`INTENT_BOUND` receipt. `install_bundle(..., bootstrap_authorization=...)`
-accepts that first exact bundle only when its recorded installed-v2.2.5 receipt
-digest, package-approval reference, at least two independent exact-artifact
-audit identities, accepted artifact digest, and actual source commit/digest/
-version all agree. The caller's record must exactly equal the native/root
-host-owned bootstrap record outside candidate Git; Engineering has no command
-that creates or changes that record. Bootstrap never reads or invokes the post-activation trust
-gate; it has no GitHub protection, collaborator, personal-key, or candidate
-signer-file prerequisite. It is still an evidence boundary only: it does not
-push, merge, install, activate, or replace native approval.
+`INTENT_BOUND` receipt. `engineering bootstrap-handoff-status <skill-source>
+--home <absolute-host-home>` is the supported read-only bootstrap handoff. It
+first reports only the exact v2.2.6 source bundle and the actual
+installed-v2.2.5 receipt. That
+pre-audit report cannot authorize installation. After independent auditors
+accept the exact paired candidates, root alone creates a private host record
+outside candidate Git. It contains the repository and epoch, each candidate's
+role, base, commit, tree, bundle and artifact digests, the pair and ancestry
+digests, the resolved installed-v2.2.5 receipt, a signed owner approval, and
+at least two role-, signer-, and replay-distinct signed audit receipts.
+`install_bundle(..., bootstrap_authorization=...)` accepts the first exact
+bundle only when its v2 equality-bound reference resolves that private record
+and every fact agrees. Engineering has no command that creates or changes the
+record. Missing, forged, stale, wrong-repository, wrong-epoch, wrong-contract,
+wrong-artifact, duplicate, or non-independent evidence fails closed. Bootstrap
+never reads or invokes the post-activation trust gate; it has no GitHub
+protection, collaborator, personal-key, or candidate-signer-file prerequisite.
+It is still an evidence boundary only: it does not push, merge, activate, or
+replace native approval for a separately authorized install.
 
 After activation, an intent-impacting scope is bound to an external,
 owner-private `engineering.owner-intent.v1` before it reaches the signed scope
@@ -488,11 +497,13 @@ handoff, preparation, completion, and replay records.
 
 Preparation derives intent impact from explicit/query graph selection **and**
 the normalized authorized scope and approved result-artifact source paths.
-Completion repeats that exact-edge analysis for every observed changed artifact,
-including both rename endpoints, before it retains a completion. If observed
-impact requires owner intent but the preparation lacks the matching active
-owner-intent binding and outcome-survival v2 mapping, completion fails closed;
-a candidate cannot repair the omission after execution starts.
+Completion repeats the exact-edge analysis at both the preparation checkpoint
+and the refreshed exact result checkpoint for every observed changed artifact,
+including both rename endpoints. A clean result without the required refreshed
+checkpoint, and a dirty result with a new unrepresented artifact, fail closed.
+If observed impact requires owner intent but the preparation lacks the matching
+active owner-intent binding and outcome-survival v2 mapping, completion fails
+closed; a candidate cannot repair the omission after execution starts.
 
 `engineering outcome-accept <root> <completion-id> --input-file <path|->`
 retains `engineering.outcome-acceptance.v1` only after it verifies the exact
@@ -1062,11 +1073,13 @@ source B. Later release-gated installs require the signed install token. Under
 one foreground install lock it stages beside the canonical target, replaces the
 canonical bundle, generic loaders, and command launchers, and writes
 `engineering.install.v1` for preserved legacy bundles,
-`engineering.install.v2` for release-token installs, or
-`engineering.install.v3` for the governed v2.2.6 bootstrap. The v2/v3 receipt
+`engineering.install.v2` for release-token installs,
+`engineering.install.v3` for readable historical bootstrap receipts, or
+`engineering.install.v4` for the governed v2.2.6 bootstrap. The v2/v4 receipt
 reconciles the accepted artifact digest, exact source commit, source digest,
 skill version, Graphify commit, UTC timestamp, equal Codex/Claude canonical-
-skill hashes, and respectively the token or bootstrap authorization facts. A
+skill hashes, and respectively the token or equality-bound bootstrap record
+reference. A
 failure restores the exact prior surfaces. Publication of every bundle, loader,
 receipt, and rollback surface uses one shared transaction. One fully
 digest-validated prior canonical bundle and receipt are retained;

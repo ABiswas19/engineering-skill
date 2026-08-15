@@ -251,9 +251,10 @@ candidate cannot substitute a shorter list. Each outcome is `INCLUDED`,
 `REPLACED`, `DEFERRED`, or `EXCLUDED`: replacement needs independently reviewed
 equivalence, and deferral or exclusion needs a separately host-attested owner
 exception. New owner approvals, exceptions, equivalence reviews, and outcome
-audits are verified against a receipt for the live canonical remote default
-branch and exact signer blob, never against candidate `HEAD`; the signer
-principal must equal the declared independent role. Historical v2.2.5 records stay readable but their missing owner
+audits are verified against host-owned, owner-private trust receipts and
+signer material outside candidate Git, never against a default branch or
+candidate `HEAD`; the signer principal must equal the declared independent
+role. Historical v2.2.5 records stay readable but their missing owner
 intent is `owner_intent_unknown` and cannot receive a new release token.
 
 `outcome-accept` records independent exact-artifact acceptance using typed

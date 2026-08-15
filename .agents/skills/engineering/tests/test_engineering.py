@@ -171,6 +171,18 @@ class SkillShapeTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, contract)
 
+    def test_authority_docs_mark_the_candidate_git_anchor_as_superseded(self):
+        root = Path(__file__).resolve().parents[4]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        authority = (
+            root / "docs" / "specs" / "engineering-v2.2.4-authority-persistence.md"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("live canonical remote default", readme)
+        self.assertIn("host-owned", readme)
+        self.assertNotIn("allowed signer is pinned in the governed repository", authority)
+        self.assertIn("Superseded trust transport", authority)
+        self.assertIn("outside candidate Git", authority)
+
     def test_portable_policy_and_scenarios_are_executable_contracts(self):
         scenario_payload = json.loads(SCENARIOS.read_text(encoding="utf-8"))
         scenarios = {
@@ -5889,6 +5901,56 @@ class Task5ContractTests(unittest.TestCase):
         (root / "README.md").write_text("# Changed capability artifact\n", encoding="utf-8")
 
         with patch.object(module, "_load_checkpoint", return_value=checkpoint), self.assertRaisesRegex(
+            module.EngineeringError,
+            "completion detected unbound intent impact from actual artifacts",
+        ):
+            module.complete(root, prepared["run_id"], [])
+
+    def test_complete_fails_closed_for_new_capability_path_absent_from_base_checkpoint(self):
+        """A newly mapped capability must be assessed from the refreshed exact checkpoint."""
+        module = self.module()
+        links_name = "docs/engineering-traceability/links.json"
+        root, prepared = self.prepared_run(
+            "new-capability-path-intent-impact",
+            scope=["src/native_dispatch.py", links_name],
+        )
+        (root / "src").mkdir()
+        (root / "src" / "native_dispatch.py").write_text(
+            "def dispatch():\n    return 'native'\n", encoding="utf-8"
+        )
+        links_path = root / links_name
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].extend(
+            (
+                {
+                    "id": "CAP-NEW-NATIVE-DISPATCH",
+                    "type": "capability",
+                    "title": "New native dispatch capability",
+                    "source": {"path": "design.md", "line": 1},
+                },
+                {
+                    "id": "CODE-NEW-NATIVE-DISPATCH",
+                    "type": "code_symbol",
+                    "title": "New native dispatch implementation",
+                    "source": {"path": "src/native_dispatch.py", "line": 1},
+                },
+            )
+        )
+        links["edges"].append(
+            {
+                "id": "EDGE-NEW-NATIVE-DISPATCH",
+                "from": "CAP-NEW-NATIVE-DISPATCH",
+                "to": "CODE-NEW-NATIVE-DISPATCH",
+                "type": "implements",
+                "provenance": "direct",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+        refreshed_commit = self.commit_all(root, "add new native dispatch capability")
+        self.write_canonical_checkpoint(root, refreshed_commit)
+
+        with self.assertRaisesRegex(
             module.EngineeringError,
             "completion detected unbound intent impact from actual artifacts",
         ):
@@ -11755,6 +11817,38 @@ class Task10ContractTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.bootstrap_authority_dir = (
+            self.home / ".agents" / "engineering" / "bootstrap-authority"
+        )
+        self.bootstrap_authority_dir.mkdir(parents=True)
+        self.bootstrap_signers_path = self.bootstrap_authority_dir / "allowed-signers"
+        self.bootstrap_anchor_path = (
+            self.bootstrap_authority_dir / "bootstrap-trust-anchor.json"
+        )
+        self.bootstrap_allowed_signers = (
+            "\n".join(
+                (
+                    f"bootstrap-owner {public_key}",
+                    f"bootstrap-semantic {auditor_public_key}",
+                    f"bootstrap-technical {reviewer_public_key}",
+                )
+            )
+            + "\n"
+        ).encode("ascii")
+        self.bootstrap_signers_path.write_bytes(self.bootstrap_allowed_signers)
+        self.bootstrap_anchor_path.write_text(
+            json.dumps(
+                {
+                    "schema": "engineering.v2.2.6-bootstrap-trust-anchor.v1",
+                    "anchor_id": "bootstrap-anchor-synthetic",
+                    "format_version": 1,
+                    "signers_digest": "sha256:"
+                    + hashlib.sha256(self.bootstrap_allowed_signers).hexdigest(),
+                    "identity": {"state": "unknown"},
+                }
+            ),
+            encoding="utf-8",
+        )
         (self.root / ".engineering-host-approvers").write_text(
             self.host_allowed_signers.decode("ascii"),
             encoding="ascii",
@@ -11791,8 +11885,15 @@ class Task10ContractTests(unittest.TestCase):
             text=True,
         )
         self.repository_id = engineering._project_contribution_digest(self.root)
+        self.repository_identity_original = engineering._project_contribution_digest
         self.repository_identity = patch.object(
-            engineering, "_project_contribution_digest", return_value=self.repository_id
+            engineering,
+            "_project_contribution_digest",
+            side_effect=lambda root: (
+                self.repository_id
+                if Path(root).resolve() == self.root.resolve()
+                else self.repository_identity_original(Path(root))
+            ),
         )
         self.repository_identity.start()
         self.addCleanup(self.repository_identity.stop)
@@ -12306,13 +12407,14 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         outcome_id,
         disposition,
         *,
+        exception_id="exception-native-graph",
         receipt_changes=None,
         signer=None,
         approver="synthetic-host",
     ):
         module = self.module()
         claims = {
-            "exception_id": "exception-native-graph",
+            "exception_id": exception_id,
             "owner_intent_id": intent["intent_id"],
             "owner_intent_digest": intent["owner_intent_digest"],
             "outcome_id": outcome_id,
@@ -12430,38 +12532,312 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         )
         return source
 
-    def bootstrap_authorization(self, source, *, artifact_digest=None):
-        module = self.module()
-        _, manifest, source_commit, source_digest = module._bundle_files(source)
-        artifact_digest = artifact_digest or "sha256:" + "a" * 64
+    def bootstrap_anchor(self):
+        return json.loads(self.bootstrap_anchor_path.read_text(encoding="utf-8"))
+
+    def bootstrap_host_receipt(self, *, contract, authority_epoch="epoch-local-1"):
         return {
-            "schema": "engineering.v2.2.6-bootstrap-authorization.v1",
-            "artifact_digest": artifact_digest,
-            "source_bundle": {
-                "source_git_commit": source_commit,
-                "source_digest": source_digest,
-                "skill_version": manifest["version"],
-            },
-            "installed_v225_receipt_digest": "sha256:" + "b" * 64,
-            "owner_approval_reference": "owner-approved-bootstrap",
-            "independent_audits": [
-                {"audit_id": "audit-semantic", "artifact_digest": artifact_digest},
-                {"audit_id": "audit-technical", "artifact_digest": artifact_digest},
-            ],
+            "schema": "engineering.v2.2.6-bootstrap-host-receipt.v1",
+            "receipt_id": "bootstrap-host-receipt-synthetic",
+            "repository_id": self.repository_id,
+            "authority_epoch": authority_epoch,
+            "contract": contract,
             "identity": {"state": "unknown"},
+            "trust_anchor": self.bootstrap_anchor(),
         }
 
-    def publish_bootstrap_authorization(self, authorization):
-        path = (
-            self.home
-            / ".agents"
-            / "engineering"
-            / "bootstrap-authority"
-            / "v2.2.6-authorization.json"
+    def sign_bootstrap_evidence(
+        self,
+        *,
+        schema,
+        claims_schema,
+        claims,
+        namespace,
+        contract,
+        signer,
+        approver,
+        authority_epoch="epoch-local-1",
+    ):
+        module = self.module()
+        receipt = self.bootstrap_host_receipt(
+            contract=contract, authority_epoch=authority_epoch
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(authorization), encoding="utf-8")
-        return authorization
+        material = module._canonical_json(
+            {"schema": claims_schema, "claims": claims, "host_receipt": receipt}
+        )
+        claims_path = Path(
+            self.temporary_directory.name
+        ) / f"bootstrap-evidence-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(signer),
+                "-n",
+                namespace,
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": schema,
+            "approver": approver,
+            "claims": claims,
+            "host_receipt": receipt,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def installed_v225_receipt(self):
+        if hasattr(self, "_installed_v225_receipt"):
+            return self._installed_v225_receipt
+        module = self.module()
+        source_root = Path(self.temporary_directory.name) / "installed-v225-source"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(source_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        source = source_root / ".agents" / "skills" / "engineering"
+        (source / "scripts").mkdir(parents=True)
+        (source / "references").mkdir()
+        (source / "SKILL.md").write_text(
+            "---\nname: engineering\ndescription: synthetic v2.2.5 bundle\n---\n",
+            encoding="utf-8",
+        )
+        (source / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "name": "engineering",
+                    "version": "2.2.5",
+                    "graphify": {"commit": module.GRAPHIFY_COMMIT},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (source / "scripts" / "engineering.py").write_text(
+            "# synthetic v2.2.5 release bundle\n", encoding="utf-8"
+        )
+        (source / "references" / "controller-contract.md").write_text(
+            "# Synthetic v2.2.5 controller contract\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(source_root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(source_root), "commit", "-m", "add v2.2.5 bundle"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        module.install_bundle(source, self.home)
+        receipt_path = module._install_paths(self.home)["receipt"]
+        key = module._controller_key(
+            self.home / ".agents" / "engineering" / "controller", required=True
+        )
+        self._installed_v225_receipt = module._load_install_receipt(receipt_path, key)
+        return self._installed_v225_receipt
+
+    def public_bundle_source(self, source):
+        public_root = Path(self.temporary_directory.name) / f"public-v226-{time.time_ns()}"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(public_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(public_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(public_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        (public_root / "README.md").write_text("# Public bootstrap base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(public_root), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(public_root), "commit", "-m", "public bootstrap base"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        destination = public_root / ".agents" / "skills" / "engineering"
+        shutil.copytree(source, destination)
+        subprocess.run(["git", "-C", str(public_root), "add", ".agents"], check=True)
+        subprocess.run(
+            ["git", "-C", str(public_root), "commit", "-m", "add public v2.2.6 bundle"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return destination
+
+    def bootstrap_candidate(self, source, role):
+        module = self.module()
+        _, manifest, source_commit, source_digest = module._bundle_files(source)
+        repository = Path(
+            subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        ).resolve()
+        source_tree = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        base_commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD^"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        candidate = {
+            "role": role,
+            "repository_id": module._project_contribution_digest(repository),
+            "source_git_commit": source_commit,
+            "source_git_tree": source_tree,
+            "source_digest": source_digest,
+            "skill_version": manifest["version"],
+            "base_commit": base_commit,
+        }
+        candidate["artifact_digest"] = "sha256:" + hashlib.sha256(
+            module._canonical_json(candidate)
+        ).hexdigest()
+        return candidate
+
+    def bootstrap_pair_digest(self, candidates):
+        module = self.module()
+        return "sha256:" + hashlib.sha256(
+            module._canonical_json(sorted(candidates, key=lambda item: item["role"]))
+        ).hexdigest()
+
+    def bootstrap_ancestry_digest(self, candidates):
+        module = self.module()
+        return "sha256:" + hashlib.sha256(
+            module._canonical_json(
+                [
+                    {
+                        "role": item["role"],
+                        "base_commit": item["base_commit"],
+                        "source_git_commit": item["source_git_commit"],
+                    }
+                    for item in sorted(candidates, key=lambda item: item["role"])
+                ]
+            )
+        ).hexdigest()
+
+    def bootstrap_authorization(self, source, *, issued_at=None):
+        module = self.module()
+        public_source = self.public_bundle_source(source)
+        candidates = [
+            self.bootstrap_candidate(source, "internal"),
+            self.bootstrap_candidate(public_source, "public"),
+        ]
+        pair_digest = self.bootstrap_pair_digest(candidates)
+        ancestry_digest = self.bootstrap_ancestry_digest(candidates)
+        receipt = self.installed_v225_receipt()
+        issued_at = issued_at or module._utc_now()
+        installed_v225 = {
+            "receipt_digest": module._json_digest(receipt),
+            "skill_version": receipt["skill_version"],
+            "source_git_commit": receipt["source_git_commit"],
+            "source_digest": receipt["source_digest"],
+        }
+        owner_claims = {
+            "approval_id": "bootstrap-owner-approval",
+            "repository_id": self.repository_id,
+            "authority_epoch": "epoch-local-1",
+            "candidate_pair_digest": pair_digest,
+            "installed_v225_receipt_digest": installed_v225["receipt_digest"],
+            "decision": "owner_approved",
+            "issued_at": issued_at,
+            "replay_nonce": "bootstrap-owner-nonce",
+        }
+        owner_approval = self.sign_bootstrap_evidence(
+            schema="engineering.v2.2.6-bootstrap-owner-approval.v1",
+            claims_schema="engineering.v2.2.6-bootstrap-owner-claims.v1",
+            claims=owner_claims,
+            namespace="engineering-v226-bootstrap-owner",
+            contract="engineering.v2.2.6-bootstrap-owner-approval.v1",
+            signer=self.host_key,
+            approver="bootstrap-owner",
+        )
+        audits = []
+        for audit_id, auditor_role, signer, approver, nonce in (
+            ("bootstrap-audit-semantic", "semantic", self.auditor_key, "bootstrap-semantic", "bootstrap-semantic-nonce"),
+            ("bootstrap-audit-technical", "technical", self.reviewer_key, "bootstrap-technical", "bootstrap-technical-nonce"),
+        ):
+            claims = {
+                "audit_id": audit_id,
+                "auditor_role": auditor_role,
+                "repository_id": self.repository_id,
+                "authority_epoch": "epoch-local-1",
+                "candidate_pair_digest": pair_digest,
+                "candidate_ancestry_digest": ancestry_digest,
+                "decision": "accepted",
+                "issued_at": issued_at,
+                "replay_nonce": nonce,
+            }
+            audits.append(
+                self.sign_bootstrap_evidence(
+                    schema="engineering.v2.2.6-bootstrap-audit.v1",
+                    claims_schema="engineering.v2.2.6-bootstrap-audit-claims.v1",
+                    claims=claims,
+                    namespace="engineering-v226-bootstrap-audit",
+                    contract="engineering.v2.2.6-bootstrap-audit.v1",
+                    signer=signer,
+                    approver=approver,
+                )
+            )
+        record = {
+            "schema": "engineering.v2.2.6-bootstrap-host-record.v1",
+            "record_id": "bootstrap-record-v226",
+            "repository_id": self.repository_id,
+            "authority_epoch": "epoch-local-1",
+            "candidate_pair": sorted(candidates, key=lambda item: item["role"]),
+            "candidate_pair_digest": pair_digest,
+            "installed_v225": installed_v225,
+            "owner_approval": owner_approval,
+            "independent_audits": audits,
+            "issued_at": issued_at,
+            "replay_nonce": "bootstrap-record-nonce",
+            "public_source": str(public_source),
+            "identity": {"state": "unknown"},
+        }
+        _, manifest, source_commit, source_digest = module._bundle_files(source)
+        return {
+            "record": record,
+            "authorization": {
+                "schema": "engineering.v2.2.6-bootstrap-authorization.v2",
+                "record_id": record["record_id"],
+                "record_digest": module._json_digest(record),
+                "source_bundle": {
+                    "source_git_commit": source_commit,
+                    "source_digest": source_digest,
+                    "skill_version": manifest["version"],
+                },
+            },
+        }
+
+    def publish_bootstrap_authorization(self, material):
+        path = self.bootstrap_authority_dir / "v2.2.6-authorization.json"
+        path.write_text(json.dumps(material["record"]), encoding="utf-8")
+        return material["authorization"]
 
     def host_anchor(self, **changes):
         value = json.loads(self.host_anchor_path.read_text(encoding="utf-8"))
@@ -12679,9 +13055,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         """The first v2.2.6 delivery cannot depend on its uninstalled host gate."""
         module = self.module()
         source = self.installable_bundle_source()
-        authorization = self.publish_bootstrap_authorization(
-            self.bootstrap_authorization(source)
-        )
+        authorization = self.publish_bootstrap_authorization(self.bootstrap_authorization(source))
         with patch.object(
             module,
             "_host_owned_trust_anchor",
@@ -12702,19 +13076,23 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         """Bootstrap facts are sufficient without repository administration or a human key."""
         module = self.module()
         source = self.installable_bundle_source()
-        authorization = self.bootstrap_authorization(source)
-        validated = module._v226_bootstrap_authorization(
-            authorization, authorization["source_bundle"]
-        )
-        self.assertEqual(authorization, validated)
+        material = self.bootstrap_authorization(source)
+        self.publish_bootstrap_authorization(material)
+        with patch.object(
+            module,
+            "_host_owned_trust_anchor",
+            create=True,
+            side_effect=AssertionError("post-activation trust must not run"),
+        ):
+            status = module.v226_bootstrap_handoff_status(source, self.home)
+        self.assertEqual("post_audit_authorization_available", status["state"])
+        self.assertEqual(material["authorization"], status["bootstrap_authorization"])
 
     def test_v226_bootstrap_rejects_an_authorization_for_a_different_source_bundle(self):
         """Bootstrap audit facts for A cannot authorize copying clean bundle B."""
         module = self.module()
         source_a = self.installable_bundle_source()
-        authorization = self.publish_bootstrap_authorization(
-            self.bootstrap_authorization(source_a)
-        )
+        authorization = self.publish_bootstrap_authorization(self.bootstrap_authorization(source_a))
         other_root = Path(self.temporary_directory.name) / "bootstrap-bundle-b"
         subprocess.run(
             ["git", "init", "--initial-branch=main", str(other_root)],
@@ -12754,13 +13132,180 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         """A candidate cannot invent the durable root package-approval record."""
         module = self.module()
         source = self.installable_bundle_source()
-        authorization = self.bootstrap_authorization(source)
+        authorization = self.bootstrap_authorization(source)["authorization"]
 
         with self.assertRaisesRegex(module.EngineeringError, "host.*bootstrap"):
             module.install_bundle(
                 source,
                 self.home,
                 bootstrap_authorization=authorization,
+            )
+
+    def test_v226_bootstrap_reports_pre_audit_capability_without_self_authorizing(self):
+        """Before audits, the supported handoff exposes evidence but never installs a candidate."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        self.installed_v225_receipt()
+        with patch.object(
+            module,
+            "_host_owned_trust_anchor",
+            create=True,
+            side_effect=AssertionError("post-activation trust must not run"),
+        ):
+            status = module.v226_bootstrap_handoff_status(source, self.home)
+        self.assertEqual("pre_audit_capability_evidence", status["state"])
+        self.assertEqual("root", status["post_audit_authority"])
+        self.assertEqual(
+            {"installed_v225", "owner_approval", "independent_audits"},
+            set(status["required_external_evidence"]),
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "host bootstrap"):
+            module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization={
+                    "schema": "engineering.v2.2.6-bootstrap-authorization.v2",
+                    "record_id": "bootstrap-record-v226",
+                    "record_digest": "sha256:" + "a" * 64,
+                    "source_bundle": status["source_bundle"],
+                },
+            )
+
+    def test_v226_bootstrap_handoff_status_cli_is_read_only_and_exact(self):
+        """The supported pre/post-audit handoff is a public read-only controller command."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "candidate-skill"
+        home = Path(self.temporary_directory.name) / "host-home"
+        output = io.StringIO()
+        expected = {
+            "schema": "engineering.v2.2.6-bootstrap-handoff.v1",
+            "state": "pre_audit_capability_evidence",
+            "post_audit_authority": "root",
+        }
+        with (
+            patch.object(module, "v226_bootstrap_handoff_status", return_value=expected) as status,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "bootstrap-handoff-status",
+                    str(source),
+                    "--home",
+                    str(home),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        status.assert_called_once_with(source, home)
+        self.assertEqual(expected, json.loads(output.getvalue()))
+
+    def test_v226_bootstrap_fails_closed_for_invalid_external_evidence(self):
+        """The host record must resolve signed, current, distinct, exact evidence."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(source)
+        now = module.datetime.now(module.timezone.utc)
+        cases = []
+
+        forged = json.loads(json.dumps(material))
+        forged["record"]["owner_approval"]["claims"]["decision"] = "owner_rejected"
+        cases.append(("forged", forged))
+
+        stale = self.bootstrap_authorization(
+            source,
+            issued_at=(now - module.timedelta(days=31)).isoformat().replace("+00:00", "Z"),
+        )
+        cases.append(("stale", stale))
+
+        mismatched = json.loads(json.dumps(material))
+        mismatched["record"]["candidate_pair"][0]["source_digest"] = "sha256:" + "f" * 64
+        mismatched["authorization"]["record_digest"] = module._json_digest(
+            mismatched["record"]
+        )
+        cases.append(("mismatched", mismatched))
+
+        duplicate = json.loads(json.dumps(material))
+        duplicate["record"]["independent_audits"] = [
+            duplicate["record"]["independent_audits"][0],
+            duplicate["record"]["independent_audits"][0],
+        ]
+        duplicate["authorization"]["record_digest"] = module._json_digest(
+            duplicate["record"]
+        )
+        cases.append(("duplicate", duplicate))
+
+        owner_as_auditor = json.loads(json.dumps(material))
+        owner_audit_claims = owner_as_auditor["record"]["independent_audits"][1]["claims"]
+        owner_audit_claims["replay_nonce"] = "bootstrap-owner-audit-nonce"
+        owner_as_auditor["record"]["independent_audits"][1] = self.sign_bootstrap_evidence(
+            schema="engineering.v2.2.6-bootstrap-audit.v1",
+            claims_schema="engineering.v2.2.6-bootstrap-audit-claims.v1",
+            claims=owner_audit_claims,
+            namespace="engineering-v226-bootstrap-audit",
+            contract="engineering.v2.2.6-bootstrap-audit.v1",
+            signer=self.host_key,
+            approver="bootstrap-owner",
+        )
+        owner_as_auditor["authorization"]["record_digest"] = module._json_digest(
+            owner_as_auditor["record"]
+        )
+        cases.append(("owner_as_auditor", owner_as_auditor))
+
+        for field, value in (
+            ("repository_id", "sha256:" + "f" * 64),
+            ("authority_epoch", "epoch-wrong"),
+            ("contract", "engineering.wrong-bootstrap-contract.v1"),
+        ):
+            wrong_receipt = json.loads(json.dumps(material))
+            wrong_receipt["record"]["owner_approval"]["host_receipt"][field] = value
+            wrong_receipt["authorization"]["record_digest"] = module._json_digest(
+                wrong_receipt["record"]
+            )
+            cases.append((f"wrong_{field}", wrong_receipt))
+
+        for label, candidate in cases:
+            with self.subTest(label=label):
+                self.publish_bootstrap_authorization(candidate)
+                with self.assertRaisesRegex(module.EngineeringError, "bootstrap"):
+                    module.v226_bootstrap_handoff_status(source, self.home)
+
+    def test_v226_bootstrap_fails_closed_when_installed_v225_receipt_is_unavailable(self):
+        """A host record cannot stand in for the actual installed v2.2.5 evidence."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(source)
+        self.publish_bootstrap_authorization(material)
+        module._install_paths(self.home)["receipt"].unlink()
+        with self.assertRaisesRegex(module.EngineeringError, "v2.2.5 installed receipt"):
+            module.v226_bootstrap_handoff_status(source, self.home)
+
+    def test_v226_bootstrap_replay_is_exact_and_cannot_replace_host_record(self):
+        """An exact record is idempotent; a changed record cannot replace its installed receipt."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(source)
+        authorization = self.publish_bootstrap_authorization(material)
+        first = module.install_bundle(
+            source, self.home, bootstrap_authorization=authorization
+        )
+        replay = module.install_bundle(
+            source, self.home, bootstrap_authorization=authorization
+        )
+        self.assertEqual(first, replay)
+
+        replacement = json.loads(json.dumps(material))
+        replacement["record"]["replay_nonce"] = "bootstrap-replacement-nonce"
+        replacement["authorization"]["record_digest"] = module._json_digest(
+            replacement["record"]
+        )
+        self.publish_bootstrap_authorization(replacement)
+        with self.assertRaisesRegex(module.EngineeringError, "bootstrap authorization"):
+            module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization=replacement["authorization"],
             )
 
     def test_candidate_local_signer_substitution_is_rejected_after_activation(self):
@@ -13173,6 +13718,116 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             excluded, intent, root=self.root
         )
         self.assertEqual("EXCLUDED", survival["mappings"][0]["disposition"])
+
+    def test_multiple_active_authorities_and_owner_exceptions_are_additive_and_idempotent(self):
+        """Concurrent scopes and distinct core exceptions must not overwrite one another."""
+        module = self.module()
+        issued = module.datetime.now(module.timezone.utc)
+        authority_a_binding = self.binding(
+            target="candidate-a",
+            scope=["src/a.py"],
+            issued_at=issued.isoformat(),
+            expires_at=(issued + module.timedelta(hours=2)).isoformat(),
+        )
+        authority_b_binding = self.binding(
+            target="candidate-b",
+            scope=["src/b.py"],
+            issued_at=issued.isoformat(),
+            expires_at=(issued + module.timedelta(hours=2)).isoformat(),
+        )
+        authority_a = self.persist(binding=authority_a_binding)
+        authority_b = self.persist(binding=authority_b_binding)
+        replay_a = self.persist(binding=authority_a_binding)
+        self.assertEqual(authority_a["authority_id"], replay_a["authority_id"])
+        self.assertNotEqual(authority_a["authority_id"], authority_b["authority_id"])
+        for authority, target, scope in (
+            (authority_a, "candidate-a", ["src/a.py"]),
+            (authority_b, "candidate-b", ["src/b.py"]),
+        ):
+            with self.subTest(authority=authority["authority_id"]):
+                resolved = module.resolve_scoped_authority(
+                    self.root,
+                    self.request(authority["authority_id"], target=target, scope=scope),
+                )
+                self.assertEqual("authorized", resolved["decision"])
+        ledger = module._load_scoped_authorities(self.root)
+        self.assertEqual(
+            {authority_a["authority_id"], authority_b["authority_id"]},
+            {
+                item["authority_id"]
+                for item in ledger["authorities"]
+                if item["authority_id"] in {authority_a["authority_id"], authority_b["authority_id"]}
+            },
+        )
+
+        binding = self.owner_intent_binding(
+            intent_id="intent-multiple-exceptions",
+            outcomes=[
+                {
+                    "id": "OUTCOME-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                        }
+                    ],
+                },
+                {
+                    "id": "OUTCOME-NATIVE-RECOVERY",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "3" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                        }
+                    ],
+                },
+            ],
+        )
+        intent = module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+        mappings = []
+        for outcome_id, disposition, exception_id in (
+            ("OUTCOME-NATIVE-GRAPH", "EXCLUDED", "exception-native-graph"),
+            ("OUTCOME-NATIVE-RECOVERY", "DEFERRED", "exception-native-recovery"),
+        ):
+            mappings.append(
+                {
+                    "outcome_id": outcome_id,
+                    "disposition": disposition,
+                    "reason": "Externally authorized synthetic exception.",
+                    "verification_ids": [
+                        "evidence-native-graph"
+                        if outcome_id == "OUTCOME-NATIVE-GRAPH"
+                        else "evidence-native-recovery"
+                    ],
+                    "replacement_ids": [],
+                    "equivalence": None,
+                    "owner_exception": self.owner_exception(
+                        intent,
+                        outcome_id,
+                        disposition,
+                        exception_id=exception_id,
+                    ),
+                }
+            )
+        survival = self.outcome_survival_v2(intent, mappings=mappings)
+        first = module._outcome_survival_v2(survival, intent, root=self.root)
+        replay = module._outcome_survival_v2(survival, intent, root=self.root)
+        self.assertEqual(first, replay)
+        self.assertEqual(
+            {"exception-native-graph", "exception-native-recovery"},
+            {
+                mapping["owner_exception"]["claims"]["exception_id"]
+                for mapping in first["mappings"]
+            },
+        )
 
     def test_candidate_cannot_replace_host_owned_exception_anchor(self):
         """A candidate signer edit cannot grant itself a core-outcome exception."""

@@ -98,14 +98,17 @@ credential, connector, and destructive actions.
 
 ## Bootstrap and downstream import
 
-For the first v2.2.6 installation only, the installer accepts a complete
-`engineering.v2.2.6-bootstrap-authorization.v1` instead of a token that the
-uninstalled controller would need to mint. It validates the exact source and
-artifact facts and stores them with the install receipt, but treats approval
-and audit authority as native/root evidence supplied from outside Engineering.
-The caller-provided record must exactly equal the host-owned durable bootstrap
-record outside candidate Git; a candidate cannot invent approval-shaped facts.
-It neither uses nor creates the post-activation anchor.
+For the first v2.2.6 installation only, the controller first reports
+deterministic exact-source and installed-v2.2.5 capability evidence. That
+pre-audit report cannot authorize an installation. Only after independent
+exact-artifact audits accept the paired artifacts may root write a
+host-private record outside candidate Git. The installer accepts only an
+equality-bound `engineering.v2.2.6-bootstrap-authorization.v2` reference to
+that resolved record. The record binds repository, epoch, both candidate
+commits, trees and bundle digests, installed-v2.2.5 receipt, recorded owner
+approval, and at least two distinct signed independent audit receipts. Missing,
+forged, stale, mismatched, duplicate, or candidate-created evidence fails
+closed. It neither uses nor creates the post-activation anchor.
 
 After activation, `intent-bind` and `intent-import` bind the recorded
 `OWNER_APPROVED` baseline and prove coverage for both `accepted_owner_outcomes`

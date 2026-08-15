@@ -13,25 +13,24 @@ tests, and approval boundaries.
 The orchestrator independently accepts exact artifacts. Engineering preserves
 native Codex and Claude semantics and one writer per shared resource.
 
-Before dispatch, reconstruct approved intent, decision ledger, dependencies,
-sibling flows, and bounded workspace. For material redesign, replacement,
-deletion, or simplification, classify every baseline outcome as INCLUDED,
-REPLACED, DEFERRED, or EXCLUDED. Replacement needs independent equivalence;
-deferral/exclusion needs exact owner authority. Unknown traceability permits
-advisory analysis, never accepted readiness.
-Intent-impacting work needs external owner intent, a controller-injected
-baseline, and an independently accepted exact-artifact token before separate
-native approval. The one-time v2.2.6 bootstrap uses installed v2.2.5, recorded
-owner approval, and independent exact-artifact audits—not post-activation
-trust. Thereafter approvals, exceptions, audits, equivalence, and traceability
-attestations use a host-owned external anchor and receipt outside candidate Git,
-never a candidate signer file, GitHub policy, collaborator setting, or personal
-owner key; auditor/reviewer principal equals its declared role. Legacy
-attestations remain readable but cannot establish current trust. Impact derives
-from graph context plus authorized, approved, and changed paths; completion
-checks rename endpoints. An install token binds the accepted clean source bundle
-and is rechecked before/after staging; it never replaces native install approval.
-Reject narrow handoffs and proxy-only results.
+Before dispatch, reconstruct approved intent, dependencies, and bounded scope.
+Material redesign, replacement, deletion, or simplification maps every baseline
+outcome to INCLUDED, REPLACED, DEFERRED, or EXCLUDED; replacement needs
+independent equivalence and deferral/exclusion exact owner authority. Unknown
+traceability is advisory, never accepted readiness.
+
+Intent-impacting work requires external owner intent, a controller-injected
+baseline, independent exact-artifact acceptance, and separate native approval.
+The v2.2.6 bootstrap is read-only before audit (exact source plus installed
+v2.2.5 evidence); after audit, root alone records the host-private reference.
+It never invokes post-activation trust. Later admissions use host-owned receipts
+outside candidate Git, never candidate signers, GitHub policy, collaborators, or
+personal keys. Impact includes authorized, approved, changed, and renamed paths.
+An install token binds the clean source bundle; it never replaces native approval.
+
+`engineering bootstrap-handoff-status <skill-source> --home <absolute-host-home>`
+is the supported read-only pre/post-audit handoff. It cannot create, approve,
+install, or activate anything.
 
 Model selection stays native; delivery records requested, actual, and fallback
 facts. Research separates facts, assumptions, citations, and Unknowns.
@@ -42,14 +41,13 @@ Use `engineering map`; see `references/controller-contract.md` for protocols.
 
 ## Graph and context
 
-Engineering is local-first. Graphify supplies the base graph and a deterministic
+Engineering is local-first. Graphify supplies the base graph; a deterministic
 Engineering overlay supplies verified links, decisions, and checks. Claims use
 the canonical default-branch checkpoint; missing/incompatible Graphify blocks
 graph claims. Same-machine worktrees share the Git-common local checkpoint
-catalogue. Separate machines recreate their own evidence. Enterprise graph
-sharing is an inactive opt-in. A cold start builds; an incremental change
-updates; cache
-hits reuse validated evidence.
+catalogue; Separate machines recreate their own evidence. Enterprise graph
+sharing is an inactive opt-in. A cold start builds, an incremental change
+updates, and a cache hit reuses validated evidence.
 
 ## Setup and autonomy
 
@@ -65,16 +63,14 @@ a one-off run does not change the saved autonomy level.
 
 ## What always needs approval
 
-Treat approval presence and a decision to request approval again as separate. Exact
-authority persists across unchanged turns, retries, callbacks, and bounded
-repair epochs. Re-request only when it is missing, revoked, consumed, expired,
-or its project, target, action, scope, safeguards, or epoch changes. Full Access
-is technical permission, never business authority. Native destructive and
-connector approvals remain mandatory. Setup, Graphify, architecture,
-publication, merge, deployment, release, production, security, privacy,
-credentials, finance, persisted contracts, and ambiguity stay gated. Exhausted
-workers freeze as `PAUSED_AWAITING_CENTRAL_ADJUDICATION`; they do not re-ask or
-retire automatically.
+Treat approval presence and re-request as separate. Exact authority persists
+across unchanged turns, retries, callbacks, and repair epochs; re-request only
+for missing, revoked, consumed, expired, or changed binding; never request approval again otherwise. Full Access is
+technical permission, never business authority. Native destructive and connector
+approvals remain mandatory. Setup, Graphify, architecture, publication, merge,
+deployment, release, production, security, privacy, credentials, finance,
+persisted contracts, and ambiguity stay gated. Exhausted workers freeze as
+`PAUSED_AWAITING_CENTRAL_ADJUDICATION`; they do not re-ask automatically.
 
 `engineering retrospect` is bounded and read-only; host reconciliation stays
 advisory until recorded.
@@ -84,18 +80,18 @@ advisory until recorded.
 Missing, stale, conflicting, or role-incomplete evidence stays Unknown; tests
 do not erase incidents. Completion compares impact and records checks.
 
-Maintenance is one foreground pass over a local queue and does not run in the
-background; it repairs only mechanically verified work. Historical/advisory traceability debt remains
-visible without blocking unrelated work. An orchestrator may dispatch
-disjoint maintenance lanes in parallel, while each shared-ledger mutation and
-overlapping writer serializes under existing lock. Preparation blocks
-for checkpoint identity/integrity, required current-contract evidence, or
-dependent graph/release acceptance.
+Maintenance is one foreground pass from the local queue; it does not run in the
+background and repairs only mechanically verified work. Advisory traceability debt stays visible without blocking
+unrelated work. Disjoint lanes may run in parallel, but shared-ledger mutation
+and overlapping writers serialize. Preparation blocks for checkpoint integrity,
+required current-contract evidence, or dependent graph/release acceptance.
 
 Reusable learning starts project-local; promotion needs a second project and
-explicit approval. Promote means apply. User recommendations never silently modify upstream skill. Installation at
-`~/.agents/skills/engineering/` is atomic, preserves overlays and one known-good
-rollback, never rewrites itself, and never copies project evidence. No LangGraph runtime is added without a
+explicit approval. Promote means apply an approved practice under
+`~/.agents/skills/engineering/`, never merely copy it. User recommendations
+never silently modify upstream skill.
+Installation is atomic, preserves one known-good rollback, never rewrites
+itself or copies project evidence. No LangGraph runtime is added without a
 demonstrated native-task gap.
 
 Default handoff is compact:
