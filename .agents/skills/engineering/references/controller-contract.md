@@ -35,7 +35,8 @@ Graph construction, traversal, and map rendering are deterministic and
 code-only: the pinned Graphify `update` path, its reviewed incremental adapter,
 and local BFS/DFS/path/explain operations. Engineering never invokes
 `graphify extract`, provider-backed labeling, or an LLM backend, and removes
-provider credential variables from Graphify subprocess environments. A query
+provider and connector credential variables from every Graphify subprocess
+environment, including legacy detached-snapshot rebuilds. A query
 budget limits returned context, not provider/API spend. This does not constrain
 the host agent's normal reasoning: when prose is needed it may read the bounded
 redacted execution-context slice under task authority, without adding it to the
@@ -431,7 +432,8 @@ accept the exact paired candidates, root alone creates a private host record
 outside candidate Git. It contains the repository and epoch, each candidate's
 role, base, commit, tree, bundle and artifact digests, the pair and ancestry
 digests, the resolved installed-v2.2.5 receipt, a signed owner approval, and
-at least two role-, signer-, and replay-distinct signed audit receipts.
+exactly two signer- and replay-distinct signed audit receipts in the required
+`semantic` and `technical` categories; arbitrary labels cannot substitute.
 `install_bundle(..., bootstrap_authorization=...)` accepts the first exact
 bundle only when its v2 equality-bound reference resolves that private record
 and every fact agrees. Engineering has no command that creates or changes the
@@ -445,7 +447,10 @@ replace native approval for a separately authorized install.
 After activation, an intent-impacting scope is bound to an external,
 owner-private `engineering.owner-intent.v1` before it reaches the signed scope
 handoff. The binding contains only a repository lineage digest, authority
-epoch, opaque source-evidence identities and digests, and owner outcomes. Each
+epoch, opaque source-evidence identities and digests, owner outcomes, and an
+explicit predecessor transition. A first binding declares no predecessor; a
+successor names the active binding and provides one signed disposition for each
+prior outcome (`CARRIED_FORWARD`, `REPLACED`, `DEFERRED`, or `EXCLUDED`). Each
 outcome names its criticality, statement digest, and required evidence class,
 interface, and environment. Intent bodies, approvals, credentials, runtime
 evidence, and host configuration are never stored in Git. `engineering
@@ -499,8 +504,9 @@ Preparation derives intent impact from explicit/query graph selection **and**
 the normalized authorized scope and approved result-artifact source paths.
 Completion repeats the exact-edge analysis at both the preparation checkpoint
 and the refreshed exact result checkpoint for every observed changed artifact,
-including both rename endpoints. A clean result without the required refreshed
-checkpoint, and a dirty result with a new unrepresented artifact, fail closed.
+including both rename endpoints and every new README, documentation, or test
+path. A clean result without the required refreshed checkpoint, and a dirty
+result with a new unrepresented artifact, fail closed.
 If observed impact requires owner intent but the preparation lacks the matching
 active owner-intent binding and outcome-survival v2 mapping, completion fails
 closed; a candidate cannot repair the omission after execution starts.
@@ -943,11 +949,14 @@ failure for trends. An accepted outcome retains bounded outcome and
 representative-data evidence identities, and an audit false-positive signal
 requires completed audit coverage.
 
-Model selection remains caller- or native-platform-owned. Every evaluation may
-record requested and actual model facts plus a truthful fallback reason, but
-this distributable contract prescribes no provider, model family, reasoning
-level, or task topology. Unavailable models do not reduce native capabilities
-or block a viable native fallback. Material decision review asks whether the
+Model selection remains caller- or native-platform-owned. Every new evaluation
+records requested and actual model facts plus a truthful fallback reason and
+typed routing facts for reasoning, owner override, execution target, and
+scope. A routing fact is bounded `recorded` or provider-neutral `unknown`; the
+controller never invents a value it cannot prove. Legacy records remain
+readable history. This distributable contract prescribes no provider, model
+family, reasoning level, or task topology. Unavailable models do not reduce
+native capabilities or block a viable native fallback. Material decision review asks whether the
 concept should exist and whether doing nothing is better, including for
 security, approval, persisted-contract, architecture, and operating-model
 choices.
@@ -968,8 +977,8 @@ then atomically appends one signed, bounded owner-private
 [--window N]` deterministically returns `engineering.delivery-trends.v1` over
 comparable records without an LLM or project write. Evaluation includes
 task/DoD/artifact/verdict identity;
-trigger, requested/actual/fallback model, dependencies, duration, peak
-parallelism, critical path, coordination, terminal reconciliation identity and
+trigger, requested/actual/fallback model, typed routing disclosure,
+dependencies, duration, peak parallelism, critical path, coordination, terminal reconciliation identity and
 latency, unconsumed-terminal-event signal, feedback, invalidated evidence,
 auditor coverage, rework, escaped defects, false blockers, missed escalation,
 intervention, independent technical/domain/outcome acceptance states, actual

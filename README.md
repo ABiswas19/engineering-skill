@@ -282,8 +282,10 @@ connector approvals remain mandatory. Exact-artifact audit records are evidence
 only; they never mint or expand authority.
 
 Optional owner-private delivery evaluation records requested and actual model
-facts, dependencies, coordination, rework, auditor coverage, and independent
-technical, semantic, and outcome states. It retains the newest 365 records
+facts, typed routing facts (reasoning, owner override, execution target, and
+scope), dependencies, coordination, rework, auditor coverage, and independent
+technical, semantic, and outcome states. A native host records `unknown` rather
+than guessing an unavailable routing fact. It retains the newest 365 records
 within 1 MiB and returns `insufficient_sample` below two comparable records.
 Model selection stays with the caller and native platform. No LangGraph runtime
 ships; adding one requires a demonstrated native-task gap and separate

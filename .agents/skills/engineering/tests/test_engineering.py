@@ -2568,6 +2568,43 @@ class Task3ContractTests(unittest.TestCase):
         self.assertEqual(destination, rebuilt)
         self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
 
+    def test_legacy_rebuild_filters_provider_and_connector_credentials_from_graphify(self):
+        """The legacy Graphify child must use the same reduced environment as new rebuilds."""
+        module = self.module()
+        root = self.governed_repo("legacy-rebuild-credential-filter")
+        fake = self.write_fake_graphify()
+        commit = self.git(root, "rev-parse", "HEAD")
+        captured = []
+        original_run = module.run
+
+        def capture_graphify_environment(command, *args, **kwargs):
+            if command[1:4] == ["-m", "graphify", "update"]:
+                captured.append(dict(kwargs["env"]))
+            return original_run(command, *args, **kwargs)
+
+        environment = self.graphify_environment(
+            fake,
+            OPENAI_API_KEY="synthetic-openai-secret",
+            ANTHROPIC_API_KEY="synthetic-anthropic-secret",
+            PROVIDER_CREDENTIAL="synthetic-provider-credential",
+            CONNECTOR_ACCESS_TOKEN="synthetic-connector-token",
+        )
+        with (
+            patch.dict(os.environ, environment, clear=False),
+            patch.object(module, "run", side_effect=capture_graphify_environment),
+        ):
+            module.rebuild(root, commit, sys.executable)
+
+        self.assertEqual(1, len(captured))
+        for name in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "PROVIDER_CREDENTIAL",
+            "CONNECTOR_ACCESS_TOKEN",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, captured[0])
+
     def test_recover_checkpoint_returns_machine_recovery_envelope(self):
         module = self.module()
         root = self.governed_repo("checkpoint-recovery-command")
@@ -5956,6 +5993,38 @@ class Task5ContractTests(unittest.TestCase):
         ):
             module.complete(root, prepared["run_id"], [])
 
+    def test_complete_requires_result_checkpoint_for_new_owner_commitment_paths(self):
+        """New README, prose, and test commitments cannot bypass result assessment."""
+        module = self.module()
+        paths = (
+            ("README-owner-commitment.md", "# Owner commitment\n"),
+            ("docs/owner-commitment.md", "# Owner commitment\n"),
+            ("tests/test_owner_commitment.py", "def test_commitment():\n    pass\n"),
+        )
+        for index, (relative, content) in enumerate(paths, start=1):
+            with self.subTest(path=relative):
+                root, prepared = self.prepared_run(
+                    f"new-owner-commitment-{index}", scope=[relative]
+                )
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                head = self.commit_all(root, f"add {relative}")
+                self.write_canonical_checkpoint(root, head)
+                with (
+                    patch.object(
+                        module,
+                        "check_merge_readiness",
+                        return_value={"ready": False, "commit": head},
+                    ),
+                    patch.object(module, "rebuild", return_value={"freshness": "stale"}),
+                    self.assertRaisesRegex(
+                        module.EngineeringError,
+                        "feature checkpoint refresh failed",
+                    ),
+                ):
+                    module.complete(root, prepared["run_id"], [])
+
     def test_complete_detects_capability_impact_across_authorized_rename(self):
         """Both rename endpoints are assessed before an approved scope can complete."""
         module = self.module()
@@ -7452,12 +7521,28 @@ class Task6ContractTests(unittest.TestCase):
 
     def test_completion_batches_maintenance_once_and_retains_opaque_ids(self):
         module = self.module()
-        root, prepared = self.prepared_run(
-            "maintenance-completion-producer", scope=["README.md"]
-        )
-        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
+        root, _ = self.prepared_repo("maintenance-completion-producer")
+        # This test exercises maintenance queuing for an already-known
+        # follow-up artifact.  New README/docs/tests commitments must instead
+        # receive an exact result checkpoint (covered by the completion
+        # fail-closed regression above).
         (root / "docs").mkdir(exist_ok=True)
-        (root / "docs" / "follow-up.md").write_text("# Follow up\n", encoding="utf-8")
+        (root / "docs" / "follow-up.md").write_text(
+            "# Follow up\n", encoding="utf-8"
+        )
+        base = self.commit_all(root, "add known maintenance follow-up")
+        self.write_canonical_checkpoint(root, base)
+        module.approve_checks(root)
+        prepared = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": ["README.md"], "forbidden": ["publish", "deploy"]},
+        )
+        self.assertNotEqual("blocked", prepared["readiness"])
+        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
+        (root / "docs" / "follow-up.md").write_text(
+            "# Updated follow up\n", encoding="utf-8"
+        )
 
         first = module.complete(root, prepared["run_id"], receipts=[])
 
@@ -10816,6 +10901,12 @@ class DeliveryEvaluationContractTests(unittest.TestCase):
             "verdict": "accepted_exact_artifact",
             "trigger": "completion",
             "model": {"requested": "requested-model", "actual": "actual-model", "fallback": None},
+            "routing": {
+                "reasoning": {"state": "unknown"},
+                "owner_override": {"state": "unknown"},
+                "execution_target": {"state": "unknown"},
+                "scope": {"state": "unknown"},
+            },
             "lanes": {"dependencies": 2, "parallelism": 3},
             "terminal": {
                 "artifact_identity": "sha256:ddb48e5b1d320ff88ac89675b60f8b5f61fb64881c7e8b247efbaff3c87bf075",
@@ -10903,6 +10994,48 @@ class DeliveryEvaluationContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(self.module().EngineeringError, "delivery evaluation"):
                     self.record(root, "run-a1b2c3", value)
+
+    def test_delivery_evaluation_requires_typed_provider_neutral_routing_disclosure(self):
+        """New records disclose routing facts or typed Unknown without provider guessing."""
+        module = self.module()
+        root = self.init_repo("delivery-routing")
+        missing = self.evaluation_input()
+        missing.pop("routing", None)
+        with self.assertRaisesRegex(module.EngineeringError, "routing"):
+            self.record(root, "run-a1b2c3", missing)
+
+        unknown = self.evaluation_input(
+            routing={
+                "reasoning": {"state": "unknown"},
+                "owner_override": {"state": "unknown"},
+                "execution_target": {"state": "unknown"},
+                "scope": {"state": "unknown"},
+            }
+        )
+        recorded = self.record(root, "run-b2c3d4", unknown, digest="sha256:" + "2" * 64)
+        self.assertEqual("unknown", recorded["input"]["routing"]["reasoning"]["state"])
+
+        private = self.evaluation_input(
+            routing={
+                "reasoning": {"state": "recorded", "value": "password=secret"},
+                "owner_override": {"state": "unknown"},
+                "execution_target": {"state": "unknown"},
+                "scope": {"state": "unknown"},
+            }
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "routing"):
+            self.record(root, "run-c3d4e5", private, digest="sha256:" + "3" * 64)
+
+        legacy = self.evaluation_input()
+        legacy.pop("routing", None)
+        self.assertEqual(
+            legacy,
+            module._validate_delivery_evaluation(
+                legacy,
+                allow_legacy_terminal=True,
+                allow_legacy_routing=True,
+            ),
+        )
 
     def test_delivery_evaluation_tracks_reconciled_terminal_event(self):
         root = self.init_repo("delivery-terminal")
@@ -12380,6 +12513,10 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                     ],
                 }
             ],
+            "predecessor": {
+                "schema": "engineering.owner-intent-predecessor.v1",
+                "state": "none",
+            },
         }
         value.update(changes)
         return value
@@ -12741,7 +12878,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             )
         ).hexdigest()
 
-    def bootstrap_authorization(self, source, *, issued_at=None):
+    def bootstrap_authorization(self, source, *, issued_at=None, audit_specs=None):
         module = self.module()
         public_source = self.public_bundle_source(source)
         candidates = [
@@ -12778,10 +12915,11 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             approver="bootstrap-owner",
         )
         audits = []
-        for audit_id, auditor_role, signer, approver, nonce in (
+        audit_specs = audit_specs or (
             ("bootstrap-audit-semantic", "semantic", self.auditor_key, "bootstrap-semantic", "bootstrap-semantic-nonce"),
             ("bootstrap-audit-technical", "technical", self.reviewer_key, "bootstrap-technical", "bootstrap-technical-nonce"),
-        ):
+        )
+        for audit_id, auditor_role, signer, approver, nonce in audit_specs:
             claims = {
                 "audit_id": audit_id,
                 "auditor_role": auditor_role,
@@ -13051,6 +13189,58 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 {"fabricated": True},
             )
 
+    def test_owner_intent_successor_requires_explicit_complete_predecessor_dispositions(self):
+        """An active approved baseline cannot disappear behind a new binding."""
+        module = self.module()
+        missing = self.owner_intent_binding()
+        missing.pop("predecessor", None)
+        with self.assertRaisesRegex(module.EngineeringError, "predecessor"):
+            module.bind_owner_intent(
+                self.root, missing, self.owner_intent_approval(missing)
+            )
+
+        initial_binding = self.owner_intent_binding(
+            predecessor={"schema": "engineering.owner-intent-predecessor.v1", "state": "none"}
+        )
+        initial = module.bind_owner_intent(
+            self.root,
+            initial_binding,
+            self.owner_intent_approval(initial_binding),
+        )
+        partial = self.owner_intent_binding(
+            intent_id="intent-successor",
+            predecessor={"schema": "engineering.owner-intent-predecessor.v1", "state": "none"},
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "predecessor"):
+            module.bind_owner_intent(
+                self.root, partial, self.owner_intent_approval(partial)
+            )
+
+        transition = {
+            "schema": "engineering.owner-intent-predecessor.v1",
+            "state": "successor",
+            "intent_id": initial["intent_id"],
+            "owner_intent_digest": initial["owner_intent_digest"],
+            "dispositions": [
+                {
+                    "outcome_id": "OUTCOME-NATIVE-GRAPH",
+                    "disposition": "CARRIED_FORWARD",
+                    "successor_outcome_id": "OUTCOME-NATIVE-GRAPH",
+                }
+            ],
+        }
+        successor_binding = self.owner_intent_binding(
+            intent_id="intent-successor", predecessor=transition
+        )
+        approval = self.owner_intent_approval(successor_binding)
+        successor = module.bind_owner_intent(self.root, successor_binding, approval)
+        replay = module.bind_owner_intent(self.root, successor_binding, approval)
+        self.assertEqual(successor, replay)
+        self.assertEqual(transition, successor["predecessor"])
+        ledger = module._load_owner_intents(self.root)
+        prior = next(item for item in ledger["intents"] if item["intent_id"] == initial["intent_id"])
+        self.assertEqual("superseded", prior["status"])
+
     def test_v226_bootstrap_acceptance_does_not_call_postactivation_trust(self):
         """The first v2.2.6 delivery cannot depend on its uninstalled host gate."""
         module = self.module()
@@ -13087,6 +13277,22 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             status = module.v226_bootstrap_handoff_status(source, self.home)
         self.assertEqual("post_audit_authorization_available", status["state"])
         self.assertEqual(material["authorization"], status["bootstrap_authorization"])
+
+    def test_v226_bootstrap_requires_semantic_and_technical_audit_categories(self):
+        """Distinct arbitrary labels cannot stand in for the required two audit categories."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(
+            source,
+            audit_specs=(
+                ("bootstrap-audit-semantic", "architecture", self.auditor_key, "bootstrap-semantic", "bootstrap-architecture-nonce"),
+                ("bootstrap-audit-technical", "verification", self.reviewer_key, "bootstrap-technical", "bootstrap-verification-nonce"),
+            ),
+        )
+        self.publish_bootstrap_authorization(material)
+
+        with self.assertRaisesRegex(module.EngineeringError, "semantic.*technical|required audit"):
+            module.v226_bootstrap_handoff_status(source, self.home)
 
     def test_v226_bootstrap_rejects_an_authorization_for_a_different_source_bundle(self):
         """Bootstrap audit facts for A cannot authorize copying clean bundle B."""

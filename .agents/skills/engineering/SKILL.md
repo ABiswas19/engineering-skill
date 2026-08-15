@@ -32,8 +32,10 @@ An install token binds the clean source bundle; it never replaces native approva
 is the supported read-only pre/post-audit handoff. It cannot create, approve,
 install, or activate anything.
 
-Model selection stays native; delivery records requested, actual, and fallback
-facts. Research separates facts, assumptions, citations, and Unknowns.
+Model selection stays native; new delivery records include requested, actual,
+fallback, and typed routing facts for reasoning, owner override, execution
+target, and scope. An unavailable fact stays `unknown`; it is never inferred.
+Research separates facts, assumptions, citations, and Unknowns.
 
 Engineering completion runs automatically before claiming non-trivial work is ready;
 controller commands are diagnostics and CI interfaces.

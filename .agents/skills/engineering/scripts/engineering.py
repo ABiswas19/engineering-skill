@@ -79,6 +79,7 @@ V226_BOOTSTRAP_TRUST_ANCHOR_SCHEMA = "engineering.v2.2.6-bootstrap-trust-anchor.
 V226_BOOTSTRAP_HOST_RECEIPT_SCHEMA = "engineering.v2.2.6-bootstrap-host-receipt.v1"
 V226_BOOTSTRAP_OWNER_APPROVAL_SCHEMA = "engineering.v2.2.6-bootstrap-owner-approval.v1"
 V226_BOOTSTRAP_AUDIT_SCHEMA = "engineering.v2.2.6-bootstrap-audit.v1"
+V226_BOOTSTRAP_AUDIT_CATEGORIES = {"semantic", "technical"}
 V226_BOOTSTRAP_MAX_EVIDENCE_AGE = timedelta(days=30)
 NATIVE_APPROVAL_REQUIREMENTS = {"connector", "credential", "destructive", "system"}
 MAX_SCOPED_AUTHORITIES = 256
@@ -89,6 +90,13 @@ MAX_OWNER_INTENT_EVIDENCE = 64
 MAX_OUTCOME_ACCEPTANCES = 256
 MAX_RELEASE_TOKENS = 256
 OWNER_INTENT_CRITICALITIES = {"core", "supporting"}
+OWNER_INTENT_PREDECESSOR_SCHEMA = "engineering.owner-intent-predecessor.v1"
+OWNER_INTENT_PREDECESSOR_DISPOSITIONS = {
+    "CARRIED_FORWARD",
+    "REPLACED",
+    "DEFERRED",
+    "EXCLUDED",
+}
 OUTCOME_EVIDENCE_CLASSES = {
     "design",
     "proxy",
@@ -2059,7 +2067,11 @@ def _graphify_environment(*, output: Path | None = None) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not re.search(r"(?:api.?key|token|secret|openai|anthropic)", key, re.I)
+        if not re.search(
+            r"(?:api.?key|token|secret|credential|password|openai|anthropic)",
+            key,
+            re.I,
+        )
     }
     if output is not None:
         environment["GRAPHIFY_OUT"] = str(output)
@@ -2343,8 +2355,7 @@ def _legacy_rebuild(
         added = True
         if git(snapshot, "rev-parse", "HEAD") != commit:
             raise TraceabilityError("Detached Graphify snapshot is not bound to commit.")
-        environment = os.environ.copy()
-        environment["GRAPHIFY_OUT"] = str(stage)
+        environment = _graphify_environment(output=stage)
         run(
             [
                 str(Path(graphify_python).expanduser().resolve()),
@@ -7144,12 +7155,11 @@ def _requires_refreshed_intent_checkpoint(
 ) -> bool:
     """Return whether base evidence cannot safely cover the exact result.
 
-    A result checkpoint is mandatory when the result introduces a non-document
-    artifact which the preparation checkpoint could not have represented, or
-    when it alters the traceability mapping itself.  Ordinary documentation and
-    test follow-ups remain governed by their existing scope/contract checks;
-    they are not silently promoted into a capability merely because they are
-    new dirty-overlay files.
+    A result checkpoint is mandatory when the result introduces an artifact
+    which the preparation checkpoint could not have represented, including
+    README, documentation, and test commitments, or when it alters the
+    traceability mapping itself.  The refreshed graph decides whether a new
+    artifact is capability-linked; absence of that exact evidence fails closed.
     """
     known = _checkpoint_source_paths(base)
     for path in changed:
@@ -7157,11 +7167,6 @@ def _requires_refreshed_intent_checkpoint(
         if normalized == "docs/engineering-traceability/links.json":
             return True
         if normalized in known or _path_exists_at_commit(root, preparation_commit, normalized):
-            continue
-        parts = PurePosixPath(normalized).parts
-        if parts and parts[0] in {"docs", "tests"}:
-            continue
-        if normalized.startswith("README") and normalized.endswith(".md"):
             continue
         return True
     return False
@@ -11276,8 +11281,81 @@ def _owner_intent_path(root: Path) -> Path:
     return path
 
 
-def _owner_intent_binding(root: Path, value: object) -> dict:
+def _owner_intent_predecessor(value: object) -> dict:
+    """Normalize an explicit owner-approved transition from the active baseline."""
+    if (
+        isinstance(value, dict)
+        and set(value) == {"schema", "state"}
+        and value.get("schema") == OWNER_INTENT_PREDECESSOR_SCHEMA
+        and value.get("state") == "none"
+    ):
+        return {"schema": OWNER_INTENT_PREDECESSOR_SCHEMA, "state": "none"}
     expected = {
+        "schema",
+        "state",
+        "intent_id",
+        "owner_intent_digest",
+        "dispositions",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != OWNER_INTENT_PREDECESSOR_SCHEMA
+        or value.get("state") != "successor"
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(value.get("owner_intent_digest", ""))
+        )
+        or not isinstance(value.get("dispositions"), list)
+        or not value["dispositions"]
+        or len(value["dispositions"]) > MAX_OWNER_INTENT_OUTCOMES
+    ):
+        raise EngineeringError("Engineering owner intent predecessor is invalid.")
+    dispositions = []
+    outcome_ids: set[str] = set()
+    successor_ids: set[str] = set()
+    for item in value["dispositions"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"outcome_id", "disposition", "successor_outcome_id"}
+            or item.get("disposition") not in OWNER_INTENT_PREDECESSOR_DISPOSITIONS
+        ):
+            raise EngineeringError("Engineering owner intent predecessor disposition is invalid.")
+        outcome_id = _assurance_id(item.get("outcome_id"), "owner intent predecessor outcome")
+        successor = item.get("successor_outcome_id")
+        if successor is not None:
+            successor = _assurance_id(
+                successor, "owner intent predecessor successor outcome"
+            )
+        disposition = item["disposition"]
+        if (
+            outcome_id in outcome_ids
+            or (successor is not None and successor in successor_ids)
+            or (disposition == "CARRIED_FORWARD" and successor != outcome_id)
+            or (disposition == "REPLACED" and (successor is None or successor == outcome_id))
+            or (disposition in {"DEFERRED", "EXCLUDED"} and successor is not None)
+        ):
+            raise EngineeringError("Engineering owner intent predecessor disposition is invalid.")
+        outcome_ids.add(outcome_id)
+        if successor is not None:
+            successor_ids.add(successor)
+        dispositions.append(
+            {
+                "outcome_id": outcome_id,
+                "disposition": disposition,
+                "successor_outcome_id": successor,
+            }
+        )
+    return {
+        "schema": OWNER_INTENT_PREDECESSOR_SCHEMA,
+        "state": "successor",
+        "intent_id": _assurance_id(value.get("intent_id"), "owner intent predecessor"),
+        "owner_intent_digest": value["owner_intent_digest"],
+        "dispositions": sorted(dispositions, key=lambda item: item["outcome_id"]),
+    }
+
+
+def _owner_intent_binding(root: Path, value: object) -> dict:
+    legacy_expected = {
         "schema",
         "intent_id",
         "repository_id",
@@ -11285,9 +11363,10 @@ def _owner_intent_binding(root: Path, value: object) -> dict:
         "source_evidence",
         "outcomes",
     }
+    expected = legacy_expected | {"predecessor"}
     if (
         not isinstance(value, dict)
-        or set(value) != expected
+        or set(value) not in (legacy_expected, expected)
         or value.get("schema") != OWNER_INTENT_SCHEMA
     ):
         raise EngineeringError("Engineering owner intent binding is invalid.")
@@ -11370,7 +11449,7 @@ def _owner_intent_binding(root: Path, value: object) -> dict:
                 ),
             }
         )
-    return {
+    normalized = {
         "schema": OWNER_INTENT_SCHEMA,
         "intent_id": _assurance_id(value.get("intent_id"), "owner intent"),
         "repository_id": repository_id,
@@ -11378,6 +11457,9 @@ def _owner_intent_binding(root: Path, value: object) -> dict:
         "source_evidence": sorted(normalized_sources, key=lambda item: item["identity"]),
         "outcomes": sorted(normalized_outcomes, key=lambda item: item["id"]),
     }
+    if "predecessor" in value:
+        normalized["predecessor"] = _owner_intent_predecessor(value["predecessor"])
+    return normalized
 
 
 def _owner_intent_signature(key: bytes, record: dict) -> str:
@@ -11407,28 +11489,43 @@ def _load_owner_intents(root: Path) -> dict:
     active = 0
     digests: set[str] = set()
     for record in ledger["intents"]:
-        legacy_expected = {
+        legacy_binding_fields = {
             "schema",
             "intent_id",
             "repository_id",
             "authority_epoch",
             "source_evidence",
             "outcomes",
+        }
+        binding_fields = legacy_binding_fields | {"predecessor"}
+        receipt_fields = {
             "owner_intent_digest",
             "approval_reference",
             "bound_at",
             "status",
             "signature",
         }
-        anchored_expected = legacy_expected | {"approval_trust_anchor"}
-        if not isinstance(record, dict) or frozenset(record) not in {
-            frozenset(legacy_expected),
-            frozenset(anchored_expected),
-        }:
+        expected_records = (
+            legacy_binding_fields | receipt_fields,
+            legacy_binding_fields | receipt_fields | {"approval_trust_anchor"},
+            binding_fields | receipt_fields,
+            binding_fields | receipt_fields | {"approval_trust_anchor"},
+        )
+        if not isinstance(record, dict) or set(record) not in expected_records:
             raise EngineeringError("Engineering owner intent ledger is invalid.")
-        binding = {name: record[name] for name in (
-            "schema", "intent_id", "repository_id", "authority_epoch", "source_evidence", "outcomes"
-        )}
+        binding = {
+            name: record[name]
+            for name in (
+                "schema",
+                "intent_id",
+                "repository_id",
+                "authority_epoch",
+                "source_evidence",
+                "outcomes",
+                "predecessor",
+            )
+            if name in record
+        }
         try:
             normalized = _owner_intent_binding(root, binding)
             _assurance_id(record["approval_reference"], "owner intent approval reference")
@@ -11470,6 +11567,69 @@ def _publish_owner_intents(root: Path, ledger: dict, new_key: bytes | None) -> N
     _transactional_json_documents([(_owner_intent_path(root), ledger)], binary)
 
 
+def _validate_owner_intent_predecessor_transition(ledger: dict, normalized: dict) -> None:
+    """Require a signed successor to account for every active approved outcome."""
+    predecessor = normalized.get("predecessor")
+    if not isinstance(predecessor, dict):
+        raise EngineeringError(
+            "Engineering new owner intent requires explicit predecessor dispositions."
+        )
+    active = [record for record in ledger["intents"] if record["status"] == "active"]
+    if len(active) > 1:
+        raise EngineeringError("Engineering owner intent ledger is ambiguous.")
+    if not active:
+        if predecessor != {
+            "schema": OWNER_INTENT_PREDECESSOR_SCHEMA,
+            "state": "none",
+        }:
+            raise EngineeringError(
+                "Engineering first owner intent predecessor must declare no active baseline."
+            )
+        return
+    prior = active[0]
+    if (
+        predecessor.get("state") != "successor"
+        or predecessor.get("intent_id") != prior["intent_id"]
+        or predecessor.get("owner_intent_digest") != prior["owner_intent_digest"]
+    ):
+        raise EngineeringError(
+            "Engineering owner intent predecessor does not bind the active baseline."
+        )
+    prior_outcomes = {item["id"]: item for item in prior["outcomes"]}
+    next_outcomes = {item["id"]: item for item in normalized["outcomes"]}
+    dispositions = predecessor.get("dispositions")
+    if not isinstance(dispositions, list):
+        raise EngineeringError("Engineering owner intent predecessor dispositions are invalid.")
+    by_outcome = {item.get("outcome_id"): item for item in dispositions}
+    if len(by_outcome) != len(dispositions) or set(by_outcome) != set(prior_outcomes):
+        raise EngineeringError(
+            "Engineering owner intent predecessor dispositions are incomplete."
+        )
+    for outcome_id, item in by_outcome.items():
+        disposition = item["disposition"]
+        successor_id = item["successor_outcome_id"]
+        if disposition == "CARRIED_FORWARD":
+            if (
+                successor_id != outcome_id
+                or next_outcomes.get(outcome_id) != prior_outcomes[outcome_id]
+            ):
+                raise EngineeringError(
+                    "Engineering owner intent predecessor carry-forward is mismatched."
+                )
+        elif disposition == "REPLACED":
+            if successor_id not in next_outcomes or successor_id == outcome_id:
+                raise EngineeringError(
+                    "Engineering owner intent predecessor replacement is mismatched."
+                )
+        elif disposition in {"DEFERRED", "EXCLUDED"}:
+            if successor_id is not None or outcome_id in next_outcomes:
+                raise EngineeringError(
+                    "Engineering owner intent predecessor disposition is mismatched."
+                )
+        else:
+            raise EngineeringError("Engineering owner intent predecessor disposition is invalid.")
+
+
 def _verify_host_owner_intent_approval(root: Path, normalized: dict, approval: object) -> tuple[str, dict]:
     return _verify_host_owned_signature(
         root,
@@ -11487,6 +11647,10 @@ def bind_owner_intent(root: Path, binding: object, approval: object) -> dict:
     """Persist a host-approved owner baseline; callers cannot self-approve it."""
     project_root = resolve_project_root(str(root))
     normalized = _owner_intent_binding(project_root, binding)
+    if "predecessor" not in normalized:
+        raise EngineeringError(
+            "Engineering new owner intent requires explicit predecessor dispositions."
+        )
     approval_reference, approval_trust_anchor = _verify_host_owner_intent_approval(
         project_root, normalized, approval
     )
@@ -11507,6 +11671,7 @@ def bind_owner_intent(root: Path, binding: object, approval: object) -> dict:
             ):
                 raise EngineeringError("Engineering owner intent replay conflicts with retained state.")
             return dict(matches[0])
+        _validate_owner_intent_predecessor_transition(ledger, normalized)
         controller = _project_controller_dir(project_root)
         key = _controller_key(controller, required=False)
         new_key = os.urandom(32) if key is None else None
@@ -13902,18 +14067,46 @@ def _delivery_count(value: object, label: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _delivery_routing_fact(value: object, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise EngineeringError("Engineering delivery evaluation routing is invalid.")
+    if set(value) == {"state"} and value.get("state") == "unknown":
+        return {"state": "unknown"}
+    if set(value) == {"state", "value"} and value.get("state") == "recorded":
+        return {
+            "state": "recorded",
+            "value": _delivery_label(value["value"], f"routing {label}"),
+        }
+    raise EngineeringError("Engineering delivery evaluation routing is invalid.")
+
+
+def _delivery_routing(value: object) -> dict:
+    names = {"reasoning", "owner_override", "execution_target", "scope"}
+    if not isinstance(value, dict) or set(value) != names:
+        raise EngineeringError("Engineering delivery evaluation routing is invalid.")
+    return {name: _delivery_routing_fact(value[name], name) for name in sorted(names)}
+
+
 def _validate_delivery_evaluation(
     value: object,
     *,
     bound_terminal_evidence: set[str] | None = None,
     bound_acceptance_evidence: set[str] | None = None,
     allow_legacy_terminal: bool = False,
+    allow_legacy_routing: bool = False,
 ) -> dict:
-    required = {
+    legacy_required = {
         "task_id", "dod_id", "artifact_digest", "verdict", "trigger", "model", "lanes",
         "terminal", "acceptance", *_DELIVERY_METRICS, "auditor_coverage", "non_applicable"
     }
-    if not isinstance(value, dict) or set(value) != required:
+    required = legacy_required | {"routing"}
+    if not isinstance(value, dict):
+        raise EngineeringError("Engineering delivery evaluation input is invalid.")
+    keys = set(value)
+    legacy_routing = keys == legacy_required
+    if legacy_routing and not allow_legacy_routing:
+        raise EngineeringError("Engineering delivery evaluation routing is required.")
+    if keys != required and not (allow_legacy_routing and legacy_routing):
         raise EngineeringError("Engineering delivery evaluation input is invalid.")
     non_applicable = value["non_applicable"]
     permitted_reasons = {*_DELIVERY_METRICS, "model.fallback"}
@@ -13931,6 +14124,7 @@ def _validate_delivery_evaluation(
     coverage = value["auditor_coverage"]
     acceptance = value["acceptance"]
     terminal = value["terminal"]
+    routing = None if legacy_routing else _delivery_routing(value["routing"])
     terminal_keys = {
         "artifact_identity",
         "acceptance_state",
@@ -14010,6 +14204,8 @@ def _validate_delivery_evaluation(
         },
         "non_applicable": dict(sorted(reasons.items())),
     }
+    if routing is not None:
+        normalized["routing"] = routing
     if (
         not re.fullmatch(r"sha256:[0-9a-f]{64}", str(normalized["artifact_digest"]))
         or normalized["verdict"] != "accepted_exact_artifact"
@@ -14168,7 +14364,9 @@ def _load_delivery_evaluations() -> dict:
                 and re.fullmatch(r"run-[0-9a-f]{6}", str(record["completion_id"]))
                 and re.fullmatch(r"sha256:[0-9a-f]{64}", str(record["completion_digest"]))
                 and _validate_delivery_evaluation(
-                    record["input"], allow_legacy_terminal=True
+                    record["input"],
+                    allow_legacy_terminal=True,
+                    allow_legacy_routing=True,
                 ) == record["input"]
                 and record["id"] not in identifiers
                 and hmac.compare_digest(str(record["signature"]), _delivery_evaluation_signature(key, record))
@@ -15607,6 +15805,10 @@ def _v226_bootstrap_audit_claims(
         issued_at = _v226_bootstrap_timestamp(value.get("issued_at"), "audit")
     except EngineeringError as error:
         raise EngineeringError("Engineering v2.2.6 bootstrap audit is invalid.") from error
+    if auditor_role not in V226_BOOTSTRAP_AUDIT_CATEGORIES:
+        raise EngineeringError(
+            "Engineering v2.2.6 bootstrap audit category must be semantic or technical."
+        )
     return {
         "audit_id": audit_id,
         "auditor_role": auditor_role,
@@ -15717,7 +15919,7 @@ def _v226_bootstrap_host_record(
         label="owner approval",
     )
     audits = value.get("independent_audits")
-    if not isinstance(audits, list) or not 2 <= len(audits) <= 16:
+    if not isinstance(audits, list) or len(audits) != len(V226_BOOTSTRAP_AUDIT_CATEGORIES):
         raise EngineeringError("Engineering host bootstrap independent audits are invalid.")
     normalized_audits = []
     audit_ids: set[str] = set()
@@ -15771,6 +15973,10 @@ def _v226_bootstrap_host_record(
         )
     if len(replay_nonces) != len(audits) + 2:
         raise EngineeringError("Engineering host bootstrap replay evidence is duplicated.")
+    if audit_roles != V226_BOOTSTRAP_AUDIT_CATEGORIES:
+        raise EngineeringError(
+            "Engineering host bootstrap lacks required semantic and technical audit categories."
+        )
     if source_bundle != {
         name: internal[name]
         for name in ("source_git_commit", "source_digest", "skill_version")
