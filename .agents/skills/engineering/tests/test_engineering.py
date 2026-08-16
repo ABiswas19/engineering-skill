@@ -271,13 +271,7 @@ class Task2ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -522,20 +516,27 @@ class Task2ContractTests(unittest.TestCase):
         (package / "__init__.py").write_text("", encoding="utf-8")
         (package / "__main__.py").write_text(
             "import json, os, pathlib, subprocess, sys\n"
+            "control_path = pathlib.Path(__file__).with_name('fixture-controls.json')\n"
+            "try:\n"
+            "    controls = json.loads(control_path.read_text(encoding='utf-8'))\n"
+            "except (OSError, json.JSONDecodeError):\n"
+            "    controls = {}\n"
+            "def control(name):\n"
+            "    return controls.get(name) or os.environ.get(name)\n"
             "if '--help' in sys.argv:\n"
             "    print('  update PATH\\n  query TEXT\\n  path A B\\n  explain X')\n"
             "elif len(sys.argv) > 1 and sys.argv[1] == 'query':\n"
             "    print('No matching nodes found.')\n"
             "elif len(sys.argv) > 2 and sys.argv[1] == 'update':\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_RECORD'):\n"
-            "        pathlib.Path(os.environ['FAKE_GRAPHIFY_RECORD']).open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_SLOW'):\n"
-            "        __import__('time').sleep(float(os.environ['FAKE_GRAPHIFY_SLOW']))\n"
+            "    if control('FAKE_GRAPHIFY_RECORD'):\n"
+            "        pathlib.Path(control('FAKE_GRAPHIFY_RECORD')).open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "    if control('FAKE_GRAPHIFY_SLOW'):\n"
+            "        __import__('time').sleep(float(control('FAKE_GRAPHIFY_SLOW')))\n"
             "    out = pathlib.Path(os.environ['GRAPHIFY_OUT'])\n"
             "    out.mkdir(parents=True, exist_ok=True)\n"
             "    commit = subprocess.run(['git', '-C', sys.argv[2], 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()\n"
             "    (out / 'graph.json').write_text(json.dumps({'directed': True, 'multigraph': False, 'graph': {}, 'nodes': [], 'links': [], 'built_at_commit': commit}))\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_FAIL'):\n"
+            "    if control('FAKE_GRAPHIFY_FAIL'):\n"
             "        raise SystemExit(7)\n"
             "else:\n"
             "    raise SystemExit(3)\n",
@@ -547,21 +548,28 @@ class Task2ContractTests(unittest.TestCase):
         )
         (package / "watch.py").write_text(
             "import json, os, pathlib, subprocess, sys, time\n"
+            "control_path = pathlib.Path(__file__).with_name('fixture-controls.json')\n"
+            "try:\n"
+            "    controls = json.loads(control_path.read_text(encoding='utf-8'))\n"
+            "except (OSError, json.JSONDecodeError):\n"
+            "    controls = {}\n"
+            "def control(name):\n"
+            "    return controls.get(name) or os.environ.get(name)\n"
             "def _rebuild_code(watch_path, *, changed_paths=None, follow_symlinks=False, force=False, no_cluster=False, acquire_lock=True, block_on_lock=False):\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_RECORD'):\n"
-            "        pathlib.Path(os.environ['FAKE_GRAPHIFY_RECORD']).open('a', encoding='utf-8').write(json.dumps(['private_rebuild_code', str(pathlib.Path.cwd()), *[str(p) for p in (changed_paths or [])]]) + '\\n')\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_SLOW'):\n"
-            "        if os.environ.get('FAKE_GRAPHIFY_CHILD_PID'):\n"
+            "    if control('FAKE_GRAPHIFY_RECORD'):\n"
+            "        pathlib.Path(control('FAKE_GRAPHIFY_RECORD')).open('a', encoding='utf-8').write(json.dumps(['private_rebuild_code', str(pathlib.Path.cwd()), *[str(p) for p in (changed_paths or [])]]) + '\\n')\n"
+            "    if control('FAKE_GRAPHIFY_SLOW'):\n"
+            "        if control('FAKE_GRAPHIFY_CHILD_PID'):\n"
             "            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
-            "            pathlib.Path(os.environ['FAKE_GRAPHIFY_CHILD_PID']).write_text(str(child.pid))\n"
-            "        time.sleep(float(os.environ['FAKE_GRAPHIFY_SLOW']))\n"
+            "            pathlib.Path(control('FAKE_GRAPHIFY_CHILD_PID')).write_text(str(child.pid))\n"
+            "        time.sleep(float(control('FAKE_GRAPHIFY_SLOW')))\n"
             "    out = pathlib.Path(os.environ['GRAPHIFY_OUT'])\n"
             "    out.mkdir(parents=True, exist_ok=True)\n"
             "    graph_path = out / 'graph.json'\n"
             "    graph = json.loads(graph_path.read_text()) if graph_path.exists() else {'directed': True, 'multigraph': False, 'graph': {}, 'nodes': [], 'links': []}\n"
             "    graph['built_at_commit'] = subprocess.run(['git', '-C', str(watch_path), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()\n"
             "    graph_path.write_text(json.dumps(graph))\n"
-            "    return not bool(os.environ.get('FAKE_GRAPHIFY_FAIL'))\n",
+            "    return not bool(control('FAKE_GRAPHIFY_FAIL'))\n",
             encoding="utf-8",
         )
         (metadata / "METADATA").write_text(
@@ -583,6 +591,42 @@ class Task2ContractTests(unittest.TestCase):
             encoding="utf-8",
         )
         return root
+
+    def start_fake_graphify_interpreter(self) -> None:
+        """Use an isolated interpreter for synthetic Graphify, never PYTHONPATH."""
+        host_python = Path(sys.executable)
+        fake_graphify = self.write_fake_graphify()
+        environment = Path(self.temporary_directory.name) / "fake-graphify-venv"
+        subprocess.run(
+            [str(host_python), "-m", "venv", "--without-pip", str(environment)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        interpreter = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        site_packages = Path(
+            subprocess.run(
+                [str(interpreter), "-c", "import site; print(site.getsitepackages()[0])"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        shutil.copytree(fake_graphify / "graphify", site_packages / "graphify")
+        shutil.copytree(
+            fake_graphify / "graphifyy-0.9.5.dist-info",
+            site_packages / "graphifyy-0.9.5.dist-info",
+        )
+        self.fake_graphify_control = site_packages / "graphify" / "fixture-controls.json"
+        self.fake_graphify_control.write_text("{}\n", encoding="utf-8")
+        self.fake_graphify_interpreter = patch.object(sys, "executable", str(interpreter))
+        self.fake_graphify_interpreter.start()
+        self.addCleanup(self.fake_graphify_interpreter.stop)
+
+    def set_fake_graphify_controls(self, **controls: str) -> None:
+        self.fake_graphify_control.write_text(
+            json.dumps(controls, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     def test_project_discovery_contract_surface(self):
         module = self.module()
@@ -2134,11 +2178,8 @@ class Task2ContractTests(unittest.TestCase):
         (root / "README.md").write_text("# Changed\n", encoding="utf-8")
         second_commit = self.commit_all(root, "changed source")
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_FAIL": "1"},
-            clear=False,
-        ):
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_FAIL="1")
+        with patch.dict(os.environ, environment, clear=False):
             with self.assertRaises(module.EngineeringError):
                 module.rebuild(root, second_commit, sys.executable)
 
@@ -2368,9 +2409,7 @@ class Task2ContractTests(unittest.TestCase):
 class Task3ContractTests(unittest.TestCase):
     def setUp(self):
         Task2ContractTests.setUp(self)
-        # Task 3 exercises the pinned Graphify adapter; Task 2's fake is only
-        # for ordinary context fixtures.
-        self.fake_graphify_environment.stop()
+
     module = Task2ContractTests.module
     init_repo = Task2ContractTests.init_repo
     git = Task2ContractTests.git
@@ -2379,9 +2418,51 @@ class Task3ContractTests(unittest.TestCase):
     write_fake_graphify = Task2ContractTests.write_fake_graphify
     write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
     recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def graphify_environment(self, fake_graphify: Path, **extra: str) -> dict[str, str]:
-        return {"PYTHONPATH": str(fake_graphify), **extra}
+        self.set_fake_graphify_controls(
+            **{
+                name: value
+                for name, value in extra.items()
+                if name.startswith("FAKE_GRAPHIFY_")
+            }
+        )
+        return extra
+
+    def adversarial_graphify_environment(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Return a fixed runtime baseline plus values Graphify must never inherit."""
+        temporary = Path(self.temporary_directory.name) / "graphify-runtime"
+        temporary.mkdir(exist_ok=True)
+        runtime = {
+            "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get(
+                "SYSTEMROOT", os.environ.get("SystemRoot", r"C:\\Windows")
+            ),
+            "WINDIR": os.environ.get("WINDIR", r"C:\\Windows"),
+            "COMSPEC": os.environ.get("COMSPEC", r"C:\\Windows\\System32\\cmd.exe"),
+            "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+            "TEMP": str(temporary),
+            "TMP": str(temporary),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "LC_CTYPE": "C",
+            "TZ": "UTC",
+        }
+        forbidden = {
+            "AWS_ACCESS_KEY_ID": "synthetic-aws-access-key",
+            "AWS_PROFILE": "synthetic-aws-profile",
+            "HTTPS_PROXY": "https://credential:synthetic-password@127.0.0.1:8080",
+            "GIT_ASKPASS": "synthetic-git-askpass",
+            "SSH_AUTH_SOCK": "synthetic-ssh-agent",
+            "AZURE_CLIENT_ID": "synthetic-azure-client",
+            "PYTHONPATH": "synthetic-untrusted-import-path",
+            "UNRELATED_APPLICATION_STATE": "synthetic-unknown-secret",
+            "OPENAI_API_KEY": "synthetic-provider-secret",
+            "GRAPHIFY_OUT": "spoofed-output",
+        }
+        return runtime, forbidden
 
     def governed_repo(self, name: str = "governed") -> Path:
         root = self.init_repo(name)
@@ -2527,6 +2608,7 @@ class Task3ContractTests(unittest.TestCase):
             module._restore_quarantined_checkpoint(root, quarantined),
         )
 
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_FAIL="1")
         with patch.dict(
             os.environ, {**environment, "FAKE_GRAPHIFY_FAIL": "1"}, clear=False
         ):
@@ -2568,11 +2650,10 @@ class Task3ContractTests(unittest.TestCase):
         self.assertEqual(destination, rebuilt)
         self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
 
-    def test_legacy_rebuild_filters_provider_and_connector_credentials_from_graphify(self):
-        """The legacy Graphify child must use the same reduced environment as new rebuilds."""
+    def test_legacy_rebuild_uses_exact_credentialless_graphify_environment(self):
+        """Legacy rebuild passes only the fixed runtime environment to Graphify."""
         module = self.module()
-        root = self.governed_repo("legacy-rebuild-credential-filter")
-        fake = self.write_fake_graphify()
+        root = self.governed_repo("legacy-rebuild-exact-environment")
         commit = self.git(root, "rev-parse", "HEAD")
         captured = []
         original_run = module.run
@@ -2580,28 +2661,120 @@ class Task3ContractTests(unittest.TestCase):
         def capture_graphify_environment(command, *args, **kwargs):
             if command[1:4] == ["-m", "graphify", "update"]:
                 captured.append(dict(kwargs["env"]))
+                output = Path(kwargs["env"]["GRAPHIFY_OUT"])
+                snapshot = Path(command[-1])
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "graph.json").write_text(
+                    json.dumps(
+                        {
+                            "directed": True,
+                            "multigraph": False,
+                            "graph": {},
+                            "nodes": [],
+                            "links": [],
+                            "built_at_commit": module.git(snapshot, "rev-parse", "HEAD"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
             return original_run(command, *args, **kwargs)
 
-        environment = self.graphify_environment(
-            fake,
-            OPENAI_API_KEY="synthetic-openai-secret",
-            ANTHROPIC_API_KEY="synthetic-anthropic-secret",
-            PROVIDER_CREDENTIAL="synthetic-provider-credential",
-            CONNECTOR_ACCESS_TOKEN="synthetic-connector-token",
-        )
+        runtime, forbidden = self.adversarial_graphify_environment()
         with (
-            patch.dict(os.environ, environment, clear=False),
+            patch.dict(os.environ, {**runtime, **forbidden}, clear=True),
+            patch.object(
+                module,
+                "verify_graphify",
+                return_value=module.GraphifyIdentity(
+                    Path(sys.executable),
+                    module.GRAPHIFY_REPOSITORY,
+                    module.GRAPHIFY_VERSION,
+                    module.GRAPHIFY_COMMIT,
+                    module.REQUIRED_GRAPHIFY_COMMANDS,
+                ),
+            ),
             patch.object(module, "run", side_effect=capture_graphify_environment),
         ):
             module.rebuild(root, commit, sys.executable)
 
         self.assertEqual(1, len(captured))
-        for name in (
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "PROVIDER_CREDENTIAL",
-            "CONNECTOR_ACCESS_TOKEN",
+        self.assertEqual(
+            {**runtime, "GRAPHIFY_OUT": captured[0]["GRAPHIFY_OUT"]}, captured[0]
+        )
+        for name in forbidden:
+            if name == "GRAPHIFY_OUT":
+                self.assertNotEqual(forbidden[name], captured[0][name])
+                continue
+            with self.subTest(name=name):
+                self.assertNotIn(name, captured[0])
+
+    def test_current_rebuild_uses_exact_credentialless_graphify_environment(self):
+        """Current cold rebuild passes the same fixed environment to its child."""
+        module = self.module()
+        root = self.governed_repo("current-rebuild-exact-environment")
+        commit = self.git(root, "rev-parse", "HEAD")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            {
+                "root": str(root),
+                "commit": commit,
+                "branch": "main",
+                "kind": "canonical",
+                "manifest_name": "engineering.json",
+                "hook": False,
+                "authority": {"branch": "main", "remote": None},
+            }
+        )
+        module._write_operation(record)
+        captured = []
+        original_run = module.run
+
+        def capture_graphify_environment(command, *args, **kwargs):
+            if command[1:4] == ["-m", "graphify", "update"]:
+                captured.append(dict(kwargs["env"]))
+                output = Path(kwargs["env"]["GRAPHIFY_OUT"])
+                snapshot = Path(command[-1])
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "graph.json").write_text(
+                    json.dumps(
+                        {
+                            "directed": True,
+                            "multigraph": False,
+                            "graph": {},
+                            "nodes": [],
+                            "links": [],
+                            "built_at_commit": module.git(snapshot, "rev-parse", "HEAD"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
+            return original_run(command, *args, **kwargs)
+
+        runtime, forbidden = self.adversarial_graphify_environment()
+        with (
+            patch.dict(os.environ, {**runtime, **forbidden}, clear=True),
+            patch.object(
+                module,
+                "_verify_graphify_adapter_in_process",
+                return_value=({"version": module.GRAPHIFY_VERSION, "code_extensions": []}, object()),
+            ),
+            patch.object(module, "_compatible_ancestor", return_value=None),
+            patch.object(module, "_mutate_maintenance_locked", return_value=None),
+            patch.object(module, "run", side_effect=capture_graphify_environment),
         ):
+            self.assertEqual(0, module._graph_worker_entry(root, operation["operation_id"]))
+
+        self.assertEqual(1, len(captured))
+        self.assertEqual(
+            {**runtime, "GRAPHIFY_OUT": captured[0]["GRAPHIFY_OUT"]}, captured[0]
+        )
+        for name in forbidden:
+            if name == "GRAPHIFY_OUT":
+                self.assertNotEqual(forbidden[name], captured[0][name])
+                continue
             with self.subTest(name=name):
                 self.assertNotIn(name, captured[0])
 
@@ -2883,7 +3056,9 @@ class Task3ContractTests(unittest.TestCase):
         root = self.governed_repo()
         local_main = self.commit_file(root, "src/local.py", "local = True\n")
 
-        result = module.reconcile_canonical(root, refresh_remote=False)
+        result = module.reconcile_canonical(
+            root, refresh_remote=False, graphify_python=sys.executable
+        )
 
         self.assertEqual("not_configured", result["freshness"])
         self.assertEqual(local_main, result["commit"])
@@ -3053,6 +3228,8 @@ class Task3AmendedContractTests(unittest.TestCase):
     add_linked_worktree = Task3ContractTests.add_linked_worktree
     commit_file = Task3ContractTests.commit_file
     cold_checkpoint = Task3ContractTests.cold_checkpoint
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def create_test_reparse(self, link: Path, target: Path, *, directory: bool) -> bool:
         try:
@@ -3335,6 +3512,15 @@ class Task3AmendedContractTests(unittest.TestCase):
     def test_real_pinned_adapter_covers_every_supported_suffix_and_matches_cold(self):
         module = self.module()
         identity, _ = module._verify_graphify_adapter_in_process()
+        # This contract exercises the real adapter surface.  Give the isolated
+        # child fixture the same pinned suffix inventory so its pre-flight
+        # semantic classifier cannot disagree with the inspected adapter.
+        (self.fake_graphify_control.parent / "detect.py").write_text(
+            "CODE_EXTENSIONS = {"
+            + ", ".join(repr(suffix) for suffix in identity["code_extensions"])
+            + "}\n",
+            encoding="utf-8",
+        )
         root = self.governed_repo("all-suffixes")
         suffix_root = root / "suffixes"
         suffix_root.mkdir()
@@ -5012,9 +5198,10 @@ class Task3AmendedContractTests(unittest.TestCase):
         fake = self.write_fake_graphify()
         record = Path(self.temporary_directory.name) / "argv-graphify.jsonl"
         child_audit = Path(self.temporary_directory.name) / "argv-child.jsonl"
-        (fake / "sitecustomize.py").write_text(
-            "import json,os,pathlib,subprocess,sys\n"
-            "sink=pathlib.Path(os.environ['ENGINEERING_ARGV_AUDIT'])\n"
+        (self.fake_graphify_control.parent.parent / "sitecustomize.py").write_text(
+            "import json,pathlib,subprocess,sys\n"
+            "controls=pathlib.Path(__file__).with_name('graphify').joinpath('fixture-controls.json')\n"
+            "sink=pathlib.Path(json.loads(controls.read_text(encoding='utf-8'))['ENGINEERING_ARGV_AUDIT'])\n"
             "def emit(argv):\n"
             "    sink.open('a',encoding='utf-8').write(json.dumps(list(map(str,argv)))+'\\n')\n"
             "emit([sys.executable,*sys.argv])\n"
@@ -5028,8 +5215,7 @@ class Task3AmendedContractTests(unittest.TestCase):
             "subprocess.Popen=popen\n",
             encoding="utf-8",
         )
-        environment = self.graphify_environment(
-            fake,
+        self.set_fake_graphify_controls(
             FAKE_GRAPHIFY_RECORD=str(record),
             ENGINEERING_ARGV_AUDIT=str(child_audit),
         )
@@ -5054,7 +5240,6 @@ class Task3AmendedContractTests(unittest.TestCase):
             patch.object(module.subprocess, "run", side_effect=recording_run),
             patch.object(module, "_start_worker", side_effect=recording_worker),
             patch.object(module, "_start_cleanup", side_effect=recording_cleanup),
-            patch.dict(os.environ, environment, clear=False),
         ):
             module.rebuild(root, sys.executable)
             self.commit_file(root, "src/value.py", "def value():\n    return 2\n")
@@ -5408,6 +5593,36 @@ class Task3AmendedContractTests(unittest.TestCase):
             timeout=2,
         )
 
+    def test_windows_timeout_waits_for_saved_tree_exit_after_taskkill(self):
+        """Taskkill leader exit is not proof until the captured descendants exit."""
+        module = self.module()
+        process = Mock()
+        process.pid = 4242
+        process.poll.side_effect = [None, 0]
+        process.wait.return_value = 0
+        expected_tree = [{"pid": 4242, "start_time": "saved-start"}]
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.subprocess, "run"),
+            patch.object(
+                module,
+                "_saved_process_tree_absent",
+                side_effect=[
+                    (False, "saved_process_alive"),
+                    (True, "saved_process_tree_absent"),
+                ],
+            ) as saved_tree_absent,
+        ):
+            terminated = module._terminate_process_tree(
+                process,
+                expected_tree=expected_tree,
+            )
+
+        self.assertTrue(terminated)
+        self.assertEqual(2, saved_tree_absent.call_count)
+        saved_tree_absent.assert_called_with(expected_tree)
+
     def test_windows_timeout_without_saved_tree_stays_unconfirmed(self):
         module = self.module()
         process = Mock()
@@ -5688,17 +5903,13 @@ class Task5ContractTests(unittest.TestCase):
     write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
     recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     prepared_repo = Task2ContractTests.prepared_repo
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -6021,6 +6232,65 @@ class Task5ContractTests(unittest.TestCase):
                     self.assertRaisesRegex(
                         module.EngineeringError,
                         "feature checkpoint refresh failed",
+                    ),
+                ):
+                    module.complete(root, prepared["run_id"], [])
+
+    def test_complete_fails_closed_for_modified_unrepresented_owner_commitment_paths(self):
+        """Existing README/docs/tests omitted from base evidence still require refresh and intent."""
+        module = self.module()
+        paths = (
+            ("README-owner-commitment.md", "# Initial owner commitment\n"),
+            ("docs/specs/owner-intent.md", "# Initial owner commitment\n"),
+            ("tests/test_owner_intent.py", "def test_initial_commitment():\n    pass\n"),
+        )
+        for index, (relative, initial) in enumerate(paths, start=1):
+            with self.subTest(path=relative):
+                root, _ = self.prepared_repo(f"modified-owner-commitment-{index}")
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(initial, encoding="utf-8")
+                preparation_commit = self.commit_all(root, f"add {relative}")
+                self.write_canonical_checkpoint(root, preparation_commit)
+                module.approve_checks(root)
+                prepared = module.prepare(
+                    root,
+                    "change REQ-1",
+                    {"scope": [relative], "forbidden": ["publish", "deploy"]},
+                )
+                self.assertNotEqual("blocked", prepared["readiness"])
+                base = module._load_checkpoint(root, preparation_commit)
+                self.assertNotIn(relative, module._checkpoint_source_paths(base))
+
+                path.write_text(initial + "Updated owner commitment.\n", encoding="utf-8")
+                head = self.commit_all(root, f"modify {relative}")
+                self.write_canonical_checkpoint(root, head)
+                self.assertTrue(
+                    module._requires_refreshed_intent_checkpoint(
+                        root, preparation_commit, base, [relative]
+                    )
+                )
+                self.assertTrue(
+                    module._completion_intent_impact(
+                        root,
+                        preparation_commit,
+                        head,
+                        False,
+                        [relative],
+                        prepared["authorization"],
+                        prepared["authorization"].get("scope_handoff"),
+                        {"ready": True, "commit": head},
+                    )
+                )
+                with (
+                    patch.object(
+                        module,
+                        "check_merge_readiness",
+                        return_value={"ready": True, "commit": head},
+                    ),
+                    self.assertRaisesRegex(
+                        module.EngineeringError,
+                        "completion detected unbound intent impact from actual artifacts",
                     ),
                 ):
                     module.complete(root, prepared["run_id"], [])
@@ -6921,17 +7191,13 @@ class Task6ContractTests(unittest.TestCase):
     cold_checkpoint = Task3ContractTests.cold_checkpoint
     commit_file = Task3ContractTests.commit_file
     graphify_environment = Task3ContractTests.graphify_environment
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -7522,13 +7788,13 @@ class Task6ContractTests(unittest.TestCase):
     def test_completion_batches_maintenance_once_and_retains_opaque_ids(self):
         module = self.module()
         root, _ = self.prepared_repo("maintenance-completion-producer")
-        # This test exercises maintenance queuing for an already-known
-        # follow-up artifact.  New README/docs/tests commitments must instead
-        # receive an exact result checkpoint (covered by the completion
-        # fail-closed regression above).
-        (root / "docs").mkdir(exist_ok=True)
-        (root / "docs" / "follow-up.md").write_text(
-            "# Follow up\n", encoding="utf-8"
+        # This test exercises maintenance queuing for an already-known,
+        # non-owner-facing follow-up artifact.  README/docs/tests commitments
+        # omitted from the exact checkpoint must instead refresh and bind
+        # owner intent (covered by the completion fail-closed regressions).
+        (root / "notes").mkdir(exist_ok=True)
+        (root / "notes" / "follow-up.txt").write_text(
+            "Follow up\n", encoding="utf-8"
         )
         base = self.commit_all(root, "add known maintenance follow-up")
         self.write_canonical_checkpoint(root, base)
@@ -7536,12 +7802,15 @@ class Task6ContractTests(unittest.TestCase):
         prepared = module.prepare(
             root,
             "change REQ-1",
-            {"scope": ["README.md"], "forbidden": ["publish", "deploy"]},
+            {
+                "scope": ["README.md", "notes/follow-up.txt"],
+                "forbidden": ["publish", "deploy"],
+            },
         )
         self.assertNotEqual("blocked", prepared["readiness"])
         (root / "README.md").write_text("# Updated\n", encoding="utf-8")
-        (root / "docs" / "follow-up.md").write_text(
-            "# Updated follow up\n", encoding="utf-8"
+        (root / "notes" / "follow-up.txt").write_text(
+            "Updated follow up\n", encoding="utf-8"
         )
 
         first = module.complete(root, prepared["run_id"], receipts=[])
@@ -7551,7 +7820,7 @@ class Task6ContractTests(unittest.TestCase):
         ).read_bytes()
         second = module.complete(root, prepared["run_id"], receipts=[])
 
-        self.assertEqual(2, len(first["maintenance"]))
+        self.assertEqual(1, len(first["maintenance"]))
         self.assertTrue(
             all(re.fullmatch(r"maintenance-[0-9a-f]{12}", item) for item in first["maintenance"])
         )
@@ -7799,19 +8068,14 @@ class Task7ContractTests(unittest.TestCase):
     recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     prepared_repo = Task2ContractTests.prepared_repo
     prepared_run = Task5ContractTests.prepared_run
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.home = Path(self.temporary_directory.name) / "home"
         self.home.mkdir()
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.environment = patch.dict(
             os.environ,
             {"ENGINEERING_USER_HOME": str(self.home)},
@@ -8703,8 +8967,13 @@ class Task7ContractTests(unittest.TestCase):
             scripts = root / "scripts"
             scripts.mkdir()
             shutil.copy2(SKILL_DIR / "scripts" / "engineering.cmd", scripts / "engineering.cmd")
-            shutil.copy2(sys.executable, root / "python.exe")
-            runtime_dll = Path(sys.executable).with_name(
+            # The class normally patches sys.executable to the isolated fake
+            # Graphify venv.  A copied venv launcher is invalid without its
+            # sibling pyvenv.cfg, while this launcher-resolution test needs a
+            # standalone base interpreter only.
+            launcher_python = Path(getattr(sys, "_base_executable", sys.executable))
+            shutil.copy2(launcher_python, root / "python.exe")
+            runtime_dll = launcher_python.with_name(
                 f"python{sys.version_info.major}{sys.version_info.minor}.dll"
             )
             if runtime_dll.is_file():

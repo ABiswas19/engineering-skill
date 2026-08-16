@@ -32,7 +32,26 @@ GRAPHIFY_TAG = "v0.9.5"
 GRAPHIFY_VERSION = "0.9.5"
 GRAPHIFY_COMMIT = "d89ec68af95e0cad801b56d88df383991e659823"
 REQUIRED_GRAPHIFY_COMMANDS = ("update", "path", "explain")
+# Graphify receives only the OS/runtime variables it needs to launch the
+# absolute interpreter, locate Git, create its staged output, and preserve
+# deterministic locale behavior.  In particular, HOME/USERPROFILE, proxy,
+# provider, Git, SSH, and Python import settings never cross this boundary.
+GRAPHIFY_ENVIRONMENT_ALLOWLIST = (
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+)
 CLEANUP_TERMINATION_GRACE_SECONDS = 0.25
+PROCESS_TREE_TERMINATION_PROOF_SECONDS = 5.0
 ORPHAN_MINIMUM_AGE_SECONDS = 30.0
 DEFAULT_CONTEXT_TOKEN_BUDGET = 1000
 DEFAULT_INITIAL_CHECKPOINT_RECOVERY_SECONDS = 30.0
@@ -2063,15 +2082,11 @@ def _common_graph_dir(root: Path) -> Path:
 
 
 def _graphify_environment(*, output: Path | None = None) -> dict[str, str]:
-    """Run the code-only Graphify path without forwarding provider credentials."""
+    """Build the minimal, credentialless environment for one Graphify child."""
     environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not re.search(
-            r"(?:api.?key|token|secret|credential|password|openai|anthropic)",
-            key,
-            re.I,
-        )
+        key: os.environ[key]
+        for key in GRAPHIFY_ENVIRONMENT_ALLOWLIST
+        if key in os.environ
     }
     if output is not None:
         environment["GRAPHIFY_OUT"] = str(output)
@@ -3857,6 +3872,19 @@ def _saved_process_tree_absent(tree: object) -> tuple[bool, str]:
     return True, "saved_process_tree_absent"
 
 
+def _wait_saved_process_tree_absent(tree: object, timeout: float) -> bool:
+    """Bound whole-tree proof after a Windows termination request."""
+    deadline = time.monotonic() + timeout
+    while True:
+        proven, _ = _saved_process_tree_absent(tree)
+        if proven:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
 def _terminate_process_tree(
     process: subprocess.Popen,
     pgid: int | None = None,
@@ -3868,7 +3896,9 @@ def _terminate_process_tree(
             if expected_tree is None:
                 setattr(process, "_engineering_tree_proven", False)
                 return False
-            proven = _saved_process_tree_absent(expected_tree)[0]
+            proven = _wait_saved_process_tree_absent(
+                expected_tree, PROCESS_TREE_TERMINATION_PROOF_SECONDS
+            )
             setattr(process, "_engineering_tree_proven", proven)
             return proven
         try:
@@ -3886,7 +3916,9 @@ def _terminate_process_tree(
             process.kill()
             process.wait(timeout=2)
         if expected_tree is not None:
-            proven = _saved_process_tree_absent(expected_tree)[0]
+            proven = _wait_saved_process_tree_absent(
+                expected_tree, PROCESS_TREE_TERMINATION_PROOF_SECONDS
+            )
         else:
             # A leader exit without a saved tree is not whole-tree proof.
             proven = False
@@ -7128,6 +7160,36 @@ def _checkpoint_source_paths(checkpoint: dict) -> set[str]:
     }
 
 
+def _owner_commitment_path(path: str) -> bool:
+    """Return whether an unmapped path can carry owner-facing commitments."""
+    normalized = path.replace("\\", "/")
+    name = PurePosixPath(normalized).name.lower()
+    return (
+        name.startswith("readme")
+        or normalized.startswith("docs/")
+        or normalized.startswith("tests/")
+    )
+
+
+def _unrepresented_owner_commitment_paths(
+    checkpoint: dict, artifact_paths: object
+) -> set[str]:
+    """Return safe repository paths not represented by the exact base graph."""
+    if not isinstance(artifact_paths, (list, tuple, set, frozenset)):
+        return set()
+    known = _checkpoint_source_paths(checkpoint)
+    return {
+        normalized
+        for path in artifact_paths
+        if isinstance(path, str)
+        and path
+        and not Path(path).is_absolute()
+        and ".." not in Path(path).parts
+        and (normalized := path.replace("\\", "/")) not in known
+        and _owner_commitment_path(normalized)
+    }
+
+
 def _path_exists_at_commit(root: Path, commit: str, path: str) -> bool:
     """Check a bounded repository-relative path without interpreting it as an argument."""
     if (
@@ -7162,11 +7224,16 @@ def _requires_refreshed_intent_checkpoint(
     artifact is capability-linked; absence of that exact evidence fails closed.
     """
     known = _checkpoint_source_paths(base)
+    unrepresented_commitments = _unrepresented_owner_commitment_paths(base, changed)
     for path in changed:
         normalized = path.replace("\\", "/")
         if normalized == "docs/engineering-traceability/links.json":
             return True
-        if normalized in known or _path_exists_at_commit(root, preparation_commit, normalized):
+        if normalized in known:
+            continue
+        if normalized in unrepresented_commitments:
+            return True
+        if _path_exists_at_commit(root, preparation_commit, normalized):
             continue
         return True
     return False
@@ -7198,7 +7265,7 @@ def _completion_intent_impact(
         authorization.get("change_class"),
         scope_handoff,
         artifact_paths=changed,
-    )
+    ) or bool(_unrepresented_owner_commitment_paths(base, changed))
     requires_refreshed = _requires_refreshed_intent_checkpoint(
         root, preparation_commit, base, changed
     )
