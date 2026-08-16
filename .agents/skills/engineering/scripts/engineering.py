@@ -350,6 +350,8 @@ def run(
     env: dict[str, str] | None = None,
     timeout: int = 15,
 ) -> str:
+    if env is None and command and Path(command[0]).name.casefold() in {"git", "git.exe"}:
+        env = _controller_git_environment()
     result = subprocess.run(
         command, capture_output=True, text=True, timeout=timeout, env=env
     )
@@ -358,19 +360,26 @@ def run(
     return result.stdout.strip()
 
 
-def git(root: Path, *arguments: str) -> str:
-    environment = os.environ.copy()
-    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-    return run(["git", "-C", str(root), *arguments], env=environment)
-
-
-def _identity_git(root: Path, *arguments: str) -> str:
-    """Run Git for trust decisions without caller-controlled Git state."""
+def _controller_git_environment() -> dict[str, str]:
+    """Return host-native execution state without caller-routed Git state."""
     environment = {
         key: value
         for key, value in os.environ.items()
         if not key.upper().startswith("GIT_")
     }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
+
+
+def git(root: Path, *arguments: str) -> str:
+    return run(
+        ["git", "-C", str(root), *arguments], env=_controller_git_environment()
+    )
+
+
+def _identity_git(root: Path, *arguments: str) -> str:
+    """Run Git for trust decisions without caller-controlled Git state."""
+    environment = _controller_git_environment()
     environment.update(
         {
             "GIT_NO_REPLACE_OBJECTS": "1",
@@ -3143,6 +3152,7 @@ def _compatible_ancestor(
                 ["git", "-C", str(root), "merge-base", "--is-ancestor", candidate, commit],
                 capture_output=True,
                 text=True,
+                env=_controller_git_environment(),
             ).returncode:
                 continue
             distance = int(git(root, "rev-list", "--count", f"{candidate}..{commit}"))
@@ -3171,6 +3181,7 @@ def _changed_files(root: Path, ancestor: str, commit: str) -> list[str]:
             "--",
         ],
         capture_output=True,
+        env=_controller_git_environment(),
     )
     if result.returncode:
         raise EngineeringError(result.stderr.decode(errors="replace").strip())
@@ -3969,6 +3980,11 @@ def _start_cleanup(command: list[str]) -> subprocess.Popen:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=(
+            _controller_git_environment()
+            if command and Path(command[0]).name.casefold() in {"git", "git.exe"}
+            else None
+        ),
     )
 
 
@@ -4606,14 +4622,12 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
     empty_hooks = Path(record["operation_root"]) / "hooks"
     quarantine = None
     quarantine_rollback = None
+    cwd_before = Path.cwd()
+    environment_before = dict(os.environ)
     try:
-        removed_environment = {
-            key: os.environ.pop(key)
-            for key in list(os.environ)
-            if re.search(r"(?:api.?key|token|secret|openai|anthropic)", key, re.I)
-        }
-        environment_before = os.environ.get("GRAPHIFY_OUT")
-        os.environ["GRAPHIFY_OUT"] = str(stage)
+        graphify_environment = _graphify_environment(output=stage)
+        os.environ.clear()
+        os.environ.update(graphify_environment)
         adapter_details, adapter = _verify_graphify_adapter_in_process()
         ancestor = _compatible_ancestor(
             project_root, commit, adapter_details["version"]
@@ -4691,7 +4705,6 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
             shutil.copytree(ancestor[1].parent, stage, dirs_exist_ok=True)
         record["phase"] = "staging_ready"
         _write_operation(record)
-        cwd_before = Path.cwd()
         try:
             os.chdir(worktree)
             if ancestor:
@@ -4711,11 +4724,6 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                 run(list(command), env=_graphify_environment(output=stage), timeout=600)
         finally:
             os.chdir(cwd_before)
-            if environment_before is None:
-                os.environ.pop("GRAPHIFY_OUT", None)
-            else:
-                os.environ["GRAPHIFY_OUT"] = environment_before
-            os.environ.update(removed_environment)
         graph_path = stage / "graph.json"
         if ancestor:
             incremented_graph = _read_base_graph(graph_path)
@@ -4857,6 +4865,10 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
             + "\n",
         )
         return 1
+    finally:
+        os.chdir(cwd_before)
+        os.environ.clear()
+        os.environ.update(environment_before)
 
 
 def _start_worker(command: list[str]) -> subprocess.Popen:
@@ -4866,6 +4878,7 @@ def _start_worker(command: list[str]) -> subprocess.Popen:
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=(os.name != "nt"),
+        env=_graphify_environment(),
     )
 
 
@@ -7161,14 +7174,9 @@ def _checkpoint_source_paths(checkpoint: dict) -> set[str]:
 
 
 def _owner_commitment_path(path: str) -> bool:
-    """Return whether an unmapped path can carry owner-facing commitments."""
+    """Fail closed when a safe changed path lacks an exact owner-neutral proof."""
     normalized = path.replace("\\", "/")
-    name = PurePosixPath(normalized).name.lower()
-    return (
-        name.startswith("readme")
-        or normalized.startswith("docs/")
-        or normalized.startswith("tests/")
-    )
+    return bool(normalized)
 
 
 def _unrepresented_owner_commitment_paths(
@@ -7204,6 +7212,7 @@ def _path_exists_at_commit(root: Path, commit: str, path: str) -> bool:
             ["git", "-C", str(root), "cat-file", "-e", f"{commit}:{path}"],
             capture_output=True,
             text=True,
+            env=_controller_git_environment(),
         ).returncode
         == 0
     )
@@ -7332,6 +7341,7 @@ def _dirty_paths(root: Path) -> list[str]:
         ["git", "-C", str(root), "status", "--porcelain", "-z", "--untracked-files=all"],
         capture_output=True,
         check=True,
+        env=_controller_git_environment(),
     ).stdout.decode("utf-8", errors="strict")
     fields = [field for field in output.split("\0") if field]
     paths: list[str] = []
@@ -7532,6 +7542,7 @@ def _is_ancestor_or_equal(
             ],
             capture_output=True,
             text=True,
+            env=_controller_git_environment(),
         ).returncode
         == 0
     )
@@ -8754,6 +8765,7 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
         ["git", "-C", str(root), *arguments],
         capture_output=True,
         shell=False,
+        env=_controller_git_environment(),
     )
     if result.returncode != 0:
         raise EngineeringError("Engineering could not inspect the Git working state.")
@@ -16753,10 +16765,11 @@ def inventory_legacy_outputs(root: Path) -> list[dict]:
                     "--quiet",
                     "--",
                     "graphify-out",
-                ],
-                capture_output=True,
-                text=True,
-            ).returncode
+            ],
+            capture_output=True,
+            text=True,
+            env=_controller_git_environment(),
+        ).returncode
             == 0
         )
         replacement = check_merge_readiness(worktree) if inside else {"ready": False}
@@ -16809,6 +16822,7 @@ def clean_legacy_output(root: Path, candidate_path: Path) -> bool:
                 ],
                 capture_output=True,
                 text=True,
+                env=_controller_git_environment(),
             ).returncode
             != 0
             or not check_merge_readiness(worktree)["ready"]

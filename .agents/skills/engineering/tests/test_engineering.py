@@ -2507,6 +2507,40 @@ class Task3ContractTests(unittest.TestCase):
             module.common_graph_dir(linked),
         )
 
+    def test_controller_git_and_project_resolution_ignore_hostile_git_routing(self):
+        """Ordinary controller Git calls stay bound to each requested project."""
+        module = self.module()
+        internal = self.init_repo("routing-internal")
+        public = self.init_repo("routing-public")
+        injected = {
+            "GIT_DIR": str(public / ".git"),
+            "GIT_WORK_TREE": str(public),
+            "GIT_COMMON_DIR": str(public / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(public / ".git" / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(public / ".git" / "objects"),
+            "GIT_INDEX_FILE": str(public / ".git" / "hostile.index"),
+            "GIT_PREFIX": str(public),
+            "GIT_CEILING_DIRECTORIES": str(public.parent),
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(public / "hostile.gitconfig"),
+            "GIT_CONFIG_SYSTEM": str(public / "hostile-system.gitconfig"),
+            "GIT_CONFIG_NOSYSTEM": "0",
+            "GIT_REPLACE_REF_BASE": "refs/heads",
+            "GIT_NO_REPLACE_OBJECTS": "0",
+        }
+
+        with patch.dict(os.environ, injected, clear=False):
+            self.assertEqual(
+                internal.resolve(),
+                Path(module.git(internal, "rev-parse", "--show-toplevel")).resolve(),
+            )
+            self.assertEqual(
+                public.resolve(),
+                Path(module.git(public, "rev-parse", "--show-toplevel")).resolve(),
+            )
+            self.assertEqual(internal.resolve(), module.resolve_project_root(str(internal)))
+            self.assertEqual(public.resolve(), module.resolve_project_root(str(public)))
+
     def test_three_worktrees_share_one_common_cache_root(self):
         module = self.module()
         root = self.governed_repo()
@@ -2729,6 +2763,7 @@ class Task3ContractTests(unittest.TestCase):
         )
         module._write_operation(record)
         captured = []
+        adapter_environments = []
         original_run = module.run
 
         def capture_graphify_environment(command, *args, **kwargs):
@@ -2753,13 +2788,17 @@ class Task3ContractTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0)
             return original_run(command, *args, **kwargs)
 
+        def capture_adapter_environment():
+            adapter_environments.append(dict(os.environ))
+            return ({"version": module.GRAPHIFY_VERSION, "code_extensions": []}, object())
+
         runtime, forbidden = self.adversarial_graphify_environment()
         with (
             patch.dict(os.environ, {**runtime, **forbidden}, clear=True),
             patch.object(
                 module,
                 "_verify_graphify_adapter_in_process",
-                return_value=({"version": module.GRAPHIFY_VERSION, "code_extensions": []}, object()),
+                side_effect=capture_adapter_environment,
             ),
             patch.object(module, "_compatible_ancestor", return_value=None),
             patch.object(module, "_mutate_maintenance_locked", return_value=None),
@@ -2771,12 +2810,104 @@ class Task3ContractTests(unittest.TestCase):
         self.assertEqual(
             {**runtime, "GRAPHIFY_OUT": captured[0]["GRAPHIFY_OUT"]}, captured[0]
         )
+        self.assertEqual(
+            {**runtime, "GRAPHIFY_OUT": captured[0]["GRAPHIFY_OUT"]},
+            adapter_environments[0],
+        )
         for name in forbidden:
             if name == "GRAPHIFY_OUT":
                 self.assertNotEqual(forbidden[name], captured[0][name])
                 continue
             with self.subTest(name=name):
                 self.assertNotIn(name, captured[0])
+
+    def test_incremental_outer_worker_uses_exact_environment_before_python_start(self):
+        """The worker cannot resolve Graphify from ambient proxy, Git, or Python paths."""
+        module = self.module()
+        runtime, forbidden = self.adversarial_graphify_environment()
+        captured = []
+
+        def capture_start(command, **kwargs):
+            captured.append((list(command), dict(kwargs.get("env", {}))))
+            return object()
+
+        with (
+            patch.dict(os.environ, {**runtime, **forbidden}, clear=True),
+            patch.object(module.subprocess, "Popen", side_effect=capture_start),
+        ):
+            module._start_worker([sys.executable, "-c", "import graphify"])
+
+        self.assertEqual([[sys.executable, "-c", "import graphify"]], [item[0] for item in captured])
+        self.assertEqual(runtime, captured[0][1])
+        for name in forbidden:
+            with self.subTest(name=name):
+                self.assertNotIn(name, captured[0][1])
+
+    def test_incremental_outer_worker_cannot_import_graphify_from_ambient_pythonpath(self):
+        """The strict worker environment applies before the child resolves Graphify."""
+        module = self.module()
+        runtime, forbidden = self.adversarial_graphify_environment()
+        untrusted = Path(self.temporary_directory.name) / "untrusted-graphify"
+        package = untrusted / "graphify"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "raise RuntimeError('ambient PYTHONPATH graphify loaded')\n",
+            encoding="utf-8",
+        )
+        observed = Path(self.temporary_directory.name) / "resolved-graphify.txt"
+        script = (
+            "import graphify,pathlib,sys;"
+            "pathlib.Path(sys.argv[1]).write_text(graphify.__file__,encoding='utf-8')"
+        )
+
+        with patch.dict(
+            os.environ,
+            {**runtime, **forbidden, "PYTHONPATH": str(untrusted)},
+            clear=True,
+        ):
+            process = module._start_worker([sys.executable, "-c", script, str(observed)])
+            stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        self.assertEqual(0, process.returncode)
+        self.assertTrue(observed.is_file())
+        self.assertNotIn(str(untrusted), observed.read_text(encoding="utf-8"))
+
+    def test_graph_worker_restores_host_environment_after_early_stale_return(self):
+        """The in-process worker cannot leak its reduced environment to its caller."""
+        module = self.module()
+        root = self.governed_repo("graph-worker-environment-restoration")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            {
+                "root": str(root),
+                "commit": self.git(root, "rev-parse", "HEAD"),
+                "branch": "main",
+                "kind": "canonical",
+                "manifest_name": "engineering.json",
+                "hook": True,
+                "authority": {"branch": "main", "remote": None},
+            }
+        )
+        module._write_operation(record)
+        runtime, forbidden = self.adversarial_graphify_environment()
+        host_environment = {**runtime, **forbidden}
+
+        with (
+            patch.dict(os.environ, host_environment, clear=True),
+            patch.object(
+                module,
+                "_verify_graphify_adapter_in_process",
+                return_value=({"version": module.GRAPHIFY_VERSION, "code_extensions": []}, object()),
+            ),
+            patch.object(module, "_compatible_ancestor", return_value=None),
+            patch.object(module, "_semantic_changes", return_value=[]),
+            patch.object(module, "_queue_graph_worker_stale", return_value=None),
+        ):
+            self.assertEqual(0, module._graph_worker_entry(root, operation["operation_id"]))
+            self.assertEqual(host_environment, dict(os.environ))
 
     def test_recover_checkpoint_returns_machine_recovery_envelope(self):
         module = self.module()
@@ -2906,12 +3037,9 @@ class Task3ContractTests(unittest.TestCase):
         fake, environment = self.cold_checkpoint(root)
         record = Path(self.temporary_directory.name) / "incremental.jsonl"
         self.commit_file(root, "src/example.py", "changed = True\n")
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_RECORD=str(record))
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_RECORD": str(record)},
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.rebuild(root, sys.executable)
 
         self.assertEqual("changed_path_adapter", result["mode"])
@@ -2954,12 +3082,9 @@ class Task3ContractTests(unittest.TestCase):
         self.assertEqual("full", baseline["mode"])
         prior = module._checkpoint_path(root, self.git(root, "rev-parse", "HEAD"))
         self.commit_file(root, "src/example.py", "changed = True\n")
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_SLOW="120")
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_SLOW": "120"},
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.rebuild(
                 root,
                 sys.executable,
@@ -3405,12 +3530,9 @@ class Task3AmendedContractTests(unittest.TestCase):
         (root / "src" / "delete.py").unlink()
         self.git(root, "mv", "src/rename.py", "src/renamed.py")
         target = self.commit_all(root, "a m d r")
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_RECORD=str(record))
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_RECORD": str(record)},
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.rebuild(root, sys.executable, target_commit=target)
 
         self.assertTrue(record.is_file(), result)
@@ -5744,16 +5866,12 @@ class Task3AmendedContractTests(unittest.TestCase):
         self.commit_file(root, "src/value.py", "def value():\n    return 2\n")
         child_pid_path = Path(self.temporary_directory.name) / "descendant.pid"
         before = self.git(root, "worktree", "list", "--porcelain")
+        self.set_fake_graphify_controls(
+            FAKE_GRAPHIFY_SLOW="120",
+            FAKE_GRAPHIFY_CHILD_PID=str(child_pid_path),
+        )
 
-        with patch.dict(
-            os.environ,
-            {
-                **environment,
-                "FAKE_GRAPHIFY_SLOW": "120",
-                "FAKE_GRAPHIFY_CHILD_PID": str(child_pid_path),
-            },
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.dispatch_hook(
                 root,
                 "post-commit",
@@ -6294,6 +6412,51 @@ class Task5ContractTests(unittest.TestCase):
                     ),
                 ):
                     module.complete(root, prepared["run_id"], [])
+
+    def test_existing_unrepresented_governance_and_unknown_paths_require_refresh(self):
+        """Existing policy, release, automation, and unknown paths cannot bypass intent refresh."""
+        module = self.module()
+        paths = (
+            "SECURITY.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "CONTRIBUTING.md",
+            ".github/workflows/security.yml",
+            "release/public-export.json",
+            "unclassified/material-owner-impact.txt",
+        )
+        for index, relative in enumerate(paths, start=1):
+            with self.subTest(path=relative):
+                root, _ = self.prepared_repo(f"unrepresented-governance-{index}")
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("initial governed artifact\n", encoding="utf-8")
+                preparation_commit = self.commit_all(root, f"add {relative}")
+                self.write_canonical_checkpoint(root, preparation_commit)
+                base = module._load_checkpoint(root, preparation_commit)
+                self.assertNotIn(relative, module._checkpoint_source_paths(base))
+
+                path.write_text("changed governed artifact\n", encoding="utf-8")
+                head = self.commit_all(root, f"modify {relative}")
+
+                self.assertTrue(
+                    module._requires_refreshed_intent_checkpoint(
+                        root, preparation_commit, base, [relative]
+                    )
+                )
+                with self.assertRaisesRegex(
+                    module.EngineeringError, "feature checkpoint refresh failed"
+                ):
+                    module._completion_intent_impact(
+                        root,
+                        preparation_commit,
+                        head,
+                        False,
+                        [relative],
+                        {},
+                        None,
+                        {"ready": False, "commit": head},
+                    )
 
     def test_complete_detects_capability_impact_across_authorized_rename(self):
         """Both rename endpoints are assessed before an approved scope can complete."""
@@ -7789,13 +7952,24 @@ class Task6ContractTests(unittest.TestCase):
         module = self.module()
         root, _ = self.prepared_repo("maintenance-completion-producer")
         # This test exercises maintenance queuing for an already-known,
-        # non-owner-facing follow-up artifact.  README/docs/tests commitments
-        # omitted from the exact checkpoint must instead refresh and bind
-        # owner intent (covered by the completion fail-closed regressions).
+        # non-owner-facing follow-up artifact.  It deliberately avoids README,
+        # docs, tests, and every unrepresented path: those must refresh and
+        # bind owner intent under the completion fail-closed regressions.
         (root / "notes").mkdir(exist_ok=True)
         (root / "notes" / "follow-up.txt").write_text(
             "Follow up\n", encoding="utf-8"
         )
+        links_path = root / "docs" / "engineering-traceability" / "links.json"
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].append(
+            {
+                "id": "NOTE-FOLLOW-UP",
+                "type": "code_symbol",
+                "title": "Follow-up maintenance note",
+                "source": {"path": "notes/follow-up.txt", "line": 1},
+            }
+        )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
         base = self.commit_all(root, "add known maintenance follow-up")
         self.write_canonical_checkpoint(root, base)
         module.approve_checks(root)
@@ -7803,14 +7977,49 @@ class Task6ContractTests(unittest.TestCase):
             root,
             "change REQ-1",
             {
-                "scope": ["README.md", "notes/follow-up.txt"],
+                "scope": ["notes/follow-up.txt"],
                 "forbidden": ["publish", "deploy"],
             },
         )
         self.assertNotEqual("blocked", prepared["readiness"])
-        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
         (root / "notes" / "follow-up.txt").write_text(
             "Updated follow up\n", encoding="utf-8"
+        )
+
+        changed, _ = module._stable_completion_snapshot(
+            root, prepared["project"]["commit"]
+        )
+        self.assertEqual(["notes/follow-up.txt"], changed)
+        base_checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
+        self.assertIn("notes/follow-up.txt", module._checkpoint_source_paths(base_checkpoint))
+        self.assertFalse(
+            module._unrepresented_owner_commitment_paths(base_checkpoint, changed)
+        )
+        self.assertFalse(
+            module._requires_refreshed_intent_checkpoint(
+                root, prepared["project"]["commit"], base_checkpoint, changed
+            )
+        )
+        self.assertFalse(
+            module._intent_impacting(
+                base_checkpoint,
+                [],
+                prepared["authorization"].get("change_class"),
+                prepared["authorization"].get("scope_handoff"),
+                artifact_paths=changed,
+            )
+        )
+        self.assertFalse(
+            module._completion_intent_impact(
+                root,
+                prepared["project"]["commit"],
+                module.git(root, "rev-parse", "HEAD"),
+                True,
+                changed,
+                prepared["authorization"],
+                prepared["authorization"].get("scope_handoff"),
+                module.check_merge_readiness(root),
+            )
         )
 
         first = module.complete(root, prepared["run_id"], receipts=[])
