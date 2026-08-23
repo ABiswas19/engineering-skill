@@ -16330,7 +16330,9 @@ def _replace_install_path(
     *,
     preimage_path: Path | None = None,
 ) -> None:
-    if expected_pre_state is not None:
+    def verify_pre_state() -> None:
+        if expected_pre_state is None:
+            return
         inspected = preimage_path if preimage_path is not None else target
         exists = os.path.lexists(inspected)
         if exists:
@@ -16366,7 +16368,19 @@ def _replace_install_path(
             raise EngineeringError(
                 f"Engineering target changed before publication: {inspected}"
             )
-    os.replace(source, target)
+
+    # Antivirus and indexers can briefly retain Windows directory handles. Keep
+    # retries bounded and compare-and-swap safe rather than weakening atomicity.
+    retry_delays = (0.05, 0.1, 0.2, 0.4, 0.8) if os.name == "nt" else ()
+    for delay in (*retry_delays, None):
+        verify_pre_state()
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as error:
+            if delay is None or getattr(error, "winerror", None) not in {5, 32, 33}:
+                raise
+            time.sleep(delay)
 
 
 def _transactional_replace(
@@ -16409,7 +16423,11 @@ def _transactional_replace(
                 backed_up.append(target)
                 _replace_install_path(stage, target, absent)
             else:
-                _replace_install_path(stage, target, expected)
+                _replace_install_path(
+                    stage,
+                    target,
+                    expected if expected is not None else absent,
+                )
             published.append(target)
         if after_publication is not None:
             after_publication()

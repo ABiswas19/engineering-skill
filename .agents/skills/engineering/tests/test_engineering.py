@@ -2,6 +2,7 @@ import importlib.util
 import ast
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -79,6 +80,13 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
             identity = engineering._interpreter_identity(Path(temporary).resolve(), alias)
 
         self.assertEqual(str(Path(sys.executable).resolve()), identity["path"])
+
+    def test_fake_graphify_fixture_uses_a_copied_interpreter(self):
+        """The Linux fixture must survive canonical interpreter resolution."""
+        source = inspect.getsource(
+            Task2ContractTests.start_fake_graphify_interpreter
+        )
+        self.assertIn('"--copies"', source)
 
     @unittest.skipUnless(os.name == "nt", "Windows ACL transport only")
     def test_windows_owner_private_directory_is_idempotent_for_task_approval(self):
@@ -598,12 +606,23 @@ class Task2ContractTests(unittest.TestCase):
         fake_graphify = self.write_fake_graphify()
         environment = Path(self.temporary_directory.name) / "fake-graphify-venv"
         subprocess.run(
-            [str(host_python), "-m", "venv", "--without-pip", str(environment)],
+            [
+                str(host_python),
+                "-m",
+                "venv",
+                "--copies",
+                "--without-pip",
+                str(environment),
+            ],
             check=True,
             capture_output=True,
             text=True,
         )
         interpreter = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        self.assertFalse(
+            interpreter.is_symlink(),
+            "The Graphify fixture interpreter must survive canonical path resolution.",
+        )
         site_packages = Path(
             subprocess.run(
                 [str(interpreter), "-c", "import site; print(site.getsitepackages()[0])"],
@@ -9680,6 +9699,83 @@ class Task7ContractTests(unittest.TestCase):
             {key: module._tree_digest(paths[key]) for key in ("canonical", "claude", "shim")},
         )
         self.assertEqual(receipt_before, paths["receipt"].read_bytes())
+
+    def test_windows_atomic_publish_retries_transient_access_denied(self):
+        """A short Windows sharing race cannot invalidate an exact install."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "atomic-source"
+        target = Path(self.temporary_directory.name) / "atomic-target"
+        source.mkdir()
+        (source / "payload.txt").write_text("exact\n", encoding="utf-8")
+        real_replace = module.os.replace
+        attempts = []
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+
+        def transient_once(observed_source, observed_target):
+            attempts.append((Path(observed_source), Path(observed_target)))
+            if len(attempts) == 1:
+                raise denied
+            return real_replace(observed_source, observed_target)
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=transient_once),
+            patch.object(module.time, "sleep") as sleep,
+        ):
+            module._replace_install_path(
+                source,
+                target,
+                {
+                    "exists": False,
+                    "kind": "absent",
+                    "bytes_hex": None,
+                    "sha256": None,
+                    "mode": None,
+                },
+            )
+
+        self.assertEqual(2, len(attempts))
+        sleep.assert_called_once()
+        self.assertEqual("exact\n", (target / "payload.txt").read_text(encoding="utf-8"))
+
+    def test_windows_atomic_publish_retry_revalidates_the_preimage(self):
+        """A changed target during retry remains a hard publication failure."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "retry-source"
+        target = Path(self.temporary_directory.name) / "retry-target"
+        source.mkdir()
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+        attempts = 0
+
+        def substitute_target(observed_source, observed_target):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                Path(observed_target).mkdir()
+                raise denied
+            self.fail("changed publication target must be rejected before retry")
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=substitute_target),
+            patch.object(module.time, "sleep"),
+            self.assertRaisesRegex(module.EngineeringError, "target changed"),
+        ):
+            module._replace_install_path(
+                source,
+                target,
+                {
+                    "exists": False,
+                    "kind": "absent",
+                    "bytes_hex": None,
+                    "sha256": None,
+                    "mode": None,
+                },
+            )
+
+        self.assertEqual(1, attempts)
 
     def test_every_late_install_publication_failure_restores_exact_state(self):
         module = self.module()
