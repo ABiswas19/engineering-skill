@@ -477,9 +477,10 @@ class RepositoryContractTests(unittest.TestCase):
                 text = content.decode("utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
+            normalized = text.replace("\r\n", "\n").replace("\r", "\n")
             self.assertFalse(content.startswith(b"\xef\xbb\xbf"), relative)
-            self.assertTrue(text.endswith("\n"), relative)
-            self.assertFalse(text.endswith("\n\n"), relative)
+            self.assertTrue(normalized.endswith("\n"), relative)
+            self.assertFalse(normalized.endswith("\n\n"), relative)
             self.assertFalse(
                 any(line.endswith((" ", "\t")) for line in text.splitlines()), relative
             )
