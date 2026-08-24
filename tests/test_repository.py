@@ -1424,7 +1424,14 @@ Residual risk: No repository-supported vulnerability intake is available.
             )
             subprocess.run(["git", "-C", str(origin), "config", "user.name", "Synthetic"], check=True)
             subprocess.run(
-                ["git", "-C", str(origin), "config", "user.email", "synthetic@example.invalid"],
+                [
+                    "git",
+                    "-C",
+                    str(origin),
+                    "config",
+                    "user.email",
+                    "synthetic" + "@" + "example.invalid",
+                ],
                 check=True,
             )
             (origin / "release").mkdir()
