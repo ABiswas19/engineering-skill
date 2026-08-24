@@ -99,6 +99,10 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _bytes_digest(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
 def _source_commit(root: Path) -> str:
     result = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -110,6 +114,36 @@ def _source_commit(root: Path) -> str:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ExportError("source commit is invalid")
     return commit
+
+
+def _source_tree(root: Path, commit: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{commit}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tree = result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        raise ExportError("source tree is invalid")
+    return tree
+
+
+def _git_blob_bytes(root: Path, commit: str, relative: str) -> bytes:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", commit)
+        or not relative
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+    ):
+        raise ExportError("source Git object identity is invalid")
+    result = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "blob", f"{commit}:{relative}"],
+        capture_output=True,
+    )
+    if result.returncode:
+        raise ExportError("source Git object is unavailable")
+    return result.stdout
 
 
 def _assert_clean_head_snapshot(root: Path, files: list[str]) -> None:
@@ -162,7 +196,20 @@ def _tree_digest(root: Path, files: list[str]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _validate_audience_classification(source: Path, shared_files: list[str]) -> set[str]:
+def _git_tree_digest(root: Path, commit: str, files: list[str]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(files):
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(_git_blob_bytes(root, commit, relative) + b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
+def _validate_audience_classification(
+    source: Path,
+    shared_files: list[str],
+    *,
+    destination: Path,
+) -> set[str]:
     path = source / "release" / "audience-classification.json"
     if not path.exists():
         return set()
@@ -218,6 +265,10 @@ def _validate_audience_classification(source: Path, shared_files: list[str]) -> 
     for relative in public:
         if os.path.lexists(source / relative):
             raise ExportError("public-only file is present in the canonical source")
+        try:
+            _safe_file(destination, relative)
+        except ExportError as error:
+            raise ExportError("public-only destination file is unavailable") from error
     return audience_specific
 
 
@@ -334,7 +385,10 @@ def export_tree(
     files = manifest["files"]
     _assert_clean_head_snapshot(source, files)
     source_commit = _source_commit(source)
-    audience_specific = _validate_audience_classification(source, files)
+    source_git_tree = _source_tree(source, source_commit)
+    audience_specific = _validate_audience_classification(
+        source, files, destination=destination
+    )
     policy, policy_blockers = _audience_policy(
         source, destination, files, metadata
     )
@@ -342,7 +396,11 @@ def export_tree(
         destination, audience_specific, policy
     )
     sources = {relative: _safe_file(source, relative) for relative in files}
-    source_tree_digest = _tree_digest(source, files)
+    source_blobs = {
+        relative: _git_blob_bytes(source, source_commit, relative)
+        for relative in files
+    }
+    source_tree_digest = _git_tree_digest(source, source_commit, files)
     source_snapshot_digest = _snapshot_digest(source_commit, source_tree_digest)
     receipt_path = _safe_destination(
         destination_common, "engineering-public-export.json"
@@ -356,6 +414,7 @@ def export_tree(
             in {
                 "engineering.public-export-receipt.v2",
                 "engineering.public-export-receipt.v3",
+                "engineering.public-export-receipt.v4",
             }
             and isinstance(retained.get("files"), dict)
         ):
@@ -378,17 +437,25 @@ def export_tree(
         target = _safe_destination(destination, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
         target = _safe_destination(destination, relative)
-        shutil.copy2(source_path, target)
+        target.write_bytes(source_blobs[relative])
+        shutil.copymode(source_path, target)
     destination_tree_digest = _tree_digest(destination, files)
     if destination_tree_digest != source_tree_digest:
         raise ExportError("same-snapshot byte parity failed")
     receipt = {
-        "schema": "engineering.public-export-receipt.v3",
+        "schema": "engineering.public-export-receipt.v4",
         "files": {relative: _file_digest(destination / relative) for relative in files},
         "source_commit": source_commit,
+        "source_git_tree": source_git_tree,
         "tree_digest": destination_tree_digest,
         "source_snapshot_digest": source_snapshot_digest,
-        "manifest_digest": _file_digest(manifest_path),
+        "manifest_digest": _bytes_digest(
+            _git_blob_bytes(
+                source,
+                source_commit,
+                "release/public-export.json",
+            )
+        ),
         "audience_specific_files": audience_specific_files,
         "metadata_snapshot_digests": {
             audience: "sha256:"
@@ -409,6 +476,7 @@ def export_tree(
         "schema": "engineering.public-export-result.v1",
         "tree_digest": destination_tree_digest,
         "source_commit": source_commit,
+        "source_git_tree": source_git_tree,
         "source_snapshot_digest": source_snapshot_digest,
         "file_count": len(files),
         "publication_ready": not blockers,

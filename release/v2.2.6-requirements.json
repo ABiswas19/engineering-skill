@@ -1,0 +1,185 @@
+{
+  "schema": "engineering.v2.2.6-owner-requirements.v1",
+  "requirements": [
+    {
+      "id": "deterministic_release_matrix",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Generated matrix and evidence gates"},
+      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "generate_matrix"},
+      "runtime_behavior": "Generate complete exact-artifact rows and fail closed for omission, Unknown, or insufficient proxy evidence.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_release_matrix_is_exact_complete_and_fail_closed"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "exact_release_install_binding",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Exact release and installation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "install_bundle"},
+      "runtime_behavior": "Bind token, authorization, copied source, commit, tree, digest, receipt, install, and rollback to one exact artifact.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_actual_install_receipt_reconciles_the_signed_source_bundle"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "external_owner_authority",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "External owner authority"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_active_owner_intent"},
+      "runtime_behavior": "Resolve owner authority only from authenticated host-owned state; Engineering cannot mint approval.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_owner_intent_requires_external_host_signature"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "git_object_byte_identity",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Exact release and installation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_git_blob_bytes"},
+      "runtime_behavior": "Derive bundle and export identity and copied bytes from exact Git objects across checkout EOL settings.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_bundle_identity_and_install_bytes_are_stable_across_checkout_eol"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "host_private_postactivation_trust",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Non-circular bootstrap and host trust"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_host_v226_bootstrap_authorization"},
+      "runtime_behavior": "Keep post-activation trust and intent state at a host-owned private boundary outside candidate Git and preserve restart state.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_bound_owner_intent_stays_in_private_controller_state"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "hostile_git_environment",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Isolation and paired distribution"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_controller_git_environment"},
+      "runtime_behavior": "Ignore ambient GIT routing substitution while preserving the intended repository identity.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_controller_git_and_project_resolution_ignore_hostile_git_routing"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "independent_equivalence",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Predecessor and survival completeness"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_outcome_survival_v2"},
+      "runtime_behavior": "Require an external owner exception or distinct independent equivalence evidence for non-included outcomes.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_replacement_requires_an_independent_equivalence_reviewer"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "independent_exact_artifact_acceptance",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Typed evidence and independent acceptance"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_verify_independent_outcome_audit"},
+      "runtime_behavior": "Require an auditor distinct from architect, implementer, and writer and bind acceptance to exact artifact identity.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_independent_audit_binds_role_assignments_and_outcome_states"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "intent_digest_continuity",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Refreshed intent impact and continuity"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "complete"},
+      "runtime_behavior": "Carry the exact owner-intent digest through execution, handoffs, completion, and compaction and reject tampering.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_execution_context_carries_owner_intent_digest_and_rejects_tampering"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "model_routing_disclosure",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Native outcome and routing proof"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_delivery_evaluation_path"},
+      "runtime_behavior": "Retain typed model, reasoning, owner override, execution target, and scope with provider-neutral Unknown handling.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_delivery_evaluation_requires_typed_provider_neutral_routing_disclosure"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "unit"}
+    },
+    {
+      "id": "native_harness_real_outcome_gate",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Native outcome and routing proof"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_evidence_satisfies_requirements"},
+      "runtime_behavior": "Require proven Codex and Claude native end-to-end execution rather than hooks, MCP, unit, or proxy inference.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_unit_evidence_cannot_satisfy_real_native_harness_requirement"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome"}
+    },
+    {
+      "id": "noncircular_bootstrap",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Non-circular bootstrap and host trust"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "v226_bootstrap_handoff_status"},
+      "runtime_behavior": "Authorize the first v2.2.6 delivery from v2.2.5, recorded owner approval, and two exact audits without calling the future gate.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_v226_bootstrap_acceptance_does_not_call_postactivation_trust"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "outcome_survival_baseline",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Predecessor and survival completeness"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_outcome_survival_v2"},
+      "runtime_behavior": "Inject the controller outcome baseline and reject missing mappings, candidate self-exclusion, or unauthorized deferral.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_outcome_survival_lists_each_missing_baseline_mapping"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "postactivation_all_outcomes_binding",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Post-activation all-outcome binding"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "dependent_dispatch_status"},
+      "runtime_behavior": "Block every downstream product or accepted-owner-outcome lane until all recorded categories are imported and completeness-bound after activation.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_postactivation_import_is_required_before_v061_or_frontend_dispatch"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome"}
+    },
+    {
+      "id": "predecessor_disposition",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Predecessor and survival completeness"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_active_owner_intent"},
+      "runtime_behavior": "Reject a successor binding unless every active predecessor outcome has explicit carry-forward or disposition semantics.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_owner_intent_successor_requires_explicit_complete_predecessor_dispositions"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "public_sanitized_parity",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Isolation and paired distribution"},
+      "contract": {"path": "tools/export_public.py", "symbol": "export_tree"},
+      "runtime_behavior": "Preserve exact shared-byte parity and require declared audience-specific and public-only destination artifacts.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_public_export_requires_every_declared_public_only_destination_file"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "refreshed_intent_impact",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Refreshed intent impact and continuity"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_intent_impacting"},
+      "runtime_behavior": "Use base plus refreshed/current exact checkpoints and fail closed for new or unrepresented material paths.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_existing_unrepresented_governance_and_unknown_paths_require_refresh"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "transactional_install_preimages",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Exact release and installation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_replace_install_path"},
+      "runtime_behavior": "Revalidate exact or absent source and target preimages at every bounded Windows retry in install and rollback paths.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_existing_install_backup_retry_rejects_source_substitution"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration"}
+    },
+    {
+      "id": "typed_evidence_hierarchy",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Typed evidence and independent acceptance"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_evidence_satisfies_requirements"},
+      "runtime_behavior": "Prevent lower evidence classes from satisfying higher owner-required evidence classes or environments.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_unit_evidence_cannot_satisfy_real_native_harness_requirement"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "unit"}
+    },
+    {
+      "id": "v060_incident_regression",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "v0.6.0 incident regression"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "release_gate"},
+      "runtime_behavior": "Reject a policy-kernel/unit-only candidate that excludes required executable native graph and autonomous no-steering outcomes.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_v060_proxy_only_self_exclusion_cannot_receive_release_token"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "end_to_end"}
+    }
+  ]
+}

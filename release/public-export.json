@@ -27,11 +27,14 @@
     "docs/specs/engineering-v2.2.6-final-audit-repair.md",
     "docs/specs/engineering-v2.2.6-owner-intent-audit-repair.md",
     "docs/specs/engineering-v2.2.6-owner-intent.md",
+    "docs/specs/engineering-v2.2.6-release-traceability.md",
     "release/public-export.json",
+    "release/v2.2.6-requirements.json",
     "tests/__init__.py",
     "tests/test_repository.py",
     "tools/check_audience.py",
     "tools/check_sensitive.py",
-    "tools/export_public.py"
+    "tools/export_public.py",
+    "tools/v226_release_matrix.py"
   ]
 }

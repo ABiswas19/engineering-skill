@@ -8444,6 +8444,8 @@ class Task7ContractTests(unittest.TestCase):
             expected_pre_state=None,
             *,
             preimage_path=None,
+            expected_source_state=None,
+            expected_target_state=None,
         ):
             nonlocal failed
             if not failed and Path(destination).resolve() == Path(target).resolve():
@@ -8454,6 +8456,8 @@ class Task7ContractTests(unittest.TestCase):
                 destination,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         return replace
@@ -8963,7 +8967,18 @@ class Task7ContractTests(unittest.TestCase):
         canonical = self.home / ".agents" / "skills" / "engineering" / "SKILL.md"
         claude = self.home / ".claude" / "skills" / "engineering" / "SKILL.md"
         shim = self.home / ".agents" / "skills" / "engineering-traceability" / "SKILL.md"
-        self.assertEqual(SKILL.read_bytes(), canonical.read_bytes())
+        expected_skill = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source.parents[2]),
+                "show",
+                "HEAD:.agents/skills/engineering/SKILL.md",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(expected_skill, canonical.read_bytes())
         self.assertIn("engineering.py", (canonical.parent / "scripts" / "engineering.cmd").read_text(encoding="utf-8"))
         self.assertIn("engineering.py", (canonical.parent / "scripts" / "engineering").read_text(encoding="utf-8"))
         self.assertIn("~/.agents/skills/engineering/SKILL.md", claude.read_text(encoding="utf-8"))
@@ -8984,11 +8999,63 @@ class Task7ContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn(str(source), receipt_text)
 
+    def test_bundle_identity_and_install_bytes_are_stable_across_checkout_eol(self):
+        """One Git artifact has one bundle identity on LF and CRLF hosts."""
+        module = self.module()
+        origin_source = self.bundle_repo("bundle-object-eol")
+        origin = origin_source.parents[2]
+        lf_root = Path(self.temporary_directory.name) / "bundle-object-eol-lf"
+        crlf_root = Path(self.temporary_directory.name) / "bundle-object-eol-crlf"
+        subprocess.run(
+            ["git", "-c", "core.autocrlf=false", "clone", str(origin), str(lf_root)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "core.autocrlf=true", "clone", str(origin), str(crlf_root)],
+            check=True,
+            capture_output=True,
+        )
+        lf_source = lf_root / ".agents" / "skills" / "engineering"
+        crlf_source = crlf_root / ".agents" / "skills" / "engineering"
+        self.assertNotEqual(
+            (lf_source / "SKILL.md").read_bytes(),
+            (crlf_source / "SKILL.md").read_bytes(),
+            "fixture must exercise distinct checkout bytes",
+        )
+
+        _, _, lf_commit, lf_digest = module._bundle_files(lf_source)
+        _, _, crlf_commit, crlf_digest = module._bundle_files(crlf_source)
+        self.assertEqual(lf_commit, crlf_commit)
+        self.assertEqual(lf_digest, crlf_digest)
+        expected_tree = self.git(origin, "rev-parse", f"{lf_commit}^{{tree}}")
+        lf_receipt = module.install_bundle(lf_source, self.home)
+        installed_skill = self.home / ".agents" / "skills" / "engineering" / "SKILL.md"
+        committed_skill = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(origin),
+                "show",
+                f"{lf_commit}:.agents/skills/engineering/SKILL.md",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(committed_skill, installed_skill.read_bytes())
+        self.assertEqual(expected_tree, lf_receipt["source_git_tree"])
+        retained = module._load_install_receipt(
+            self.home / ".agents" / "engineering" / "install-receipt.json",
+            module._install_key(self.home),
+        )
+        self.assertEqual(expected_tree, retained["source_git_tree"])
+
     def test_install_release_gate_preflight_requires_exact_token_pair(self):
         """Installation may consume a verified token but never self-authorizes it."""
         module = self.module()
         source = self.bundle_repo("install-release-gate", version="2.2.6")
         _, source_manifest, source_commit, source_digest = module._bundle_files(source)
+        source_tree = module._bundle_git_tree(source, source_commit)
         with self.assertRaisesRegex(module.EngineeringError, "requires an exact release token"):
             module.install_bundle(source, self.home)
         self.assertFalse((self.home / ".agents" / "skills" / "engineering").exists())
@@ -9011,6 +9078,7 @@ class Task7ContractTests(unittest.TestCase):
                 "native_approval_required": True,
                 "source_bundle": {
                     "source_git_commit": source_commit,
+                    "source_git_tree": source_tree,
                     "source_digest": source_digest,
                     "skill_version": source_manifest["version"],
                 },
@@ -9045,6 +9113,7 @@ class Task7ContractTests(unittest.TestCase):
         self.git(source_b_root, "add", ".")
         self.git(source_b_root, "commit", "-m", "different bundle")
         _, manifest_a, commit_a, digest_a = module._bundle_files(source_a)
+        tree_a = module._bundle_git_tree(source_a, commit_a)
 
         with patch.object(
             module,
@@ -9058,6 +9127,7 @@ class Task7ContractTests(unittest.TestCase):
                 "native_approval_required": True,
                 "source_bundle": {
                     "source_git_commit": commit_a,
+                    "source_git_tree": tree_a,
                     "source_digest": digest_a,
                     "skill_version": manifest_a["version"],
                 },
@@ -9081,6 +9151,7 @@ class Task7ContractTests(unittest.TestCase):
         module = self.module()
         source = self.bundle_repo("install-receipt-source-facts", version="2.2.6")
         _, manifest, commit, source_digest = module._bundle_files(source)
+        source_tree = module._bundle_git_tree(source, commit)
         authorization = {
             "schema": "engineering.install-release-authorization.v1",
             "token_id": "release-token-" + "1" * 32,
@@ -9089,6 +9160,7 @@ class Task7ContractTests(unittest.TestCase):
             "acceptance_id": "acceptance-a",
             "source_bundle": {
                 "source_git_commit": commit,
+                "source_git_tree": source_tree,
                 "source_digest": source_digest,
                 "skill_version": manifest["version"],
             },
@@ -9117,7 +9189,7 @@ class Task7ContractTests(unittest.TestCase):
                 release_artifact_digest=authorization["artifact_digest"],
             )
 
-        self.assertEqual("engineering.install.v2", receipt["schema"])
+        self.assertEqual("engineering.install.v5", receipt["schema"])
         self.assertEqual(authorization, receipt.get("release_authorization"))
         self.assertEqual(source_digest, receipt["source_digest"])
         persisted = {key: value for key, value in receipt.items() if key != "release_gate"}
@@ -9333,6 +9405,7 @@ class Task7ContractTests(unittest.TestCase):
         module = self.module()
         source = self.bundle_repo("active-home-path")
         first_bundle = module._bundle_files(source)
+        first_tree = module._bundle_git_tree(source, first_bundle[2])
         baseline = r"C:\\baseline"
         registry_state = {"path": baseline}
         registry = Mock()
@@ -9355,6 +9428,7 @@ class Task7ContractTests(unittest.TestCase):
             patch.dict(sys.modules, {"winreg": registry}),
             patch.dict(os.environ, {"PATH": baseline}, clear=False),
             patch.object(module, "_bundle_files", return_value=first_bundle),
+            patch.object(module, "_bundle_git_tree", return_value=first_tree),
         ):
             module.install_bundle(source, self.home)
             self.assertNotEqual(baseline, registry_state["path"])
@@ -9374,12 +9448,14 @@ class Task7ContractTests(unittest.TestCase):
 
         self.update_bundle(source, "2.1.1")
         updated_bundle = module._bundle_files(source)
+        updated_tree = module._bundle_git_tree(source, updated_bundle[2])
         with (
             patch.object(module.os, "name", "nt"),
             patch.object(Path, "home", return_value=self.home),
             patch.dict(sys.modules, {"winreg": registry}),
             patch.dict(os.environ, {"PATH": baseline}, clear=False),
             patch.object(module, "_bundle_files", return_value=updated_bundle),
+            patch.object(module, "_bundle_git_tree", return_value=updated_tree),
         ):
             registry_state["path"] = baseline
             registry.reset_mock()
@@ -9776,6 +9852,98 @@ class Task7ContractTests(unittest.TestCase):
             )
 
         self.assertEqual(1, attempts)
+
+    def test_existing_install_backup_retry_rejects_source_substitution(self):
+        """The real upgrade path cannot back up bytes changed during a retry."""
+        module = self.module()
+        source = self.bundle_repo("upgrade-backup-retry-race")
+        module.install_bundle(source, self.home)
+        self.update_bundle(source)
+        paths = module._install_paths(self.home)
+        real_replace = module.os.replace
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+        injected = False
+
+        def substitute_existing_install(observed_source, observed_target):
+            nonlocal injected
+            observed_source = Path(observed_source)
+            observed_target = Path(observed_target)
+            if (
+                not injected
+                and os.path.normcase(str(observed_source.resolve()))
+                == os.path.normcase(str(paths["canonical"].resolve()))
+                and observed_target.name.startswith(".engineering.backup-")
+            ):
+                injected = True
+                (observed_source / "SKILL.md").write_text(
+                    "# concurrently substituted install\n", encoding="utf-8"
+                )
+                raise denied
+            return real_replace(observed_source, observed_target)
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=substitute_existing_install),
+            patch.object(module.time, "sleep"),
+            self.assertRaisesRegex(module.EngineeringError, "target changed"),
+        ):
+            module.install_bundle(source, self.home)
+
+        self.assertTrue(injected)
+
+    def test_rollback_restoration_retry_rejects_target_substitution(self):
+        """The real rollback exception path cannot replace a raced restore target."""
+        module = self.module()
+        source = self.bundle_repo("rollback-restore-retry-race")
+        module.install_bundle(source, self.home)
+        self.update_bundle(source)
+        module.install_bundle(source, self.home)
+        paths = module._install_paths(self.home)
+        real_replace = module.os.replace
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+        forced_late_failure = False
+        restore_attempts = 0
+
+        def substitute_restoration_target(observed_source, observed_target):
+            nonlocal forced_late_failure, restore_attempts
+            observed_source = Path(observed_source)
+            observed_target = Path(observed_target)
+            if (
+                not forced_late_failure
+                and os.path.normcase(str(observed_target.resolve()))
+                == os.path.normcase(str(paths["previous"].resolve()))
+                and observed_source.name.startswith("..engineering.previous.stage-")
+            ):
+                forced_late_failure = True
+                raise OSError("synthetic later rollback publication failure")
+            if (
+                forced_late_failure
+                and os.path.normcase(str(observed_target.resolve()))
+                == os.path.normcase(str(paths["canonical"].resolve()))
+                and observed_source.name.startswith(".engineering.backup-")
+            ):
+                restore_attempts += 1
+                if restore_attempts == 1:
+                    observed_target.mkdir(parents=True)
+                    (observed_target / "substitute.txt").write_text(
+                        "concurrent\n", encoding="utf-8"
+                    )
+                    raise denied
+                shutil.rmtree(observed_target)
+            return real_replace(observed_source, observed_target)
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=substitute_restoration_target),
+            patch.object(module.time, "sleep"),
+            self.assertRaisesRegex(module.EngineeringError, "target changed"),
+        ):
+            module.rollback_install(self.home)
+
+        self.assertTrue(forced_late_failure)
+        self.assertEqual(1, restore_attempts)
 
     def test_every_late_install_publication_failure_restores_exact_state(self):
         module = self.module()
@@ -10548,7 +10716,8 @@ class Task7ContractTests(unittest.TestCase):
         injected = False
 
         def inject_change(
-            source, target, expected_pre_state=None, *, preimage_path=None
+            source, target, expected_pre_state=None, *, preimage_path=None,
+            expected_source_state=None, expected_target_state=None,
         ):
             nonlocal injected
             if target == hook and not injected:
@@ -10559,6 +10728,8 @@ class Task7ContractTests(unittest.TestCase):
                 target,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         with (
@@ -10596,7 +10767,8 @@ class Task7ContractTests(unittest.TestCase):
         injected = False
 
         def inject_change(
-            stage, target, expected_pre_state=None, *, preimage_path=None
+            stage, target, expected_pre_state=None, *, preimage_path=None,
+            expected_source_state=None, expected_target_state=None,
         ):
             nonlocal injected
             if not injected:
@@ -10607,6 +10779,8 @@ class Task7ContractTests(unittest.TestCase):
                 target,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         with (
@@ -10631,7 +10805,8 @@ class Task7ContractTests(unittest.TestCase):
         injected = False
 
         def inject_change(
-            source, destination, expected_pre_state=None, *, preimage_path=None
+            source, destination, expected_pre_state=None, *, preimage_path=None,
+            expected_source_state=None, expected_target_state=None,
         ):
             nonlocal injected
             if destination == target and not injected:
@@ -10642,6 +10817,8 @@ class Task7ContractTests(unittest.TestCase):
                 destination,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         with (
@@ -13532,6 +13709,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             "identity": {"state": "unknown"},
         }
         _, manifest, source_commit, source_digest = module._bundle_files(source)
+        source_tree = module._bundle_git_tree(source, source_commit)
         return {
             "record": record,
             "authorization": {
@@ -13540,6 +13718,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 "record_digest": module._json_digest(record),
                 "source_bundle": {
                     "source_git_commit": source_commit,
+                    "source_git_tree": source_tree,
                     "source_digest": source_digest,
                     "skill_version": manifest["version"],
                 },
@@ -15112,9 +15291,11 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 self.root, token["token_id"], token["artifact_digest"], "install"
             )
         _, manifest, commit, digest = module._bundle_files(source)
+        tree = module._bundle_git_tree(source, commit)
         self.assertEqual(
             {
                 "source_git_commit": commit,
+                "source_git_tree": tree,
                 "source_digest": digest,
                 "skill_version": manifest["version"],
             },
@@ -15233,10 +15414,12 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 release_artifact_digest=token["artifact_digest"],
             )
         _, manifest, commit, digest = module._bundle_files(source)
-        self.assertEqual("engineering.install.v2", receipt["schema"])
+        tree = module._bundle_git_tree(source, commit)
+        self.assertEqual("engineering.install.v5", receipt["schema"])
         self.assertEqual(
             {
                 "source_git_commit": commit,
+                "source_git_tree": tree,
                 "source_digest": digest,
                 "skill_version": manifest["version"],
             },

@@ -338,6 +338,16 @@ class GraphifyIdentity:
     required_commands: tuple[str, ...]
 
 
+class BundleSnapshot(tuple):
+    """Four-field compatibility tuple plus exact Git-object publication data."""
+
+    def __new__(cls, files, manifest, commit, digest, source_git_tree, blobs):
+        value = super().__new__(cls, (files, manifest, commit, digest))
+        value.source_git_tree = source_git_tree
+        value.blobs = blobs
+        return value
+
+
 def controller_argv() -> list[str]:
     """Return the installed launcher; raw Python remains troubleshooting only."""
     launcher = Path(__file__).with_name("engineering.cmd" if os.name == "nt" else "engineering")
@@ -12587,9 +12597,17 @@ def _load_release_tokens(root: Path) -> dict:
         valid_source_bundle = (
             isinstance(source_bundle, dict)
             and set(source_bundle)
-            == {"source_git_commit", "source_digest", "skill_version"}
+            == {
+                "source_git_commit",
+                "source_git_tree",
+                "source_digest",
+                "skill_version",
+            }
             and re.fullmatch(
                 r"[0-9a-f]{40}", str(source_bundle.get("source_git_commit", ""))
+            )
+            and re.fullmatch(
+                r"[0-9a-f]{40}", str(source_bundle.get("source_git_tree", ""))
             )
             and re.fullmatch(
                 r"sha256:[0-9a-f]{64}", str(source_bundle.get("source_digest", ""))
@@ -12775,6 +12793,7 @@ def _release_install_source_bundle(
             "Engineering release install source is not the accepted project repository."
         )
     _, manifest, source_commit, source_digest = _bundle_files(source)
+    source_git_tree = _bundle_git_tree(source, source_commit)
     completion, completion_digest = _terminal_completion(project_root, completion_id)
     _completion_artifact_digest(completion, completion_digest)
     result_identity = completion.get("result_identity")
@@ -12787,6 +12806,7 @@ def _release_install_source_bundle(
         )
     return {
         "source_git_commit": source_commit,
+        "source_git_tree": source_git_tree,
         "source_digest": source_digest,
         "skill_version": manifest["version"],
     }
@@ -15122,9 +15142,17 @@ def _bundle_files(source: Path) -> tuple[list[Path], dict, str, str]:
         files.append(relative)
     if not required <= set(files) or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise EngineeringError("Engineering bundle source closure is invalid.")
+    blobs = {
+        relative: _git_blob_bytes(
+            repository,
+            commit,
+            f"{relative_source.rstrip('/')}/{relative.as_posix()}",
+        )
+        for relative in files
+    }
     try:
-        manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        manifest = json.loads(blobs[PurePosixPath("manifest.json")].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise EngineeringError("Engineering bundle manifest is invalid.") from error
     graphify = manifest.get("graphify") if isinstance(manifest, dict) else None
     if not (
@@ -15135,22 +15163,81 @@ def _bundle_files(source: Path) -> tuple[list[Path], dict, str, str]:
         and graphify.get("commit") == GRAPHIFY_COMMIT
     ):
         raise EngineeringError("Engineering bundle manifest is invalid.")
-    skill = (source / "SKILL.md").read_text(encoding="utf-8")
+    try:
+        skill = blobs[PurePosixPath("SKILL.md")].decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EngineeringError("Engineering canonical skill metadata is invalid.") from error
     if "name: engineering" not in skill:
         raise EngineeringError("Engineering canonical skill metadata is invalid.")
     digest = hashlib.sha256()
     for relative in sorted(files, key=lambda value: value.as_posix()):
         digest.update(relative.as_posix().encode("utf-8") + b"\0")
-        digest.update((source / relative).read_bytes() + b"\0")
-    return files, manifest, commit, "sha256:" + digest.hexdigest()
+        digest.update(blobs[relative] + b"\0")
+    tree = git(repository, "rev-parse", f"{commit}^{{tree}}")
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        raise EngineeringError("Engineering bundle Git tree is invalid.")
+    return BundleSnapshot(
+        files,
+        manifest,
+        commit,
+        "sha256:" + digest.hexdigest(),
+        tree,
+        blobs,
+    )
 
 
-def _copy_bundle(source: Path, target: Path, files: list[Path]) -> None:
+def _git_blob_bytes(repository: Path, commit: str, relative: str) -> bytes:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", commit)
+        or not relative
+        or Path(relative).is_absolute()
+        or ".." in PurePosixPath(relative).parts
+    ):
+        raise EngineeringError("Engineering Git object identity is invalid.")
+    result = subprocess.run(
+        ["git", "-C", str(repository), "cat-file", "blob", f"{commit}:{relative}"],
+        capture_output=True,
+        env=_controller_git_environment(),
+    )
+    if result.returncode:
+        raise EngineeringError("Engineering bundle Git object is unavailable.")
+    return result.stdout
+
+
+def _bundle_git_tree(source: Path, commit: str) -> str:
+    repository = _expand_install_path(git(source, "rev-parse", "--show-toplevel")).resolve()
+    tree = git(repository, "rev-parse", f"{commit}^{{tree}}")
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        raise EngineeringError("Engineering bundle Git tree is invalid.")
+    return tree
+
+
+def _copy_bundle(
+    source: Path,
+    target: Path,
+    files: list[Path],
+    commit: str,
+    blobs: dict[Path, bytes] | None = None,
+) -> None:
+    repository = None
+    relative_source = None
+    if blobs is None:
+        repository = _expand_install_path(git(source, "rev-parse", "--show-toplevel")).resolve()
+        relative_source = source.resolve().relative_to(repository).as_posix().rstrip("/")
     target.mkdir(parents=True)
     for relative in files:
         destination = target / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source / relative, destination)
+        content = (
+            blobs[relative]
+            if blobs is not None
+            else _git_blob_bytes(
+                repository,
+                commit,
+                f"{relative_source}/{relative.as_posix()}",
+            )
+        )
+        destination.write_bytes(content)
 
 
 def _forwarder(name: str) -> str:
@@ -15377,17 +15464,24 @@ def _legacy_v226_bootstrap_authorization(value: object, source_bundle: object) -
 
 
 def _v226_bootstrap_source_bundle(value: object) -> dict:
-    expected = {"source_git_commit", "source_digest", "skill_version"}
+    expected = {
+        "source_git_commit",
+        "source_git_tree",
+        "source_digest",
+        "skill_version",
+    }
     if (
         not isinstance(value, dict)
         or set(value) != expected
         or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("source_git_commit", "")))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("source_git_tree", "")))
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("source_digest", "")))
         or value.get("skill_version") != "2.2.6"
     ):
         raise EngineeringError("Engineering v2.2.6 bootstrap source bundle is invalid.")
     return {
         "source_git_commit": value["source_git_commit"],
+        "source_git_tree": value["source_git_tree"],
         "source_digest": value["source_digest"],
         "skill_version": "2.2.6",
     }
@@ -15783,7 +15877,8 @@ def _v226_installed_v225(home: Path) -> dict:
             if candidate is None:
                 continue
             if (
-                candidate.get("schema") == "engineering.install.v1"
+                candidate.get("schema")
+                in {"engineering.install.v1", "engineering.install.v5"}
                 and candidate.get("status") == "installed"
                 and candidate.get("skill_version") == "2.2.5"
             ):
@@ -16058,7 +16153,12 @@ def _v226_bootstrap_host_record(
         )
     if source_bundle != {
         name: internal[name]
-        for name in ("source_git_commit", "source_digest", "skill_version")
+        for name in (
+            "source_git_commit",
+            "source_git_tree",
+            "source_digest",
+            "skill_version",
+        )
     }:
         raise EngineeringError("Engineering host bootstrap record source bundle is mismatched.")
     return {
@@ -16098,9 +16198,11 @@ def v226_bootstrap_handoff_status(source: Path, home: Path) -> dict:
     if not home.is_absolute() or str(home).startswith("\\\\"):
         raise EngineeringError("Engineering bootstrap home must be absolute.")
     _, manifest, commit, source_digest = _bundle_files(source)
+    source_git_tree = _bundle_git_tree(source, commit)
     source_bundle = _v226_bootstrap_source_bundle(
         {
             "source_git_commit": commit,
+            "source_git_tree": source_git_tree,
             "source_digest": source_digest,
             "skill_version": manifest["version"],
         }
@@ -16201,6 +16303,7 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
     v2_required = legacy_required | {"release_authorization"}
     v3_required = legacy_required | {"bootstrap_authorization"}
     v4_required = legacy_required | {"bootstrap_authorization"}
+    current_required = legacy_required | {"source_git_tree"}
     valid_legacy = (
         isinstance(receipt, dict)
         and set(receipt) == legacy_required
@@ -16256,8 +16359,64 @@ def _load_install_receipt(path: Path, key: bytes) -> dict | None:
         )
     except EngineeringError:
         valid_v4 = False
+    source_bundle_v5 = {
+        "source_git_commit": receipt.get("source_git_commit"),
+        "source_git_tree": receipt.get("source_git_tree"),
+        "source_digest": receipt.get("source_digest"),
+        "skill_version": receipt.get("skill_version"),
+    }
+    receipt_keys = set(receipt) if isinstance(receipt, dict) else set()
+    authorization_kind = None
+    if receipt_keys == current_required:
+        authorization_kind = "none"
+    elif receipt_keys == current_required | {"release_authorization"}:
+        authorization_kind = "release"
+    elif receipt_keys == current_required | {"bootstrap_authorization"}:
+        authorization_kind = "bootstrap"
+    valid_v5_release = False
+    if authorization_kind == "release" and isinstance(authorization, dict):
+        valid_v5_release = (
+            set(authorization) == authorization_required
+            and authorization.get("schema")
+            == "engineering.install-release-authorization.v1"
+            and authorization.get("source_bundle") == source_bundle_v5
+            and isinstance(authorization.get("token_id"), str)
+            and re.fullmatch(r"release-token-[0-9a-f]{32}", authorization["token_id"])
+            and all(
+                re.fullmatch(r"sha256:[0-9a-f]{64}", str(authorization.get(name, "")))
+                for name in ("token_digest", "artifact_digest")
+            )
+            and isinstance(authorization.get("acceptance_id"), str)
+            and re.fullmatch(
+                r"acceptance-[A-Za-z0-9][A-Za-z0-9._-]*",
+                authorization["acceptance_id"],
+            )
+        )
+    try:
+        valid_v5_bootstrap = (
+            authorization_kind == "bootstrap"
+            and _v226_bootstrap_authorization(
+                bootstrap_authorization, source_bundle_v5
+            )
+            == bootstrap_authorization
+        )
+    except EngineeringError:
+        valid_v5_bootstrap = False
+    version = receipt.get("skill_version") if isinstance(receipt, dict) else None
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", str(version))
+    version_tuple = tuple(int(part) for part in match.groups()) if match else ()
+    valid_v5 = (
+        isinstance(receipt, dict)
+        and receipt.get("schema") == "engineering.install.v5"
+        and re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_git_tree", "")))
+        and (
+            valid_v5_release
+            or valid_v5_bootstrap
+            or (authorization_kind == "none" and version_tuple < (2, 2, 6))
+        )
+    )
     if (
-        not (valid_legacy or valid_v2 or valid_v3 or valid_v4)
+        not (valid_legacy or valid_v2 or valid_v3 or valid_v4 or valid_v5)
         or receipt.get("status") not in {"installed", "rolled_back"}
         or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_git_commit", "")))
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("source_digest", "")))
@@ -16323,51 +16482,82 @@ def _validate_install_paths(home: Path, paths: dict[str, Path]) -> None:
         _reject_reparse_ancestors(path, home)
 
 
+def _install_path_state(path: Path) -> dict:
+    if not os.path.lexists(path):
+        return {
+            "exists": False,
+            "kind": "absent",
+            "bytes_hex": None,
+            "sha256": None,
+            "mode": None,
+        }
+    if path.is_symlink() or _is_reparse_point(path):
+        raise EngineeringError(f"Engineering target changed before publication: {path}")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if path.is_file():
+        content = path.read_bytes()
+        return {
+            "exists": True,
+            "kind": "file",
+            "bytes_hex": content.hex(),
+            "sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
+            "mode": mode,
+        }
+    if not path.is_dir():
+        raise EngineeringError(f"Engineering target changed before publication: {path}")
+    digest = hashlib.sha256(b"engineering.install-path.directory.v1\0")
+    for candidate in sorted(path.rglob("*"), key=lambda value: value.as_posix()):
+        if candidate.is_symlink() or _is_reparse_point(candidate):
+            raise EngineeringError(
+                f"Engineering target changed before publication: {path}"
+            )
+        relative = candidate.relative_to(path).as_posix().encode("utf-8")
+        candidate_mode = stat.S_IMODE(candidate.stat().st_mode)
+        if candidate.is_dir():
+            digest.update(b"directory\0" + relative + b"\0")
+            digest.update(str(candidate_mode).encode("ascii") + b"\0")
+        elif candidate.is_file():
+            digest.update(b"file\0" + relative + b"\0")
+            digest.update(str(candidate_mode).encode("ascii") + b"\0")
+            digest.update(candidate.read_bytes() + b"\0")
+        else:
+            raise EngineeringError(
+                f"Engineering target changed before publication: {path}"
+            )
+    return {
+        "exists": True,
+        "kind": "directory",
+        "bytes_hex": None,
+        "sha256": "sha256:" + digest.hexdigest(),
+        "mode": mode,
+    }
+
+
+def _verify_install_path_state(path: Path, expected: dict | None) -> None:
+    if expected is None:
+        return
+    normalized = {
+        key: expected.get(key)
+        for key in ("exists", "kind", "bytes_hex", "sha256", "mode")
+    }
+    if _install_path_state(path) != normalized:
+        raise EngineeringError(f"Engineering target changed before publication: {path}")
+
+
 def _replace_install_path(
     source: Path,
     target: Path,
     expected_pre_state: dict | None = None,
     *,
     preimage_path: Path | None = None,
+    expected_source_state: dict | None = None,
+    expected_target_state: dict | None = None,
 ) -> None:
     def verify_pre_state() -> None:
-        if expected_pre_state is None:
-            return
         inspected = preimage_path if preimage_path is not None else target
-        exists = os.path.lexists(inspected)
-        if exists:
-            if inspected.is_symlink() or _is_reparse_point(inspected):
-                raise EngineeringError(
-                    f"Engineering target changed before publication: {inspected}"
-                )
-            if not inspected.is_file():
-                raise EngineeringError(
-                    f"Engineering target changed before publication: {inspected}"
-                )
-            content = inspected.read_bytes()
-            actual = {
-                "exists": True,
-                "kind": "file",
-                "bytes_hex": content.hex(),
-                "sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
-                "mode": stat.S_IMODE(inspected.stat().st_mode),
-            }
-        else:
-            actual = {
-                "exists": False,
-                "kind": "absent",
-                "bytes_hex": None,
-                "sha256": None,
-                "mode": None,
-            }
-        expected = {
-            key: expected_pre_state.get(key)
-            for key in ("exists", "kind", "bytes_hex", "sha256", "mode")
-        }
-        if actual != expected:
-            raise EngineeringError(
-                f"Engineering target changed before publication: {inspected}"
-            )
+        _verify_install_path_state(inspected, expected_pre_state)
+        _verify_install_path_state(source, expected_source_state)
+        _verify_install_path_state(target, expected_target_state)
 
     # Antivirus and indexers can briefly retain Windows directory handles. Keep
     # retries bounded and compare-and-swap safe rather than weakening atomicity.
@@ -16404,29 +16594,40 @@ def _transactional_replace(
     }
     backed_up: list[Path] = []
     published: list[Path] = []
+    target_states = {
+        target: expected_pre_states.get(target, _install_path_state(target))
+        for _, target in replacements
+    }
+    stage_states = {stage: _install_path_state(stage) for stage, _ in replacements}
     completed = False
     try:
         for stage, target in replacements:
             target.parent.mkdir(parents=True, exist_ok=True)
             backup = backups[target]
             _remove_install_path(backup)
-            expected = expected_pre_states.get(target)
+            expected = target_states[target]
             if os.path.lexists(target):
                 if _is_reparse_point(target):
                     raise EngineeringError("Engineering install target is a link/reparse point.")
                 _replace_install_path(
                     target,
                     backup,
-                    expected,
-                    preimage_path=target,
+                    expected_source_state=expected,
+                    expected_target_state=absent,
                 )
                 backed_up.append(target)
-                _replace_install_path(stage, target, absent)
+                _replace_install_path(
+                    stage,
+                    target,
+                    expected_source_state=stage_states[stage],
+                    expected_target_state=absent,
+                )
             else:
                 _replace_install_path(
                     stage,
                     target,
-                    expected if expected is not None else absent,
+                    expected_source_state=stage_states[stage],
+                    expected_target_state=expected,
                 )
             published.append(target)
         if after_publication is not None:
@@ -16438,7 +16639,12 @@ def _transactional_replace(
         for target in reversed(backed_up):
             backup = backups[target]
             if backup.exists() and not os.path.lexists(target):
-                _replace_install_path(backup, target)
+                _replace_install_path(
+                    backup,
+                    target,
+                    expected_source_state=target_states[target],
+                    expected_target_state=absent,
+                )
             elif backup.exists():
                 _remove_install_path(backup)
         raise
@@ -16492,9 +16698,16 @@ def install_bundle(
         raise EngineeringError("Engineering install home must be absolute.")
     if str(home).startswith("\\\\"):
         raise EngineeringError("Engineering installation on UNC paths is unsupported.")
-    files, manifest, commit, source_digest = _bundle_files(source)
+    bundle_snapshot = _bundle_files(source)
+    files, manifest, commit, source_digest = bundle_snapshot
+    source_git_tree = (
+        bundle_snapshot.source_git_tree
+        if isinstance(bundle_snapshot, BundleSnapshot)
+        else _bundle_git_tree(source, commit)
+    )
     expected_source_bundle = {
         "source_git_commit": commit,
+        "source_git_tree": source_git_tree,
         "source_digest": source_digest,
         "skill_version": manifest["version"],
     }
@@ -16610,7 +16823,15 @@ def install_bundle(
             raise EngineeringError("Engineering install state is incomplete.")
         for path in stages.values():
             _remove_install_path(path)
-        _copy_bundle(source, stages["canonical"], files)
+        _copy_bundle(
+            source,
+            stages["canonical"],
+            files,
+            commit,
+            bundle_snapshot.blobs
+            if isinstance(bundle_snapshot, BundleSnapshot)
+            else None,
+        )
         stages["claude"].mkdir(parents=True)
         (stages["claude"] / "SKILL.md").write_text(
             _forwarder("engineering"), encoding="utf-8", newline="\n"
@@ -16626,16 +16847,11 @@ def install_bundle(
                 "Engineering staged bundle does not match the authorized source bundle."
             )
         receipt_payload = {
-            "schema": (
-                "engineering.install.v2"
-                if release_authorization is not None
-                else "engineering.install.v4"
-                if validated_bootstrap is not None
-                else "engineering.install.v1"
-            ),
+            "schema": "engineering.install.v5",
             "status": "installed",
             "skill_version": manifest["version"],
             "source_git_commit": commit,
+            "source_git_tree": source_git_tree,
             "source_digest": source_digest,
             "graphify_commit": manifest["graphify"]["commit"],
             "installed_at": _utc_now(),

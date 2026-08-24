@@ -42,6 +42,83 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_v226_release_matrix_is_exact_complete_and_fail_closed(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        registry = ROOT / "release" / "v2.2.6-requirements.json"
+        self.assertTrue(tool.is_file())
+        self.assertTrue(registry.is_file())
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_release_matrix", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        unknown = module.generate_matrix(ROOT, "internal", None)
+        self.assertEqual(
+            set(module.V226_REQUIRED_REQUIREMENTS),
+            {row["requirement_id"] for row in unknown["rows"]},
+        )
+        self.assertFalse(unknown["gates"]["artifact_acceptance_ready"])
+        self.assertFalse(unknown["gates"]["post_activation_ready"])
+        self.assertTrue(unknown["unknowns"])
+        with self.assertRaisesRegex(module.MatrixError, "authoritative requirement coverage"):
+            module._normalize_requirements(
+                {"schema": module.REQUIREMENTS_SCHEMA, "requirements": []}
+            )
+
+        artifact_rows = [
+            row
+            for row in unknown["rows"]
+            if row["gate"] == "artifact_acceptance"
+        ]
+        def receipt(evidence_class: str) -> dict:
+            return {
+                "schema": module.EXECUTION_RECEIPT_SCHEMA,
+                "artifact": unknown["artifact"],
+                "commands": [
+                    {
+                        "command_id": "canonical-paired-gates",
+                        "command": "python -m unittest",
+                        "started_at": "2026-08-24T10:00:00+00:00",
+                        "finished_at": "2026-08-24T10:01:00+00:00",
+                        "exit_code": 0,
+                        "counts": {
+                            "run": 1,
+                            "failures": 0,
+                            "errors": 0,
+                            "skipped": 0,
+                        },
+                        "evidence_class": evidence_class,
+                        "requirement_ids": [
+                            row["requirement_id"] for row in artifact_rows
+                        ],
+                        "stdout_digest": "sha256:" + "1" * 64,
+                        "stderr_digest": "sha256:" + "2" * 64,
+                    }
+                ],
+                "incidents": [],
+            }
+
+        proxy_receipt = receipt("proxy")
+        proxy = module.generate_matrix(ROOT, "internal", proxy_receipt)
+        self.assertFalse(proxy["gates"]["artifact_acceptance_ready"])
+        self.assertTrue(proxy["proxy_rejections"])
+
+        exact_receipt = receipt("real_outcome")
+        malformed_incident = json.loads(json.dumps(exact_receipt))
+        malformed_incident["incidents"] = [{}]
+        with self.assertRaisesRegex(module.MatrixError, "incident receipt"):
+            module.generate_matrix(ROOT, "internal", malformed_incident)
+        exact = module.generate_matrix(ROOT, "internal", exact_receipt)
+        self.assertTrue(exact["gates"]["artifact_acceptance_ready"])
+        self.assertFalse(exact["gates"]["post_activation_ready"])
+        for row in exact["rows"]:
+            self.assertEqual(exact["artifact"], row["exact_artifact_identity"])
+            self.assertRegex(row["design_blob"], r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(row["contract_blob"], r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(row["negative_test_blob"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(exact["matrix_digest"], module.matrix_digest(exact))
+
     def test_release_manifest_is_v2_2_6_with_owner_intent_gate(self) -> None:
         manifest = json.loads((SKILL_ROOT / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual("2.2.6", manifest["version"])
@@ -926,7 +1003,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     encoding="utf-8"
                 )
             )
-            self.assertEqual("engineering.public-export-receipt.v3", receipt["schema"])
+            self.assertEqual("engineering.public-export-receipt.v4", receipt["schema"])
             source_commit = subprocess.run(
                 ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
                 check=True,
@@ -1088,6 +1165,34 @@ Residual risk: No repository-supported vulnerability intake is available.
             )
             with self.assertRaisesRegex(module.ExportError, "audience-specific security"):
                 module.export_tree(ROOT, destination)
+
+    def test_public_export_requires_every_declared_public_only_destination_file(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            destination = Path(temporary) / "public"
+            (source / "release").mkdir(parents=True)
+            destination.mkdir()
+            (source / "release" / "audience-classification.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "engineering.audience-classification.v1",
+                        "shared_manifest": "release/public-export.json",
+                        "internal_only": ["release/audience-classification.json"],
+                        "public_only": ["docs/public-contributing.md"],
+                        "audience_specific": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(module.ExportError, "public-only destination"):
+                module._validate_audience_classification(
+                    source, [], destination=destination
+                )
 
     def test_public_export_cannot_delete_an_absolute_retained_path(self) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -1283,6 +1388,87 @@ Residual risk: No repository-supported vulnerability intake is available.
             (source / "README.md").write_text("modified\n", encoding="utf-8")
             with self.assertRaises(module.ExportError):
                 module._assert_clean_head_snapshot(source, ["README.md"])
+
+    def test_public_export_identity_and_bytes_are_stable_across_checkout_eol(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            origin = base / "origin"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(origin)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(origin), "config", "user.name", "Synthetic"], check=True)
+            subprocess.run(
+                ["git", "-C", str(origin), "config", "user.email", "synthetic@example.invalid"],
+                check=True,
+            )
+            (origin / "release").mkdir()
+            (origin / "README.md").write_bytes(b"one\ntwo\n")
+            (origin / "release" / "public-export.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "engineering.public-export.v1",
+                        "files": ["README.md"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(origin), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(origin), "commit", "-m", "exact source"],
+                check=True,
+                capture_output=True,
+            )
+            results = []
+            for name, autocrlf in (("lf", "false"), ("crlf", "true")):
+                source = base / f"source-{name}"
+                destination = base / f"public-{name}"
+                subprocess.run(
+                    ["git", "-c", f"core.autocrlf={autocrlf}", "clone", str(origin), str(source)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "init", "--initial-branch=main", str(destination)],
+                    check=True,
+                    capture_output=True,
+                )
+                results.append((module.export_tree(source, destination), destination))
+            self.assertNotEqual(
+                (base / "source-lf" / "README.md").read_bytes(),
+                (base / "source-crlf" / "README.md").read_bytes(),
+            )
+            self.assertEqual(results[0][0]["tree_digest"], results[1][0]["tree_digest"])
+            expected_tree = subprocess.run(
+                ["git", "-C", str(origin), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(expected_tree, results[0][0]["source_git_tree"])
+            expected_readme = subprocess.run(
+                ["git", "-C", str(origin), "show", "HEAD:README.md"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            for _, destination in results:
+                self.assertEqual(expected_readme, (destination / "README.md").read_bytes())
+            receipts = [
+                json.loads(
+                    (destination / ".git" / "engineering-public-export.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                for _, destination in results
+            ]
+            self.assertEqual(receipts[0], receipts[1])
 
     def test_public_export_rejects_a_hard_linked_receipt(self) -> None:
         spec = importlib.util.spec_from_file_location(
