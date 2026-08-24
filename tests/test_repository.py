@@ -58,7 +58,12 @@ class RepositoryContractTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        unknown = module.generate_matrix(ROOT, "internal", None)
+        role = (
+            "internal"
+            if (ROOT / "release" / "audience-classification.json").is_file()
+            else "public"
+        )
+        unknown = module.generate_matrix(ROOT, role, None)
         self.assertEqual(
             set(module.V226_REQUIRED_REQUIREMENTS),
             {row["requirement_id"] for row in unknown["rows"]},
@@ -105,7 +110,7 @@ class RepositoryContractTests(unittest.TestCase):
             }
 
         proxy_receipt = receipt("proxy")
-        proxy = module.generate_matrix(ROOT, "internal", proxy_receipt)
+        proxy = module.generate_matrix(ROOT, role, proxy_receipt)
         self.assertFalse(proxy["gates"]["artifact_acceptance_ready"])
         self.assertTrue(proxy["proxy_rejections"])
 
@@ -113,8 +118,8 @@ class RepositoryContractTests(unittest.TestCase):
         malformed_incident = json.loads(json.dumps(exact_receipt))
         malformed_incident["incidents"] = [{}]
         with self.assertRaisesRegex(module.MatrixError, "incident receipt"):
-            module.generate_matrix(ROOT, "internal", malformed_incident)
-        exact = module.generate_matrix(ROOT, "internal", exact_receipt)
+            module.generate_matrix(ROOT, role, malformed_incident)
+        exact = module.generate_matrix(ROOT, role, exact_receipt)
         self.assertTrue(exact["gates"]["artifact_acceptance_ready"])
         self.assertFalse(exact["gates"]["post_activation_ready"])
         for row in exact["rows"]:
