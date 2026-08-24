@@ -42,6 +42,11 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def write_public_only_overlay(self, destination: Path) -> None:
+        path = destination / "docs" / "public-contributing.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Public contribution route\n", encoding="utf-8")
+
     def test_v226_release_matrix_is_exact_complete_and_fail_closed(self) -> None:
         tool = ROOT / "tools" / "v226_release_matrix.py"
         registry = ROOT / "release" / "v2.2.6-requirements.json"
@@ -960,6 +965,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                 capture_output=True,
             )
             self.assertTrue((destination / ".git").is_file())
+            self.write_public_only_overlay(destination)
 
             result = module.export_tree(ROOT, destination)
 
@@ -994,6 +1000,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     "https://example.invalid/security/advisories/new.\n",
                     encoding="utf-8",
                 )
+            self.write_public_only_overlay(destination)
 
             result = module.export_tree(ROOT, destination)
 
@@ -1029,6 +1036,7 @@ Residual risk: No repository-supported vulnerability intake is available.
             self.assertFalse((destination / "release" / "audience-classification.json").exists())
             self.assertFalse((destination / "CONTRIBUTING.md").exists())
             self.assertFalse((destination / "docs" / "internal-installation.md").exists())
+            self.assertTrue((destination / "docs" / "public-contributing.md").is_file())
             self.assertEqual(has_audience_policy, (destination / "SECURITY.md").exists())
             self.assertFalse((destination / ".github" / "ISSUE_TEMPLATE" / "bug-idea.yml").exists())
             self.assertFalse((destination / ".github" / "ISSUE_TEMPLATE" / "code-proposal.yml").exists())
@@ -1040,11 +1048,14 @@ Residual risk: No repository-supported vulnerability intake is available.
                 for path in destination.rglob("*")
                 if path.is_file() and ".git" not in path.parts
             }
-            actual_shared = actual - ({"SECURITY.md"} if has_audience_policy else set())
+            overlays = {"docs/public-contributing.md"}
+            if has_audience_policy:
+                overlays.add("SECURITY.md")
+            actual_shared = actual - overlays
             self.assertEqual(expected, actual_shared)
             for relative in expected:
                 self.assertEqual(
-                    (ROOT / relative).read_bytes(),
+                    module._git_blob_bytes(ROOT, source_commit, relative),
                     (destination / relative).read_bytes(),
                     relative,
                 )
@@ -1163,6 +1174,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                 check=True,
                 capture_output=True,
             )
+            self.write_public_only_overlay(destination)
             with self.assertRaisesRegex(module.ExportError, "audience-specific security"):
                 module.export_tree(ROOT, destination)
 
@@ -1220,6 +1232,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     "https://example.invalid/security/advisories/new.\n",
                     encoding="utf-8",
                 )
+            self.write_public_only_overlay(destination)
             module.export_tree(ROOT, destination)
             self.assertEqual("keep\n", sentinel.read_text(encoding="utf-8"))
 
@@ -1254,6 +1267,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     "https://example.invalid/security/advisories/new.\n",
                     encoding="utf-8",
                 )
+            self.write_public_only_overlay(destination)
             module.export_tree(ROOT, destination)
             self.assertEqual("keep\n", retained.read_text(encoding="utf-8"))
 
