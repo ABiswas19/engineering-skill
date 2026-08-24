@@ -443,25 +443,26 @@ class RepositoryContractTests(unittest.TestCase):
                 )
 
     def test_v226_internal_plans_receipt_docs_and_utf8_are_truthful(self) -> None:
-        if not (ROOT / "release" / "audience-classification.json").is_file():
-            self.skipTest("internal-only classification contract")
-        audience = json.loads(
-            (ROOT / "release" / "audience-classification.json").read_text(encoding="utf-8")
-        )
-        shared = set(
-            json.loads((ROOT / "release" / "public-export.json").read_text(encoding="utf-8"))[
-                "files"
-            ]
-        )
-        classified = shared | set(audience["internal_only"]) | set(audience["public_only"]) | set(
-            audience["audience_specific"]
-        )
-        tracked = subprocess.check_output(
-            ["git", "-C", str(ROOT), "ls-files", "docs/plans", "docs/superpowers/plans"],
-            text=True,
-            encoding="utf-8",
-        ).splitlines()
-        self.assertEqual([], sorted(set(tracked) - classified))
+        audience_path = ROOT / "release" / "audience-classification.json"
+        if audience_path.is_file():
+            audience = json.loads(audience_path.read_text(encoding="utf-8"))
+            shared = set(
+                json.loads(
+                    (ROOT / "release" / "public-export.json").read_text(encoding="utf-8")
+                )["files"]
+            )
+            classified = (
+                shared
+                | set(audience["internal_only"])
+                | set(audience["public_only"])
+                | set(audience["audience_specific"])
+            )
+            tracked = subprocess.check_output(
+                ["git", "-C", str(ROOT), "ls-files", "docs/plans", "docs/superpowers/plans"],
+                text=True,
+                encoding="utf-8",
+            ).splitlines()
+            self.assertEqual([], sorted(set(tracked) - classified))
         receipt_doc = (
             ROOT / "docs" / "specs" / "engineering-v2.2.6-owner-intent-audit-repair.md"
         ).read_text(encoding="utf-8")
