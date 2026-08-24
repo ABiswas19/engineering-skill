@@ -6,6 +6,45 @@ the complete requirement identifiers and their executable mappings. The matrix
 generator reads exact Git objects, names the commit and tree, and fails closed
 when a mapping, referenced blob, test selector, or required evidence is absent.
 
+## Complete generic obligation DAG
+
+The versioned owner-obligation ledger carries every inherited Engineering
+outcome and every generic post-activation outcome category as project-neutral
+data. Each row has an explicit lifecycle phase, predecessor dependencies,
+INCLUDED or DEFERRED disposition, typed acceptance criteria, environment, and
+fail-closed dispatch gate. The ordered dependency list is the staggered DAG;
+unknown dependencies, omissions, cycles, or non-current acceptance evidence
+reject matrix generation.
+
+The ledger covers Graphify plus the deterministic overlay; trace, coverage,
+impact, and why views; setup, checkpoint, and completion; authority persistence;
+maintenance; semantic matrices; capability assurance; learning; project
+identity; measurement; first-pass incidents; false-acceptance prevention;
+graph engineering; README truth; and explicit Langfuse deferment. After the
+separate v2.2.6 activation boundary it also covers the completeness import,
+all-owner-outcome release enforcement, real Codex and Claude harness proof,
+v0.6.1, CTAO, governed direct consumers, Decision Studio, headless product work,
+remaining plugin-independent frontend work, and the full consumer release gate.
+No populated outcome, private heartbeat content, or owner identity is stored in
+this shared ledger.
+
+## Authenticated host execution envelopes
+
+Release evidence is resolved only from an HMAC-authenticated native-host
+envelope stored outside candidate Git and verified with the canonical host
+controller key. Each command reference resolves exact UTF-8 metadata and log
+bytes and binds argv, working directory, executor role and typed Unknown
+identity, role-specific pre/post commit and tree, UTC timestamps, exit status,
+parsed test counts, evidence class, and allowed requirement identifiers. Any
+unresolved file, changed digest, signature mismatch, arbitrary identifier,
+wrong role, or artifact drift fails closed.
+
+Product unit or integration commands cannot satisfy independent exact-artifact
+acceptance. That row requires two distinct authenticated receipts for the same
+artifact: one semantic audit and one technical-security audit, each with an
+external report digest and an accepted decision. Until fresh audits exist, the
+row and artifact-acceptance gate remain Unknown.
+
 ## External owner authority
 
 Engineering validates host-owned approval and intent receipts. Candidate Git

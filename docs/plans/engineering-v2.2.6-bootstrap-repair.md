@@ -66,7 +66,7 @@ Validate the exact schema, `sha256:` digests, 40-hex source commit, version `2.2
 
 - [x] **Step 2: Route v2.2.6 installation through exactly one preflight**
 
-Require either the existing release-token/artifact pair or a bootstrap authorization for a v2.2.6 source, never both. Require the caller's bootstrap facts to equal the host-owned durable bootstrap record outside candidate Git, persist them in the v3 install receipt, and revalidate source/staged bundle digests before transactional publication.
+Require either the existing release-token/artifact pair or a bootstrap authorization for a v2.2.6 source, never both. Require the caller's bootstrap facts to equal the host-owned durable bootstrap record outside candidate Git, persist them in the v5 install receipt, and revalidate source/staged bundle digests before transactional publication. Release-token enforcement governs normal delivery after the one-time bootstrap; it is not a circular prerequisite for that bootstrap.
 
 - [x] **Step 3: Run bootstrap tests to verify green**
 

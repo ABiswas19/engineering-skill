@@ -4,7 +4,10 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import importlib.util
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -72,8 +75,14 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertFalse(unknown["gates"]["post_activation_ready"])
         self.assertTrue(unknown["unknowns"])
         with self.assertRaisesRegex(module.MatrixError, "authoritative requirement coverage"):
-            module._normalize_requirements(
-                {"schema": module.REQUIREMENTS_SCHEMA, "requirements": []}
+            module._normalize_registry(
+                {
+                    "schema": module.REQUIREMENTS_SCHEMA,
+                    "requirements": [],
+                    "obligations": json.loads(registry.read_text(encoding="utf-8"))[
+                        "obligations"
+                    ],
+                }
             )
 
         artifact_rows = [
@@ -81,53 +90,399 @@ class RepositoryContractTests(unittest.TestCase):
             for row in unknown["rows"]
             if row["gate"] == "artifact_acceptance"
         ]
-        def receipt(evidence_class: str) -> dict:
-            return {
-                "schema": module.EXECUTION_RECEIPT_SCHEMA,
+        requirement_ids = sorted(
+            row["requirement_id"]
+            for row in artifact_rows
+            if row["requirement_id"] != "independent_exact_artifact_acceptance"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            host_home = Path(temporary) / "host-home"
+            evidence_root = Path(temporary) / "native-evidence"
+            key_path = host_home / ".agents" / "engineering" / "controller" / "controller.key"
+            key_path.parent.mkdir(parents=True)
+            key = bytes.fromhex("42" * 32)
+            key_path.write_text(key.hex() + "\n", encoding="ascii")
+            evidence_root.mkdir()
+            log = evidence_root / "full.log"
+            log.write_text("Ran 1 test in 0.001s\n\nOK\n", encoding="utf-8")
+            meta = evidence_root / "full.meta.json"
+            meta_payload = {
+                "schema": module.NATIVE_EXECUTION_META_SCHEMA,
+                "command_id": "canonical-paired-gates",
+                "executor": {"role": "implementer", "identity": {"state": "unknown"}},
+                "artifact_before": unknown["artifact"],
+                "artifact_after": unknown["artifact"],
+                "role": role,
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(ROOT.resolve()),
+                "started_at": "2026-08-24T10:00:00+00:00",
+                "finished_at": "2026-08-24T10:01:00+00:00",
+                "exit_code": 0,
+                "parser": "python-unittest-v1",
+                "counts": {"run": 1, "failures": 0, "errors": 0, "skipped": 0},
+                "evidence_class": "real_outcome",
+                "requirement_ids": requirement_ids,
+            }
+            meta.write_text(json.dumps(meta_payload, sort_keys=True), encoding="utf-8")
+
+            def reference(path: Path) -> dict:
+                return {
+                    "path": path.relative_to(evidence_root).as_posix(),
+                    "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            envelope_payload = {
+                "schema": module.HOST_EXECUTION_ENVELOPE_SCHEMA,
+                "issuer": {
+                    "boundary_id": "native-host-controller",
+                    "key_id": "sha256:" + hashlib.sha256(key).hexdigest(),
+                    "identity": {"state": "unknown"},
+                },
                 "artifact": unknown["artifact"],
+                "evidence_root": str(evidence_root.resolve()),
                 "commands": [
                     {
                         "command_id": "canonical-paired-gates",
-                        "command": "python -m unittest",
-                        "started_at": "2026-08-24T10:00:00+00:00",
-                        "finished_at": "2026-08-24T10:01:00+00:00",
-                        "exit_code": 0,
-                        "counts": {
-                            "run": 1,
-                            "failures": 0,
-                            "errors": 0,
-                            "skipped": 0,
-                        },
-                        "evidence_class": evidence_class,
-                        "requirement_ids": [
-                            row["requirement_id"] for row in artifact_rows
-                        ],
-                        "stdout_digest": "sha256:" + "1" * 64,
-                        "stderr_digest": "sha256:" + "2" * 64,
+                        "meta": reference(meta),
+                        "log": reference(log),
                     }
                 ],
                 "incidents": [],
+                "audits": [],
             }
 
-        proxy_receipt = receipt("proxy")
-        proxy = module.generate_matrix(ROOT, role, proxy_receipt)
-        self.assertFalse(proxy["gates"]["artifact_acceptance_ready"])
-        self.assertTrue(proxy["proxy_rejections"])
+            def write_envelope(payload: dict) -> Path:
+                signed = dict(payload)
+                signed["signature"] = "hmac-sha256:" + hmac.new(
+                    key, module._canonical(payload), hashlib.sha256
+                ).hexdigest()
+                path = Path(temporary) / "host-execution-envelope.json"
+                path.write_text(json.dumps(signed, sort_keys=True), encoding="utf-8")
+                return path
 
-        exact_receipt = receipt("real_outcome")
-        malformed_incident = json.loads(json.dumps(exact_receipt))
-        malformed_incident["incidents"] = [{}]
-        with self.assertRaisesRegex(module.MatrixError, "incident receipt"):
-            module.generate_matrix(ROOT, role, malformed_incident)
-        exact = module.generate_matrix(ROOT, role, exact_receipt)
-        self.assertTrue(exact["gates"]["artifact_acceptance_ready"])
-        self.assertFalse(exact["gates"]["post_activation_ready"])
-        for row in exact["rows"]:
-            self.assertEqual(exact["artifact"], row["exact_artifact_identity"])
-            self.assertRegex(row["design_blob"], r"^sha256:[0-9a-f]{64}$")
-            self.assertRegex(row["contract_blob"], r"^sha256:[0-9a-f]{64}$")
-            self.assertRegex(row["negative_test_blob"], r"^sha256:[0-9a-f]{64}$")
-        self.assertEqual(exact["matrix_digest"], module.matrix_digest(exact))
+            envelope = write_envelope(envelope_payload)
+            with patch.object(module, "_canonical_host_home", return_value=host_home):
+                exact_without_audits = module.generate_matrix(ROOT, role, envelope)
+            independent = next(
+                row
+                for row in exact_without_audits["rows"]
+                if row["requirement_id"] == "independent_exact_artifact_acceptance"
+            )
+            self.assertEqual("unknown", independent["evidence_state"])
+            self.assertFalse(
+                exact_without_audits["gates"]["artifact_acceptance_ready"]
+            )
+
+            audit_references = []
+            for category in ("semantic", "technical_security"):
+                report = evidence_root / f"{category}.report.txt"
+                report.write_text("ACCEPT exact artifact\n", encoding="utf-8")
+                audit_meta = evidence_root / f"{category}.meta.json"
+                audit_meta.write_text(
+                    json.dumps(
+                        {
+                            "schema": module.INDEPENDENT_AUDIT_META_SCHEMA,
+                            "audit_id": f"audit-{category}",
+                            "category": category,
+                            "auditor": {
+                                "role": "independent_auditor",
+                                "principal_id": f"auditor-{category}",
+                                "identity": {"state": "unknown"},
+                            },
+                            "artifact": unknown["artifact"],
+                            "decision": "accepted",
+                            "issued_at": "2026-08-24T10:02:00+00:00",
+                            "report_digest": reference(report)["digest"],
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                audit_references.append(
+                    {
+                        "audit_id": f"audit-{category}",
+                        "meta": reference(audit_meta),
+                        "report": reference(report),
+                    }
+                )
+            accepted_payload = dict(envelope_payload)
+            accepted_payload["audits"] = audit_references
+            with patch.object(module, "_canonical_host_home", return_value=host_home):
+                accepted = module.generate_matrix(
+                    ROOT, role, write_envelope(accepted_payload)
+                )
+            self.assertTrue(accepted["gates"]["artifact_acceptance_ready"])
+            self.assertFalse(accepted["gates"]["post_activation_ready"])
+
+            unsigned = json.loads(envelope.read_text(encoding="utf-8"))
+            unsigned["signature"] = "hmac-sha256:" + "0" * 64
+            envelope.write_text(json.dumps(unsigned), encoding="utf-8")
+            with self.assertRaisesRegex(module.MatrixError, "authenticated"):
+                with patch.object(module, "_canonical_host_home", return_value=host_home):
+                    module.generate_matrix(ROOT, role, envelope)
+
+            for row in accepted["rows"]:
+                self.assertEqual(accepted["artifact"], row["exact_artifact_identity"])
+                self.assertRegex(row["design_blob"], r"^sha256:[0-9a-f]{64}$")
+                self.assertRegex(row["contract_blob"], r"^sha256:[0-9a-f]{64}$")
+                self.assertRegex(row["negative_test_blob"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(accepted["matrix_digest"], module.matrix_digest(accepted))
+
+    def test_v226_release_matrix_rejects_fabricated_native_evidence(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_matrix_negative", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
+        artifact = module.generate_matrix(ROOT, role, None)["artifact"]
+        with self.assertRaisesRegex(module.MatrixError, "host envelope path"):
+            module.generate_matrix(
+                ROOT,
+                role,
+                {
+                    "schema": module.HOST_EXECUTION_ENVELOPE_SCHEMA,
+                    "artifact": artifact,
+                    "evidence_class": "real_outcome",
+                    "requirement_ids": list(module.V226_REQUIRED_REQUIREMENTS),
+                },
+            )
+
+    def test_v226_incident_evidence_is_exact_and_role_bound(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_incident", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
+        artifact = module.generate_matrix(ROOT, role, None)["artifact"]
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_root = Path(temporary).resolve()
+            log = evidence_root / "incident.log"
+            log.write_text(
+                "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n",
+                encoding="utf-8",
+            )
+            meta = evidence_root / "incident.meta.json"
+            wrong_role = "public" if role == "internal" else "internal"
+            meta.write_text(
+                json.dumps(
+                    {
+                        "schema": module.NATIVE_INCIDENT_META_SCHEMA,
+                        "incident_id": "incident-wrong-role",
+                        "observed_at": "2026-08-24T10:00:00+00:00",
+                        "artifact": {**artifact, "role": wrong_role},
+                        "role": wrong_role,
+                        "executor": {"role": "implementer", "identity": {"state": "unknown"}},
+                        "argv": ["python", "-m", "unittest"],
+                        "cwd": str(ROOT.resolve()),
+                        "result": "failed",
+                        "exit_code": 1,
+                        "parser": "python-unittest-v1",
+                        "counts": {"run": 1, "failures": 1, "errors": 0, "skipped": 0},
+                        "evidence_state": "canonical_log",
+                        "reconciliation": {
+                            "state": "superseded_by_exact_artifact",
+                            "exact_artifact": artifact,
+                        },
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            reference = lambda path: {
+                "path": path.relative_to(evidence_root).as_posix(),
+                "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            with self.assertRaisesRegex(module.MatrixError, "role-bound"):
+                module._native_incident(
+                    ROOT,
+                    artifact,
+                    role,
+                    evidence_root,
+                    {
+                        "incident_id": "incident-wrong-role",
+                        "meta": reference(meta),
+                        "log": reference(log),
+                    },
+                )
+
+    def test_v226_requirement_registry_has_complete_generic_obligation_dag(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_obligations", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
+        )
+        requirements, obligations = module._normalize_registry(registry)
+        self.assertEqual(
+            set(module.V226_REQUIRED_REQUIREMENTS),
+            {row["id"] for row in requirements},
+        )
+        self.assertEqual(
+            tuple(module.V226_REQUIRED_OBLIGATIONS),
+            tuple(row["id"] for row in obligations),
+        )
+        required_categories = {
+            "graphify_overlay", "trace_coverage_impact_why", "setup_checkpoint_completion",
+            "authority_persistence", "maintenance", "semantic_matrices",
+            "capability_assurance", "learning", "v061_runtime", "ctao_api",
+            "headless_product", "consumer_integration", "decision_studio",
+            "native_harness", "project_identity", "measurement", "first_pass",
+            "false_acceptance", "graph_engineering", "readme", "langfuse_deferment",
+            "postactivation_completeness",
+        }
+        self.assertTrue(required_categories <= {row["category"] for row in obligations})
+        for row in obligations:
+            self.assertIn(row["disposition"]["state"], {"included", "deferred"})
+            self.assertTrue(row["acceptance_criteria"]["fail_closed"])
+        missing = json.loads(json.dumps(registry))
+        missing["obligations"].pop()
+        with self.assertRaisesRegex(module.MatrixError, "obligation coverage"):
+            module._normalize_registry(missing)
+
+    def test_v226_native_command_meta_and_log_tampering_fail_closed(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_native_tamper", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
+        artifact = module.generate_matrix(ROOT, role, None)["artifact"]
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_root = Path(temporary).resolve()
+            log = evidence_root / "command.log"
+            meta = evidence_root / "command.meta.json"
+            log.write_text("Ran 1 test in 0.001s\n\nOK\n", encoding="utf-8")
+            base = {
+                "schema": module.NATIVE_EXECUTION_META_SCHEMA,
+                "command_id": "exact-command",
+                "executor": {"role": "implementer", "identity": {"state": "unknown"}},
+                "artifact_before": artifact,
+                "artifact_after": artifact,
+                "role": role,
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(ROOT.resolve()),
+                "started_at": "2026-08-24T10:00:00+00:00",
+                "finished_at": "2026-08-24T10:01:00+00:00",
+                "exit_code": 0,
+                "parser": "python-unittest-v1",
+                "counts": {"run": 1, "failures": 0, "errors": 0, "skipped": 0},
+                "evidence_class": "integration",
+                "requirement_ids": ["authenticated_execution_envelopes"],
+            }
+            def reference(path: Path) -> dict:
+                return {
+                    "path": path.relative_to(evidence_root).as_posix(),
+                    "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            def command_reference() -> dict:
+                return {
+                    "command_id": "exact-command",
+                    "meta": reference(meta),
+                    "log": reference(log),
+                }
+            meta.write_text(json.dumps(base, sort_keys=True), encoding="utf-8")
+            original_meta_reference = reference(meta)
+            module._native_command(
+                ROOT,
+                artifact,
+                role,
+                evidence_root,
+                command_reference(),
+                set(module.V226_REQUIRED_REQUIREMENTS),
+            )
+            original_log_reference = reference(log)
+            log.write_text("substituted\n", encoding="utf-8")
+            with self.assertRaisesRegex(module.MatrixError, "digest"):
+                module._native_command(
+                    ROOT,
+                    artifact,
+                    role,
+                    evidence_root,
+                    {
+                        "command_id": "exact-command",
+                        "meta": reference(meta),
+                        "log": original_log_reference,
+                    },
+                    set(module.V226_REQUIRED_REQUIREMENTS),
+                )
+            log.write_text("Ran 1 test in 0.001s\n\nOK\n", encoding="utf-8")
+            mutations = [
+                {"cwd": str(evidence_root)},
+                {"role": "public" if role == "internal" else "internal"},
+                {"argv": ["python", "different.py"]},
+                {"artifact_before": {**artifact, "commit": "0" * 40}},
+                {"artifact_after": {**artifact, "tree": "0" * 40}},
+            ]
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    changed = {**base, **mutation}
+                    meta.write_text(json.dumps(changed, sort_keys=True), encoding="utf-8")
+                    with self.assertRaisesRegex(module.MatrixError, "digest"):
+                        module._native_command(
+                            ROOT,
+                            artifact,
+                            role,
+                            evidence_root,
+                            {
+                                "command_id": "exact-command",
+                                "meta": original_meta_reference,
+                                "log": reference(log),
+                            },
+                            set(module.V226_REQUIRED_REQUIREMENTS),
+                        )
+            fabricated = {**base, "requirement_ids": ["fabricated_requirement"]}
+            meta.write_text(json.dumps(fabricated, sort_keys=True), encoding="utf-8")
+            with self.assertRaisesRegex(module.MatrixError, "authenticated native"):
+                module._native_command(
+                    ROOT,
+                    artifact,
+                    role,
+                    evidence_root,
+                    command_reference(),
+                    set(module.V226_REQUIRED_REQUIREMENTS),
+                )
+
+    def test_v226_internal_plans_receipt_docs_and_utf8_are_truthful(self) -> None:
+        if not (ROOT / "release" / "audience-classification.json").is_file():
+            self.skipTest("internal-only classification contract")
+        audience = json.loads(
+            (ROOT / "release" / "audience-classification.json").read_text(encoding="utf-8")
+        )
+        shared = set(
+            json.loads((ROOT / "release" / "public-export.json").read_text(encoding="utf-8"))[
+                "files"
+            ]
+        )
+        classified = shared | set(audience["internal_only"]) | set(audience["public_only"]) | set(
+            audience["audience_specific"]
+        )
+        tracked = subprocess.check_output(
+            ["git", "-C", str(ROOT), "ls-files", "docs/plans", "docs/superpowers/plans"],
+            text=True,
+            encoding="utf-8",
+        ).splitlines()
+        self.assertEqual([], sorted(set(tracked) - classified))
+        receipt_doc = (
+            ROOT / "docs" / "specs" / "engineering-v2.2.6-owner-intent-audit-repair.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("engineering.install.v5", receipt_doc)
+        self.assertIn("after the one-time bootstrap", receipt_doc)
+        self.assertNotIn("retained as `engineering.install.v4`", receipt_doc)
+        for relative in sorted(subprocess.check_output(
+            ["git", "-C", str(ROOT), "ls-files"], text=True, encoding="utf-8"
+        ).splitlines()):
+            path = ROOT / relative
+            try:
+                content = path.read_bytes()
+                text = content.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            self.assertFalse(content.startswith(b"\xef\xbb\xbf"), relative)
+            self.assertTrue(text.endswith("\n"), relative)
+            self.assertFalse(text.endswith("\n\n"), relative)
+            self.assertFalse(
+                any(line.endswith((" ", "\t")) for line in text.splitlines()), relative
+            )
 
     def test_release_manifest_is_v2_2_6_with_owner_intent_gate(self) -> None:
         manifest = json.loads((SKILL_ROOT / "manifest.json").read_text(encoding="utf-8"))

@@ -9945,6 +9945,98 @@ class Task7ContractTests(unittest.TestCase):
         self.assertTrue(forced_late_failure)
         self.assertEqual(1, restore_attempts)
 
+    def test_transaction_cleanup_preserves_a_substituted_published_target(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-published-target"
+        stage = root / "stage"
+        target = root / "target"
+        stage.mkdir(parents=True)
+        (stage / "payload.txt").write_text("authorized\n", encoding="utf-8")
+
+        def substitute_then_fail():
+            shutil.rmtree(target)
+            target.mkdir()
+            (target / "substitute.txt").write_text("must survive\n", encoding="utf-8")
+            raise OSError("synthetic later publication failure")
+
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
+            module._transactional_replace(
+                [(stage, target)],
+                "1" * 32,
+                after_publication=substitute_then_fail,
+            )
+
+        self.assertEqual(
+            "must survive\n",
+            (target / "substitute.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_transaction_rejects_a_preexisting_backup_without_deleting_it(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-backup-target"
+        stage = root / "stage"
+        target = root / "target"
+        backup = root / (".target.backup-" + "2" * 32)
+        stage.mkdir(parents=True)
+        target.mkdir()
+        backup.mkdir()
+        (stage / "payload.txt").write_text("new\n", encoding="utf-8")
+        (target / "payload.txt").write_text("old\n", encoding="utf-8")
+        (backup / "substitute.txt").write_text("must survive\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
+            module._transactional_replace([(stage, target)], "2" * 32)
+
+        self.assertEqual(
+            "must survive\n",
+            (backup / "substitute.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_transaction_cleanup_preserves_a_substituted_stage(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-stage-target"
+        stage = root / "stage"
+        target = root / "target"
+        stage.mkdir(parents=True)
+        (stage / "payload.txt").write_text("authorized\n", encoding="utf-8")
+
+        def substitute_stage_after_publication():
+            stage.mkdir()
+            (stage / "substitute.txt").write_text("must survive\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
+            module._transactional_replace(
+                [(stage, target)],
+                "3" * 32,
+                after_publication=substitute_stage_after_publication,
+            )
+
+        self.assertEqual(
+            "must survive\n",
+            (stage / "substitute.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_install_removal_revalidates_lexical_reparse_ancestors(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-reparse"
+        target = root / "target"
+        target.mkdir(parents=True)
+        (target / "payload.txt").write_text("must survive\n", encoding="utf-8")
+        expected = module._install_path_state(target)
+
+        with (
+            patch.object(
+                module,
+                "_reject_reparse_ancestors",
+                side_effect=module.EngineeringError("synthetic reparse ancestor"),
+            ) as reject,
+            self.assertRaisesRegex(module.EngineeringError, "reparse ancestor"),
+        ):
+            module._remove_install_path(target, expected)
+
+        reject.assert_called()
+        self.assertTrue(target.exists())
+
     def test_every_late_install_publication_failure_restores_exact_state(self):
         module = self.module()
         for index, key in enumerate(("claude", "shim", "command", "receipt", "previous", "previous_receipt")):
@@ -10830,7 +10922,7 @@ class Task7ContractTests(unittest.TestCase):
             )
         self.assertEqual("concurrent\n", target.read_text(encoding="utf-8"))
 
-    def test_post_publication_verification_failure_restores_exact_preimage(self):
+    def test_post_publication_verification_failure_preserves_concurrent_substitution(self):
         module = self.module()
         root = self.init_repo("setup-post-publication-rollback")
         target = root / "managed-hook"
@@ -10844,19 +10936,16 @@ class Task7ContractTests(unittest.TestCase):
             target.write_bytes(b"#!/bin/sh\nprintf tampered\n")
             raise module.EngineeringError("synthetic post-publication mismatch")
 
-        with self.assertRaisesRegex(
-            module.EngineeringError, "post-publication mismatch"
-        ):
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
             module._transactional_replace(
                 [(stage, target)],
                 "post-publication-test",
                 {target: expected},
                 after_publication=fail_verification,
             )
-        self.assertEqual(original, target.read_bytes())
-        self.assertFalse(
-            target.with_name(".managed-hook.backup-post-publication-test").exists()
-        )
+        self.assertEqual(b"#!/bin/sh\nprintf tampered\n", target.read_bytes())
+        backup = target.with_name(".managed-hook.backup-post-publication-test")
+        self.assertEqual(original, backup.read_bytes())
 
     def test_project_document_cas_preserves_concurrent_instruction_change(self):
         module = self.module()

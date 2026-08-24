@@ -140,11 +140,17 @@ enforce the owner decision without changing those lanes now.
 ## Recovery and compatibility
 
 The v2.2.5 installed receipt and rollback bundle remain untouched. New
-bootstrap receipts are retained as `engineering.install.v4` and carry only the
-equality-bound host-record reference; legacy `engineering.install.v3` receipts
+bootstrap receipts are retained as `engineering.install.v5` and carry the
+equality-bound host-record reference plus the exact source commit, tree, and
+digest; legacy `engineering.install.v3` and `engineering.install.v4` receipts
 remain readable historical evidence. Every new receipt must reconcile the
 actual copied bundle. A failure before publication leaves no new install
 surface; transaction rollback retains the known-good prior bundle. A missing
 or malformed host authority anchor after activation results in `Unknown` and
 blocks only new owner-intent admissions and dependent release work. It does not
 rewrite historical evidence or manufacture a replacement authority.
+
+Release-token enforcement applies after the one-time bootstrap has activated
+v2.2.6. The bootstrap itself remains governed by installed v2.2.5, the recorded
+owner decision, and distinct exact-artifact audits; it does not require or mint
+its own future release token.

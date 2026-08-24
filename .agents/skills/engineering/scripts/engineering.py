@@ -15278,9 +15278,19 @@ def _tree_digest(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _remove_install_path(path: Path) -> None:
-    if not path.exists():
+def _remove_install_path(path: Path, expected_state: dict) -> None:
+    """Remove only the exact lexical install object the caller observed.
+
+    Cleanup is a destructive publication effect, not best-effort hygiene.  It
+    therefore uses the same exact/absent preimage contract as replacement and
+    rechecks lexical ancestors immediately before deletion.
+    """
+    _reject_reparse_ancestors(path)
+    _verify_install_path_state(path, expected_state)
+    if not expected_state.get("exists"):
         return
+    _reject_reparse_ancestors(path)
+    _verify_install_path_state(path, expected_state)
     if path.is_symlink() or _is_reparse_point(path):
         raise EngineeringError("Engineering install path is a link/reparse point.")
     if path.is_dir():
@@ -16599,12 +16609,13 @@ def _transactional_replace(
         for _, target in replacements
     }
     stage_states = {stage: _install_path_state(stage) for stage, _ in replacements}
+    published_stages: set[Path] = set()
     completed = False
     try:
         for stage, target in replacements:
             target.parent.mkdir(parents=True, exist_ok=True)
             backup = backups[target]
-            _remove_install_path(backup)
+            _remove_install_path(backup, absent)
             expected = target_states[target]
             if os.path.lexists(target):
                 if _is_reparse_point(target):
@@ -16622,6 +16633,7 @@ def _transactional_replace(
                     expected_source_state=stage_states[stage],
                     expected_target_state=absent,
                 )
+                published_stages.add(stage)
             else:
                 _replace_install_path(
                     stage,
@@ -16629,13 +16641,15 @@ def _transactional_replace(
                     expected_source_state=stage_states[stage],
                     expected_target_state=expected,
                 )
+                published_stages.add(stage)
             published.append(target)
         if after_publication is not None:
             after_publication()
         completed = True
     except Exception:
         for target in reversed(published):
-            _remove_install_path(target)
+            stage = next(item for item, destination in replacements if destination == target)
+            _remove_install_path(target, stage_states[stage])
         for target in reversed(backed_up):
             backup = backups[target]
             if backup.exists() and not os.path.lexists(target):
@@ -16646,14 +16660,19 @@ def _transactional_replace(
                     expected_target_state=absent,
                 )
             elif backup.exists():
-                _remove_install_path(backup)
+                raise EngineeringError(
+                    f"Engineering target changed before publication: {target}"
+                )
         raise
     finally:
         for stage, _ in replacements:
-            _remove_install_path(stage)
+            _remove_install_path(
+                stage,
+                absent if stage in published_stages else stage_states[stage],
+            )
         if completed:
-            for backup in backups.values():
-                _remove_install_path(backup)
+            for target, backup in backups.items():
+                _remove_install_path(backup, target_states[target])
 
 
 def _expand_install_path(value: Path | str) -> Path:
@@ -16789,6 +16808,15 @@ def install_bundle(
         if key in {"canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"}
     }
     stages = {key: path.with_name(path.name.replace(".backup-", ".stage-")) for key, path in stages.items()}
+    absent_install_state = {
+        "exists": False,
+        "kind": "absent",
+        "bytes_hex": None,
+        "sha256": None,
+        "mode": None,
+    }
+    staged_cleanup_states: dict[Path, dict] = {}
+    transaction_started = False
     try:
         install_key = _install_key(home)
         current = _load_install_receipt(paths["receipt"], install_key)
@@ -16822,7 +16850,7 @@ def install_bundle(
         elif any(paths[key].exists() for key in ("canonical", "previous", "previous_receipt")):
             raise EngineeringError("Engineering install state is incomplete.")
         for path in stages.values():
-            _remove_install_path(path)
+            _remove_install_path(path, absent_install_state)
         _copy_bundle(
             source,
             stages["canonical"],
@@ -16832,15 +16860,19 @@ def install_bundle(
             if isinstance(bundle_snapshot, BundleSnapshot)
             else None,
         )
+        staged_cleanup_states[stages["canonical"]] = _install_path_state(stages["canonical"])
         stages["claude"].mkdir(parents=True)
         (stages["claude"] / "SKILL.md").write_text(
             _forwarder("engineering"), encoding="utf-8", newline="\n"
         )
+        staged_cleanup_states[stages["claude"]] = _install_path_state(stages["claude"])
         stages["shim"].mkdir(parents=True)
         (stages["shim"] / "SKILL.md").write_text(
             _forwarder("engineering-traceability"), encoding="utf-8", newline="\n"
         )
+        staged_cleanup_states[stages["shim"]] = _install_path_state(stages["shim"])
         _write_command_launchers(stages["command"])
+        staged_cleanup_states[stages["command"]] = _install_path_state(stages["command"])
         parity = _validated_installed_bundle(stages["canonical"])
         if _tree_digest(stages["canonical"]) != source_digest:
             raise EngineeringError(
@@ -16865,15 +16897,21 @@ def install_bundle(
         receipt = _sign_install_receipt(receipt_payload, install_key)
         stages["receipt"].parent.mkdir(parents=True, exist_ok=True)
         stages["receipt"].write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        staged_cleanup_states[stages["receipt"]] = _install_path_state(stages["receipt"])
         replacements = [
             (stages[key], paths[key]) for key in ("canonical", "claude", "shim", "command", "receipt")
         ]
         if current is not None:
             shutil.copytree(paths["canonical"], stages["previous"])
+            staged_cleanup_states[stages["previous"]] = _install_path_state(stages["previous"])
             stages["previous_receipt"].write_bytes(paths["receipt"].read_bytes())
+            staged_cleanup_states[stages["previous_receipt"]] = _install_path_state(
+                stages["previous_receipt"]
+            )
             replacements.extend(
                 (stages[key], paths[key]) for key in ("previous", "previous_receipt")
             )
+        transaction_started = True
         _transactional_replace(
             replacements,
             token,
@@ -16888,8 +16926,9 @@ def install_bundle(
             **({"release_gate": release_gate} if release_gate is not None else {}),
         }
     finally:
-        for path in stages.values():
-            _remove_install_path(path)
+        if not transaction_started:
+            for path, expected_state in staged_cleanup_states.items():
+                _remove_install_path(path, expected_state)
         _release_directory_lock(paths["lock"], lock_owner)
 
 
@@ -16910,6 +16949,8 @@ def rollback_install(home: Path) -> dict:
         for key, path in paths.items()
         if key in {"canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"}
     }
+    staged_cleanup_states: dict[Path, dict] = {}
+    transaction_started = False
     try:
         install_key = _install_key(home)
         current = _load_install_receipt(paths["receipt"], install_key)
@@ -16922,13 +16963,17 @@ def rollback_install(home: Path) -> dict:
         except EngineeringError as error:
             raise EngineeringError("Engineering known-good rollback bundle is invalid.") from error
         shutil.copytree(paths["previous"], stages["canonical"])
+        staged_cleanup_states[stages["canonical"]] = _install_path_state(stages["canonical"])
         shutil.copytree(paths["canonical"], stages["previous"])
+        staged_cleanup_states[stages["previous"]] = _install_path_state(stages["previous"])
         for key, name in (("claude", "engineering"), ("shim", "engineering-traceability")):
             stages[key].mkdir(parents=True)
             (stages[key] / "SKILL.md").write_text(
                 _forwarder(name), encoding="utf-8", newline="\n"
             )
+            staged_cleanup_states[stages[key]] = _install_path_state(stages[key])
         _write_command_launchers(stages["command"])
+        staged_cleanup_states[stages["command"]] = _install_path_state(stages["command"])
         restored = _sign_install_receipt({
             **previous,
             "status": "rolled_back",
@@ -16937,9 +16982,14 @@ def rollback_install(home: Path) -> dict:
             "claude_parity_hash": parity,
         }, install_key)
         stages["receipt"].write_text(json.dumps(restored, indent=2) + "\n", encoding="utf-8")
+        staged_cleanup_states[stages["receipt"]] = _install_path_state(stages["receipt"])
         stages["previous_receipt"].write_text(
             json.dumps(current, indent=2) + "\n", encoding="utf-8"
         )
+        staged_cleanup_states[stages["previous_receipt"]] = _install_path_state(
+            stages["previous_receipt"]
+        )
+        transaction_started = True
         _transactional_replace(
             [(stages[key], paths[key]) for key in (
                 "canonical", "previous", "claude", "shim", "command", "receipt", "previous_receipt"
@@ -16948,8 +16998,9 @@ def rollback_install(home: Path) -> dict:
         )
         return restored
     finally:
-        for path in stages.values():
-            _remove_install_path(path)
+        if not transaction_started:
+            for path, expected_state in staged_cleanup_states.items():
+                _remove_install_path(path, expected_state)
         _release_directory_lock(paths["lock"], lock_owner)
 
 
