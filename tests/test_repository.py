@@ -98,7 +98,7 @@ class RepositoryContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             host_home = Path(temporary) / "host-home"
             evidence_root = Path(temporary) / "native-evidence"
-            key_path = host_home / ".agents" / "engineering" / "controller" / "controller.key"
+            key_path = host_home / ".agents" / "engineering" / "controller" / "attestation.key"
             key_path.parent.mkdir(parents=True)
             key = bytes.fromhex("42" * 32)
             key_path.write_text(key.hex() + "\n", encoding="ascii")

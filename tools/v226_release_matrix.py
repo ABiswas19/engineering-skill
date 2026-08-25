@@ -483,7 +483,7 @@ def _host_execution_envelope(
     host = _canonical_host_home()
     if not host.is_absolute() or ".." in host.parts:
         raise MatrixError("host envelope authentication is unavailable")
-    key_path = host / ".agents" / "engineering" / "controller" / "controller.key"
+    key_path = host / ".agents" / "engineering" / "controller" / "attestation.key"
     key_bytes = _external_bytes(repository, key_path, "host controller key")
     try:
         key = bytes.fromhex(key_bytes.decode("ascii").strip())
