@@ -2499,20 +2499,36 @@ Residual risk: No repository-supported vulnerability intake is available.
                 capture_output=True,
             )
             results = []
-            for name, autocrlf in (("lf", "false"), ("crlf", "true")):
-                source = base / f"source-{name}"
-                destination = base / f"public-{name}"
-                subprocess.run(
-                    ["git", "-c", f"core.autocrlf={autocrlf}", "clone", str(origin), str(source)],
-                    check=True,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    ["git", "init", "--initial-branch=main", str(destination)],
-                    check=True,
-                    capture_output=True,
-                )
-                results.append((module.export_tree(source, destination), destination))
+            isolated_git_config = base / "empty.gitconfig"
+            isolated_git_config.write_text("", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "GIT_CONFIG_GLOBAL": str(isolated_git_config),
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                },
+            ):
+                for name, autocrlf in (("lf", "false"), ("crlf", "true")):
+                    source = base / f"source-{name}"
+                    destination = base / f"public-{name}"
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "--config",
+                            f"core.autocrlf={autocrlf}",
+                            str(origin),
+                            str(source),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "init", "--initial-branch=main", str(destination)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    results.append((module.export_tree(source, destination), destination))
             self.assertNotEqual(
                 (base / "source-lf" / "README.md").read_bytes(),
                 (base / "source-crlf" / "README.md").read_bytes(),
