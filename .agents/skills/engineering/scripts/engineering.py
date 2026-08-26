@@ -15283,7 +15283,8 @@ def _tree_digest(path: Path) -> str:
                 len(relative_path.parts) == 3
                 and candidate.is_file()
                 and re.fullmatch(
-                    r"engineering(?:\.[A-Za-z0-9_-]+)?\.pyc",
+                    r"(?:engineering|engineering_host_boundary)"
+                    r"(?:\.[A-Za-z0-9_-]+)?\.pyc",
                     relative_path.name,
                 )
             ):
@@ -16572,6 +16573,11 @@ def _verify_install_path_state(path: Path, expected: dict | None) -> None:
         raise EngineeringError(f"Engineering target changed before publication: {path}")
 
 
+def _install_replace_retry_delays() -> tuple[float, ...]:
+    """Return the bounded native retry policy without changing path semantics."""
+    return (0.05, 0.1, 0.2, 0.4, 0.8) if os.name == "nt" else ()
+
+
 def _replace_install_path(
     source: Path,
     target: Path,
@@ -16589,7 +16595,7 @@ def _replace_install_path(
 
     # Antivirus and indexers can briefly retain Windows directory handles. Keep
     # retries bounded and compare-and-swap safe rather than weakening atomicity.
-    retry_delays = (0.05, 0.1, 0.2, 0.4, 0.8) if os.name == "nt" else ()
+    retry_delays = _install_replace_retry_delays()
     for delay in (*retry_delays, None):
         verify_pre_state()
         try:

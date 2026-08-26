@@ -9032,16 +9032,39 @@ class Task7ContractTests(unittest.TestCase):
         origin = origin_source.parents[2]
         lf_root = Path(self.temporary_directory.name) / "bundle-object-eol-lf"
         crlf_root = Path(self.temporary_directory.name) / "bundle-object-eol-crlf"
-        subprocess.run(
-            ["git", "-c", "core.autocrlf=false", "clone", str(origin), str(lf_root)],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "-c", "core.autocrlf=true", "clone", str(origin), str(crlf_root)],
-            check=True,
-            capture_output=True,
-        )
+        isolated_git_config = Path(self.temporary_directory.name) / "empty.gitconfig"
+        isolated_git_config.write_text("", encoding="utf-8")
+        with patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_GLOBAL": str(isolated_git_config),
+                "GIT_CONFIG_NOSYSTEM": "1",
+            },
+        ):
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--config",
+                    "core.autocrlf=false",
+                    str(origin),
+                    str(lf_root),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--config",
+                    "core.autocrlf=true",
+                    str(origin),
+                    str(crlf_root),
+                ],
+                check=True,
+                capture_output=True,
+            )
         lf_source = lf_root / ".agents" / "skills" / "engineering"
         crlf_source = crlf_root / ".agents" / "skills" / "engineering"
         self.assertNotEqual(
@@ -9368,6 +9391,9 @@ class Task7ContractTests(unittest.TestCase):
         cache = canonical / "scripts" / "__pycache__"
         cache.mkdir()
         (cache / "engineering.cpython-312.pyc").write_bytes(b"generated")
+        (cache / "engineering_host_boundary.cpython-312.pyc").write_bytes(
+            b"generated host boundary"
+        )
 
         self.assertEqual(
             receipt["codex_parity_hash"],
@@ -9821,7 +9847,7 @@ class Task7ContractTests(unittest.TestCase):
             return real_replace(observed_source, observed_target)
 
         with (
-            patch.object(module.os, "name", "nt"),
+            patch.object(module, "_install_replace_retry_delays", return_value=(0.0,)),
             patch.object(module.os, "replace", side_effect=transient_once),
             patch.object(module.time, "sleep") as sleep,
         ):
@@ -9839,6 +9865,53 @@ class Task7ContractTests(unittest.TestCase):
 
         self.assertEqual(2, len(attempts))
         sleep.assert_called_once()
+        self.assertEqual("exact\n", (target / "payload.txt").read_text(encoding="utf-8"))
+
+    def test_atomic_publish_retry_policy_is_injected_without_path_flavour_mutation(self):
+        """Windows retry coverage must not replace the host pathlib flavour."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "portable-retry-source"
+        target = Path(self.temporary_directory.name) / "portable-retry-target"
+        source.mkdir()
+        (source / "payload.txt").write_text("exact\n", encoding="utf-8")
+        real_replace = module.os.replace
+        attempts = 0
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+
+        def transient_once(observed_source, observed_target):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise denied
+            return real_replace(observed_source, observed_target)
+
+        try:
+            with (
+                patch.object(module.os, "name", "posix"),
+                patch.object(
+                    module,
+                    "_install_replace_retry_delays",
+                    return_value=(0.0,),
+                ),
+                patch.object(module.os, "replace", side_effect=transient_once),
+                patch.object(module.time, "sleep"),
+            ):
+                module._replace_install_path(
+                    source,
+                    target,
+                    {
+                        "exists": False,
+                        "kind": "absent",
+                        "bytes_hex": None,
+                        "sha256": None,
+                        "mode": None,
+                    },
+                )
+        except PermissionError:
+            self.fail("retry policy must be injectable without changing pathlib semantics")
+
+        self.assertEqual(2, attempts)
         self.assertEqual("exact\n", (target / "payload.txt").read_text(encoding="utf-8"))
 
     def test_windows_atomic_publish_retry_revalidates_the_preimage(self):
@@ -9860,7 +9933,7 @@ class Task7ContractTests(unittest.TestCase):
             self.fail("changed publication target must be rejected before retry")
 
         with (
-            patch.object(module.os, "name", "nt"),
+            patch.object(module, "_install_replace_retry_delays", return_value=(0.0,)),
             patch.object(module.os, "replace", side_effect=substitute_target),
             patch.object(module.time, "sleep"),
             self.assertRaisesRegex(module.EngineeringError, "target changed"),
@@ -9909,7 +9982,7 @@ class Task7ContractTests(unittest.TestCase):
             return real_replace(observed_source, observed_target)
 
         with (
-            patch.object(module.os, "name", "nt"),
+            patch.object(module, "_install_replace_retry_delays", return_value=(0.0,)),
             patch.object(module.os, "replace", side_effect=substitute_existing_install),
             patch.object(module.time, "sleep"),
             self.assertRaisesRegex(module.EngineeringError, "target changed"),
@@ -9961,7 +10034,7 @@ class Task7ContractTests(unittest.TestCase):
             return real_replace(observed_source, observed_target)
 
         with (
-            patch.object(module.os, "name", "nt"),
+            patch.object(module, "_install_replace_retry_delays", return_value=(0.0,)),
             patch.object(module.os, "replace", side_effect=substitute_restoration_target),
             patch.object(module.time, "sleep"),
             self.assertRaisesRegex(module.EngineeringError, "target changed"),

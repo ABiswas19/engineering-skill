@@ -1221,13 +1221,21 @@ class RepositoryContractTests(unittest.TestCase):
         )
         self.assertIn("matrix:\n        os: [ubuntu-latest, windows-latest]", workflow)
         self.assertIn(
-            "python -m unittest discover -s .agents/skills/engineering/tests",
+            "python -B -m unittest discover -s tests",
+            workflow,
+        )
+        self.assertIn(
+            "python -B -m unittest discover -s .agents/skills/engineering/tests",
             workflow,
         )
         self.assertIn("if: runner.os == 'Windows'", workflow)
         self.assertIn(
             "Task7ContractTests."
             "test_temporary_home_install_replay_and_rollback_do_not_mutate_windows_path",
+            workflow,
+        )
+        self.assertIn(
+            "python -B .agents/skills/engineering/tests/test_engineering.py",
             workflow,
         )
         self.assertIn("permissions:\n  contents: read", workflow)
