@@ -2,6 +2,7 @@ import importlib.util
 import ast
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -79,6 +80,13 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
             identity = engineering._interpreter_identity(Path(temporary).resolve(), alias)
 
         self.assertEqual(str(Path(sys.executable).resolve()), identity["path"])
+
+    def test_fake_graphify_fixture_uses_a_copied_interpreter(self):
+        """The Linux fixture must survive canonical interpreter resolution."""
+        source = inspect.getsource(
+            Task2ContractTests.start_fake_graphify_interpreter
+        )
+        self.assertIn('"--copies"', source)
 
     @unittest.skipUnless(os.name == "nt", "Windows ACL transport only")
     def test_windows_owner_private_directory_is_idempotent_for_task_approval(self):
@@ -171,6 +179,18 @@ class SkillShapeTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, contract)
 
+    def test_authority_docs_mark_the_candidate_git_anchor_as_superseded(self):
+        root = Path(__file__).resolve().parents[4]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        authority = (
+            root / "docs" / "specs" / "engineering-v2.2.4-authority-persistence.md"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("live canonical remote default", readme)
+        self.assertIn("host-owned", readme)
+        self.assertNotIn("allowed signer is pinned in the governed repository", authority)
+        self.assertIn("Superseded trust transport", authority)
+        self.assertIn("outside candidate Git", authority)
+
     def test_portable_policy_and_scenarios_are_executable_contracts(self):
         scenario_payload = json.loads(SCENARIOS.read_text(encoding="utf-8"))
         scenarios = {
@@ -190,7 +210,7 @@ class SkillShapeTests(unittest.TestCase):
         behavior = {
             "seed-feedback-scope": (
                 Task5ContractTests,
-                ("test_seed_feedback_scope_handoff_uses_signed_approval_and_completion",),
+                ("test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown",),
             ),
             "traceability-debt-maintenance": (
                 Task6ContractTests,
@@ -208,8 +228,8 @@ class SkillShapeTests(unittest.TestCase):
                     "test_material_replacement_rejects_candidate_local_success_without_equivalence",
                     "test_outcome_survival_lists_each_missing_baseline_mapping",
                     "test_unmanaged_material_redesign_is_advisory_and_never_accepted",
-                    "test_managed_material_redesign_blocks_with_exact_mapping_boundary",
-                    "test_seed_feedback_scope_handoff_uses_signed_approval_and_completion",
+                    "test_managed_material_redesign_without_owner_intent_blocks_with_external_boundary",
+                    "test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown",
                 ),
             ),
         }
@@ -259,13 +279,7 @@ class Task2ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -510,20 +524,27 @@ class Task2ContractTests(unittest.TestCase):
         (package / "__init__.py").write_text("", encoding="utf-8")
         (package / "__main__.py").write_text(
             "import json, os, pathlib, subprocess, sys\n"
+            "control_path = pathlib.Path(__file__).with_name('fixture-controls.json')\n"
+            "try:\n"
+            "    controls = json.loads(control_path.read_text(encoding='utf-8'))\n"
+            "except (OSError, json.JSONDecodeError):\n"
+            "    controls = {}\n"
+            "def control(name):\n"
+            "    return controls.get(name) or os.environ.get(name)\n"
             "if '--help' in sys.argv:\n"
             "    print('  update PATH\\n  query TEXT\\n  path A B\\n  explain X')\n"
             "elif len(sys.argv) > 1 and sys.argv[1] == 'query':\n"
             "    print('No matching nodes found.')\n"
             "elif len(sys.argv) > 2 and sys.argv[1] == 'update':\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_RECORD'):\n"
-            "        pathlib.Path(os.environ['FAKE_GRAPHIFY_RECORD']).open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_SLOW'):\n"
-            "        __import__('time').sleep(float(os.environ['FAKE_GRAPHIFY_SLOW']))\n"
+            "    if control('FAKE_GRAPHIFY_RECORD'):\n"
+            "        pathlib.Path(control('FAKE_GRAPHIFY_RECORD')).open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "    if control('FAKE_GRAPHIFY_SLOW'):\n"
+            "        __import__('time').sleep(float(control('FAKE_GRAPHIFY_SLOW')))\n"
             "    out = pathlib.Path(os.environ['GRAPHIFY_OUT'])\n"
             "    out.mkdir(parents=True, exist_ok=True)\n"
             "    commit = subprocess.run(['git', '-C', sys.argv[2], 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()\n"
             "    (out / 'graph.json').write_text(json.dumps({'directed': True, 'multigraph': False, 'graph': {}, 'nodes': [], 'links': [], 'built_at_commit': commit}))\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_FAIL'):\n"
+            "    if control('FAKE_GRAPHIFY_FAIL'):\n"
             "        raise SystemExit(7)\n"
             "else:\n"
             "    raise SystemExit(3)\n",
@@ -535,21 +556,28 @@ class Task2ContractTests(unittest.TestCase):
         )
         (package / "watch.py").write_text(
             "import json, os, pathlib, subprocess, sys, time\n"
+            "control_path = pathlib.Path(__file__).with_name('fixture-controls.json')\n"
+            "try:\n"
+            "    controls = json.loads(control_path.read_text(encoding='utf-8'))\n"
+            "except (OSError, json.JSONDecodeError):\n"
+            "    controls = {}\n"
+            "def control(name):\n"
+            "    return controls.get(name) or os.environ.get(name)\n"
             "def _rebuild_code(watch_path, *, changed_paths=None, follow_symlinks=False, force=False, no_cluster=False, acquire_lock=True, block_on_lock=False):\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_RECORD'):\n"
-            "        pathlib.Path(os.environ['FAKE_GRAPHIFY_RECORD']).open('a', encoding='utf-8').write(json.dumps(['private_rebuild_code', str(pathlib.Path.cwd()), *[str(p) for p in (changed_paths or [])]]) + '\\n')\n"
-            "    if os.environ.get('FAKE_GRAPHIFY_SLOW'):\n"
-            "        if os.environ.get('FAKE_GRAPHIFY_CHILD_PID'):\n"
+            "    if control('FAKE_GRAPHIFY_RECORD'):\n"
+            "        pathlib.Path(control('FAKE_GRAPHIFY_RECORD')).open('a', encoding='utf-8').write(json.dumps(['private_rebuild_code', str(pathlib.Path.cwd()), *[str(p) for p in (changed_paths or [])]]) + '\\n')\n"
+            "    if control('FAKE_GRAPHIFY_SLOW'):\n"
+            "        if control('FAKE_GRAPHIFY_CHILD_PID'):\n"
             "            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
-            "            pathlib.Path(os.environ['FAKE_GRAPHIFY_CHILD_PID']).write_text(str(child.pid))\n"
-            "        time.sleep(float(os.environ['FAKE_GRAPHIFY_SLOW']))\n"
+            "            pathlib.Path(control('FAKE_GRAPHIFY_CHILD_PID')).write_text(str(child.pid))\n"
+            "        time.sleep(float(control('FAKE_GRAPHIFY_SLOW')))\n"
             "    out = pathlib.Path(os.environ['GRAPHIFY_OUT'])\n"
             "    out.mkdir(parents=True, exist_ok=True)\n"
             "    graph_path = out / 'graph.json'\n"
             "    graph = json.loads(graph_path.read_text()) if graph_path.exists() else {'directed': True, 'multigraph': False, 'graph': {}, 'nodes': [], 'links': []}\n"
             "    graph['built_at_commit'] = subprocess.run(['git', '-C', str(watch_path), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()\n"
             "    graph_path.write_text(json.dumps(graph))\n"
-            "    return not bool(os.environ.get('FAKE_GRAPHIFY_FAIL'))\n",
+            "    return not bool(control('FAKE_GRAPHIFY_FAIL'))\n",
             encoding="utf-8",
         )
         (metadata / "METADATA").write_text(
@@ -571,6 +599,53 @@ class Task2ContractTests(unittest.TestCase):
             encoding="utf-8",
         )
         return root
+
+    def start_fake_graphify_interpreter(self) -> None:
+        """Use an isolated interpreter for synthetic Graphify, never PYTHONPATH."""
+        host_python = Path(sys.executable)
+        fake_graphify = self.write_fake_graphify()
+        environment = Path(self.temporary_directory.name) / "fake-graphify-venv"
+        subprocess.run(
+            [
+                str(host_python),
+                "-m",
+                "venv",
+                "--copies",
+                "--without-pip",
+                str(environment),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        interpreter = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        self.assertFalse(
+            interpreter.is_symlink(),
+            "The Graphify fixture interpreter must survive canonical path resolution.",
+        )
+        site_packages = Path(
+            subprocess.run(
+                [str(interpreter), "-c", "import site; print(site.getsitepackages()[0])"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        shutil.copytree(fake_graphify / "graphify", site_packages / "graphify")
+        shutil.copytree(
+            fake_graphify / "graphifyy-0.9.5.dist-info",
+            site_packages / "graphifyy-0.9.5.dist-info",
+        )
+        self.fake_graphify_control = site_packages / "graphify" / "fixture-controls.json"
+        self.fake_graphify_control.write_text("{}\n", encoding="utf-8")
+        self.fake_graphify_interpreter = patch.object(sys, "executable", str(interpreter))
+        self.fake_graphify_interpreter.start()
+        self.addCleanup(self.fake_graphify_interpreter.stop)
+
+    def set_fake_graphify_controls(self, **controls: str) -> None:
+        self.fake_graphify_control.write_text(
+            json.dumps(controls, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     def test_project_discovery_contract_surface(self):
         module = self.module()
@@ -2122,11 +2197,8 @@ class Task2ContractTests(unittest.TestCase):
         (root / "README.md").write_text("# Changed\n", encoding="utf-8")
         second_commit = self.commit_all(root, "changed source")
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_FAIL": "1"},
-            clear=False,
-        ):
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_FAIL="1")
+        with patch.dict(os.environ, environment, clear=False):
             with self.assertRaises(module.EngineeringError):
                 module.rebuild(root, second_commit, sys.executable)
 
@@ -2356,9 +2428,7 @@ class Task2ContractTests(unittest.TestCase):
 class Task3ContractTests(unittest.TestCase):
     def setUp(self):
         Task2ContractTests.setUp(self)
-        # Task 3 exercises the pinned Graphify adapter; Task 2's fake is only
-        # for ordinary context fixtures.
-        self.fake_graphify_environment.stop()
+
     module = Task2ContractTests.module
     init_repo = Task2ContractTests.init_repo
     git = Task2ContractTests.git
@@ -2367,9 +2437,51 @@ class Task3ContractTests(unittest.TestCase):
     write_fake_graphify = Task2ContractTests.write_fake_graphify
     write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
     recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def graphify_environment(self, fake_graphify: Path, **extra: str) -> dict[str, str]:
-        return {"PYTHONPATH": str(fake_graphify), **extra}
+        self.set_fake_graphify_controls(
+            **{
+                name: value
+                for name, value in extra.items()
+                if name.startswith("FAKE_GRAPHIFY_")
+            }
+        )
+        return extra
+
+    def adversarial_graphify_environment(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Return a fixed runtime baseline plus values Graphify must never inherit."""
+        temporary = Path(self.temporary_directory.name) / "graphify-runtime"
+        temporary.mkdir(exist_ok=True)
+        runtime = {
+            "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get(
+                "SYSTEMROOT", os.environ.get("SystemRoot", r"C:\\Windows")
+            ),
+            "WINDIR": os.environ.get("WINDIR", r"C:\\Windows"),
+            "COMSPEC": os.environ.get("COMSPEC", r"C:\\Windows\\System32\\cmd.exe"),
+            "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+            "TEMP": str(temporary),
+            "TMP": str(temporary),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "LC_CTYPE": "C",
+            "TZ": "UTC",
+        }
+        forbidden = {
+            "AWS_ACCESS_KEY_ID": "synthetic-aws-access-key",
+            "AWS_PROFILE": "synthetic-aws-profile",
+            "HTTPS_PROXY": "https://credential:synthetic-password@127.0.0.1:8080",
+            "GIT_ASKPASS": "synthetic-git-askpass",
+            "SSH_AUTH_SOCK": "synthetic-ssh-agent",
+            "AZURE_CLIENT_ID": "synthetic-azure-client",
+            "PYTHONPATH": "synthetic-untrusted-import-path",
+            "UNRELATED_APPLICATION_STATE": "synthetic-unknown-secret",
+            "OPENAI_API_KEY": "synthetic-provider-secret",
+            "GRAPHIFY_OUT": "spoofed-output",
+        }
+        return runtime, forbidden
 
     def governed_repo(self, name: str = "governed") -> Path:
         root = self.init_repo(name)
@@ -2413,6 +2525,40 @@ class Task3ContractTests(unittest.TestCase):
             module.common_graph_dir(root),
             module.common_graph_dir(linked),
         )
+
+    def test_controller_git_and_project_resolution_ignore_hostile_git_routing(self):
+        """Ordinary controller Git calls stay bound to each requested project."""
+        module = self.module()
+        internal = self.init_repo("routing-internal")
+        public = self.init_repo("routing-public")
+        injected = {
+            "GIT_DIR": str(public / ".git"),
+            "GIT_WORK_TREE": str(public),
+            "GIT_COMMON_DIR": str(public / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(public / ".git" / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(public / ".git" / "objects"),
+            "GIT_INDEX_FILE": str(public / ".git" / "hostile.index"),
+            "GIT_PREFIX": str(public),
+            "GIT_CEILING_DIRECTORIES": str(public.parent),
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(public / "hostile.gitconfig"),
+            "GIT_CONFIG_SYSTEM": str(public / "hostile-system.gitconfig"),
+            "GIT_CONFIG_NOSYSTEM": "0",
+            "GIT_REPLACE_REF_BASE": "refs/heads",
+            "GIT_NO_REPLACE_OBJECTS": "0",
+        }
+
+        with patch.dict(os.environ, injected, clear=False):
+            self.assertEqual(
+                internal.resolve(),
+                Path(module.git(internal, "rev-parse", "--show-toplevel")).resolve(),
+            )
+            self.assertEqual(
+                public.resolve(),
+                Path(module.git(public, "rev-parse", "--show-toplevel")).resolve(),
+            )
+            self.assertEqual(internal.resolve(), module.resolve_project_root(str(internal)))
+            self.assertEqual(public.resolve(), module.resolve_project_root(str(public)))
 
     def test_three_worktrees_share_one_common_cache_root(self):
         module = self.module()
@@ -2515,6 +2661,7 @@ class Task3ContractTests(unittest.TestCase):
             module._restore_quarantined_checkpoint(root, quarantined),
         )
 
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_FAIL="1")
         with patch.dict(
             os.environ, {**environment, "FAKE_GRAPHIFY_FAIL": "1"}, clear=False
         ):
@@ -2555,6 +2702,257 @@ class Task3ContractTests(unittest.TestCase):
 
         self.assertEqual(destination, rebuilt)
         self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+
+    def test_legacy_rebuild_uses_exact_credentialless_graphify_environment(self):
+        """Legacy rebuild passes only the fixed runtime environment to Graphify."""
+        module = self.module()
+        root = self.governed_repo("legacy-rebuild-exact-environment")
+        commit = self.git(root, "rev-parse", "HEAD")
+        captured = []
+        original_run = module.run
+
+        def capture_graphify_environment(command, *args, **kwargs):
+            if command[1:4] == ["-m", "graphify", "update"]:
+                captured.append(dict(kwargs["env"]))
+                output = Path(kwargs["env"]["GRAPHIFY_OUT"])
+                snapshot = Path(command[-1])
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "graph.json").write_text(
+                    json.dumps(
+                        {
+                            "directed": True,
+                            "multigraph": False,
+                            "graph": {},
+                            "nodes": [],
+                            "links": [],
+                            "built_at_commit": module.git(snapshot, "rev-parse", "HEAD"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
+            return original_run(command, *args, **kwargs)
+
+        runtime, forbidden = self.adversarial_graphify_environment()
+        with (
+            patch.dict(os.environ, {**runtime, **forbidden}, clear=True),
+            patch.object(
+                module,
+                "verify_graphify",
+                return_value=module.GraphifyIdentity(
+                    Path(sys.executable),
+                    module.GRAPHIFY_REPOSITORY,
+                    module.GRAPHIFY_VERSION,
+                    module.GRAPHIFY_COMMIT,
+                    module.REQUIRED_GRAPHIFY_COMMANDS,
+                ),
+            ),
+            patch.object(module, "run", side_effect=capture_graphify_environment),
+        ):
+            module.rebuild(root, commit, sys.executable)
+
+        self.assertEqual(1, len(captured))
+        self.assertEqual(
+            {**runtime, "GRAPHIFY_OUT": captured[0]["GRAPHIFY_OUT"]}, captured[0]
+        )
+        for name in forbidden:
+            if name == "GRAPHIFY_OUT":
+                self.assertNotEqual(forbidden[name], captured[0][name])
+                continue
+            with self.subTest(name=name):
+                self.assertNotIn(name, captured[0])
+
+    def test_current_rebuild_uses_exact_credentialless_graphify_environment(self):
+        """Current cold rebuild passes the same fixed environment to its child."""
+        module = self.module()
+        root = self.governed_repo("current-rebuild-exact-environment")
+        commit = self.git(root, "rev-parse", "HEAD")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            {
+                "root": str(root),
+                "commit": commit,
+                "branch": "main",
+                "kind": "canonical",
+                "manifest_name": "engineering.json",
+                "hook": False,
+                "authority": {"branch": "main", "remote": None},
+            }
+        )
+        module._write_operation(record)
+        captured = []
+        adapter_environments = []
+        original_run = module.run
+
+        def capture_graphify_environment(command, *args, **kwargs):
+            if command[1:4] == ["-m", "graphify", "update"]:
+                captured.append(dict(kwargs["env"]))
+                output = Path(kwargs["env"]["GRAPHIFY_OUT"])
+                snapshot = Path(command[-1])
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "graph.json").write_text(
+                    json.dumps(
+                        {
+                            "directed": True,
+                            "multigraph": False,
+                            "graph": {},
+                            "nodes": [],
+                            "links": [],
+                            "built_at_commit": module.git(snapshot, "rev-parse", "HEAD"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
+            return original_run(command, *args, **kwargs)
+
+        def capture_adapter_environment():
+            adapter_environments.append(dict(os.environ))
+            return ({"version": module.GRAPHIFY_VERSION, "code_extensions": []}, object())
+
+        runtime, forbidden = self.adversarial_graphify_environment()
+        with (
+            patch.dict(os.environ, {**runtime, **forbidden}, clear=True),
+            patch.object(
+                module,
+                "_verify_graphify_adapter_in_process",
+                side_effect=capture_adapter_environment,
+            ),
+            patch.object(module, "_compatible_ancestor", return_value=None),
+            patch.object(module, "_mutate_maintenance_locked", return_value=None),
+            patch.object(module, "run", side_effect=capture_graphify_environment),
+        ):
+            self.assertEqual(0, module._graph_worker_entry(root, operation["operation_id"]))
+
+        self.assertEqual(1, len(captured))
+        self.assertEqual(
+            {**runtime, "GRAPHIFY_OUT": captured[0]["GRAPHIFY_OUT"]}, captured[0]
+        )
+        self.assertEqual(
+            {**runtime, "GRAPHIFY_OUT": captured[0]["GRAPHIFY_OUT"]},
+            adapter_environments[0],
+        )
+        for name in forbidden:
+            if name == "GRAPHIFY_OUT":
+                self.assertNotEqual(forbidden[name], captured[0][name])
+                continue
+            with self.subTest(name=name):
+                self.assertNotIn(name, captured[0])
+
+    def test_incremental_outer_worker_uses_exact_environment_before_python_start(self):
+        """The worker cannot resolve Graphify from ambient proxy, Git, or Python paths."""
+        module = self.module()
+        runtime, forbidden = self.adversarial_graphify_environment()
+        captured = []
+
+        def capture_start(command, **kwargs):
+            captured.append((list(command), dict(kwargs.get("env", {}))))
+            return object()
+
+        with (
+            patch.dict(os.environ, {**runtime, **forbidden}, clear=True),
+            patch.object(module.subprocess, "Popen", side_effect=capture_start),
+        ):
+            module._start_worker([sys.executable, "-c", "import graphify"])
+
+        self.assertEqual(
+            [[sys.executable, "-B", "-c", "import graphify"]],
+            [item[0] for item in captured],
+        )
+        self.assertEqual(runtime, captured[0][1])
+        for name in forbidden:
+            with self.subTest(name=name):
+                self.assertNotIn(name, captured[0][1])
+
+    def test_incremental_outer_worker_cannot_write_python_bytecode(self):
+        """A worker cannot mutate its source checkout through import caches."""
+        module = self.module()
+        runtime, _ = self.adversarial_graphify_environment()
+        source = Path(self.temporary_directory.name) / "worker-import"
+        source.mkdir()
+        (source / "worker_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+        cwd_before = Path.cwd()
+        try:
+            os.chdir(source)
+            with patch.dict(os.environ, runtime, clear=True):
+                process = module._start_worker(
+                    [sys.executable, "-c", "import worker_probe"]
+                )
+                stdout, stderr = process.communicate(timeout=30)
+        finally:
+            os.chdir(cwd_before)
+
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        self.assertEqual(0, process.returncode)
+        self.assertFalse((source / "__pycache__").exists())
+
+    def test_incremental_outer_worker_cannot_import_graphify_from_ambient_pythonpath(self):
+        """The strict worker environment applies before the child resolves Graphify."""
+        module = self.module()
+        runtime, forbidden = self.adversarial_graphify_environment()
+        untrusted = Path(self.temporary_directory.name) / "untrusted-graphify"
+        package = untrusted / "graphify"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "raise RuntimeError('ambient PYTHONPATH graphify loaded')\n",
+            encoding="utf-8",
+        )
+        observed = Path(self.temporary_directory.name) / "resolved-graphify.txt"
+        script = (
+            "import graphify,pathlib,sys;"
+            "pathlib.Path(sys.argv[1]).write_text(graphify.__file__,encoding='utf-8')"
+        )
+
+        with patch.dict(
+            os.environ,
+            {**runtime, **forbidden, "PYTHONPATH": str(untrusted)},
+            clear=True,
+        ):
+            process = module._start_worker([sys.executable, "-c", script, str(observed)])
+            stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        self.assertEqual(0, process.returncode)
+        self.assertTrue(observed.is_file())
+        self.assertNotIn(str(untrusted), observed.read_text(encoding="utf-8"))
+
+    def test_graph_worker_restores_host_environment_after_early_stale_return(self):
+        """The in-process worker cannot leak its reduced environment to its caller."""
+        module = self.module()
+        root = self.governed_repo("graph-worker-environment-restoration")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            {
+                "root": str(root),
+                "commit": self.git(root, "rev-parse", "HEAD"),
+                "branch": "main",
+                "kind": "canonical",
+                "manifest_name": "engineering.json",
+                "hook": True,
+                "authority": {"branch": "main", "remote": None},
+            }
+        )
+        module._write_operation(record)
+        runtime, forbidden = self.adversarial_graphify_environment()
+        host_environment = {**runtime, **forbidden}
+
+        with (
+            patch.dict(os.environ, host_environment, clear=True),
+            patch.object(
+                module,
+                "_verify_graphify_adapter_in_process",
+                return_value=({"version": module.GRAPHIFY_VERSION, "code_extensions": []}, object()),
+            ),
+            patch.object(module, "_compatible_ancestor", return_value=None),
+            patch.object(module, "_semantic_changes", return_value=[]),
+            patch.object(module, "_queue_graph_worker_stale", return_value=None),
+        ):
+            self.assertEqual(0, module._graph_worker_entry(root, operation["operation_id"]))
+            self.assertEqual(host_environment, dict(os.environ))
 
     def test_recover_checkpoint_returns_machine_recovery_envelope(self):
         module = self.module()
@@ -2684,12 +3082,9 @@ class Task3ContractTests(unittest.TestCase):
         fake, environment = self.cold_checkpoint(root)
         record = Path(self.temporary_directory.name) / "incremental.jsonl"
         self.commit_file(root, "src/example.py", "changed = True\n")
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_RECORD=str(record))
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_RECORD": str(record)},
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.rebuild(root, sys.executable)
 
         self.assertEqual("changed_path_adapter", result["mode"])
@@ -2732,12 +3127,9 @@ class Task3ContractTests(unittest.TestCase):
         self.assertEqual("full", baseline["mode"])
         prior = module._checkpoint_path(root, self.git(root, "rev-parse", "HEAD"))
         self.commit_file(root, "src/example.py", "changed = True\n")
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_SLOW="120")
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_SLOW": "120"},
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.rebuild(
                 root,
                 sys.executable,
@@ -2834,7 +3226,9 @@ class Task3ContractTests(unittest.TestCase):
         root = self.governed_repo()
         local_main = self.commit_file(root, "src/local.py", "local = True\n")
 
-        result = module.reconcile_canonical(root, refresh_remote=False)
+        result = module.reconcile_canonical(
+            root, refresh_remote=False, graphify_python=sys.executable
+        )
 
         self.assertEqual("not_configured", result["freshness"])
         self.assertEqual(local_main, result["commit"])
@@ -3004,6 +3398,8 @@ class Task3AmendedContractTests(unittest.TestCase):
     add_linked_worktree = Task3ContractTests.add_linked_worktree
     commit_file = Task3ContractTests.commit_file
     cold_checkpoint = Task3ContractTests.cold_checkpoint
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def create_test_reparse(self, link: Path, target: Path, *, directory: bool) -> bool:
         try:
@@ -3179,12 +3575,9 @@ class Task3AmendedContractTests(unittest.TestCase):
         (root / "src" / "delete.py").unlink()
         self.git(root, "mv", "src/rename.py", "src/renamed.py")
         target = self.commit_all(root, "a m d r")
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_RECORD=str(record))
 
-        with patch.dict(
-            os.environ,
-            {**environment, "FAKE_GRAPHIFY_RECORD": str(record)},
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.rebuild(root, sys.executable, target_commit=target)
 
         self.assertTrue(record.is_file(), result)
@@ -3286,6 +3679,15 @@ class Task3AmendedContractTests(unittest.TestCase):
     def test_real_pinned_adapter_covers_every_supported_suffix_and_matches_cold(self):
         module = self.module()
         identity, _ = module._verify_graphify_adapter_in_process()
+        # This contract exercises the real adapter surface.  Give the isolated
+        # child fixture the same pinned suffix inventory so its pre-flight
+        # semantic classifier cannot disagree with the inspected adapter.
+        (self.fake_graphify_control.parent / "detect.py").write_text(
+            "CODE_EXTENSIONS = {"
+            + ", ".join(repr(suffix) for suffix in identity["code_extensions"])
+            + "}\n",
+            encoding="utf-8",
+        )
         root = self.governed_repo("all-suffixes")
         suffix_root = root / "suffixes"
         suffix_root.mkdir()
@@ -4963,9 +5365,10 @@ class Task3AmendedContractTests(unittest.TestCase):
         fake = self.write_fake_graphify()
         record = Path(self.temporary_directory.name) / "argv-graphify.jsonl"
         child_audit = Path(self.temporary_directory.name) / "argv-child.jsonl"
-        (fake / "sitecustomize.py").write_text(
-            "import json,os,pathlib,subprocess,sys\n"
-            "sink=pathlib.Path(os.environ['ENGINEERING_ARGV_AUDIT'])\n"
+        (self.fake_graphify_control.parent.parent / "sitecustomize.py").write_text(
+            "import json,pathlib,subprocess,sys\n"
+            "controls=pathlib.Path(__file__).with_name('graphify').joinpath('fixture-controls.json')\n"
+            "sink=pathlib.Path(json.loads(controls.read_text(encoding='utf-8'))['ENGINEERING_ARGV_AUDIT'])\n"
             "def emit(argv):\n"
             "    sink.open('a',encoding='utf-8').write(json.dumps(list(map(str,argv)))+'\\n')\n"
             "emit([sys.executable,*sys.argv])\n"
@@ -4979,8 +5382,7 @@ class Task3AmendedContractTests(unittest.TestCase):
             "subprocess.Popen=popen\n",
             encoding="utf-8",
         )
-        environment = self.graphify_environment(
-            fake,
+        self.set_fake_graphify_controls(
             FAKE_GRAPHIFY_RECORD=str(record),
             ENGINEERING_ARGV_AUDIT=str(child_audit),
         )
@@ -5005,7 +5407,6 @@ class Task3AmendedContractTests(unittest.TestCase):
             patch.object(module.subprocess, "run", side_effect=recording_run),
             patch.object(module, "_start_worker", side_effect=recording_worker),
             patch.object(module, "_start_cleanup", side_effect=recording_cleanup),
-            patch.dict(os.environ, environment, clear=False),
         ):
             module.rebuild(root, sys.executable)
             self.commit_file(root, "src/value.py", "def value():\n    return 2\n")
@@ -5359,6 +5760,36 @@ class Task3AmendedContractTests(unittest.TestCase):
             timeout=2,
         )
 
+    def test_windows_timeout_waits_for_saved_tree_exit_after_taskkill(self):
+        """Taskkill leader exit is not proof until the captured descendants exit."""
+        module = self.module()
+        process = Mock()
+        process.pid = 4242
+        process.poll.side_effect = [None, 0]
+        process.wait.return_value = 0
+        expected_tree = [{"pid": 4242, "start_time": "saved-start"}]
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.subprocess, "run"),
+            patch.object(
+                module,
+                "_saved_process_tree_absent",
+                side_effect=[
+                    (False, "saved_process_alive"),
+                    (True, "saved_process_tree_absent"),
+                ],
+            ) as saved_tree_absent,
+        ):
+            terminated = module._terminate_process_tree(
+                process,
+                expected_tree=expected_tree,
+            )
+
+        self.assertTrue(terminated)
+        self.assertEqual(2, saved_tree_absent.call_count)
+        saved_tree_absent.assert_called_with(expected_tree)
+
     def test_windows_timeout_without_saved_tree_stays_unconfirmed(self):
         module = self.module()
         process = Mock()
@@ -5480,16 +5911,12 @@ class Task3AmendedContractTests(unittest.TestCase):
         self.commit_file(root, "src/value.py", "def value():\n    return 2\n")
         child_pid_path = Path(self.temporary_directory.name) / "descendant.pid"
         before = self.git(root, "worktree", "list", "--porcelain")
+        self.set_fake_graphify_controls(
+            FAKE_GRAPHIFY_SLOW="120",
+            FAKE_GRAPHIFY_CHILD_PID=str(child_pid_path),
+        )
 
-        with patch.dict(
-            os.environ,
-            {
-                **environment,
-                "FAKE_GRAPHIFY_SLOW": "120",
-                "FAKE_GRAPHIFY_CHILD_PID": str(child_pid_path),
-            },
-            clear=False,
-        ):
+        with patch.dict(os.environ, environment, clear=False):
             result = module.dispatch_hook(
                 root,
                 "post-commit",
@@ -5639,17 +6066,13 @@ class Task5ContractTests(unittest.TestCase):
     write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
     recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     prepared_repo = Task2ContractTests.prepared_repo
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -5786,7 +6209,7 @@ class Task5ContractTests(unittest.TestCase):
         self.assertFalse(prepared["outcome_survival"]["accepted"])
         self.assertFalse(prepared["outcome_survival"]["implementation_ready"])
 
-    def test_managed_material_redesign_blocks_with_exact_mapping_boundary(self):
+    def test_managed_material_redesign_without_owner_intent_blocks_with_external_boundary(self):
         root, _ = self.prepared_repo("managed-outcome-survival")
         self.module().approve_checks(root)
 
@@ -5801,17 +6224,320 @@ class Task5ContractTests(unittest.TestCase):
         )
 
         self.assertEqual("blocked", prepared["readiness"])
+        self.assertEqual([], prepared["outcome_survival"]["missing_baseline_mappings"])
         self.assertEqual(
-            ["baseline_reconstruction_required"],
-            prepared["outcome_survival"]["missing_baseline_mappings"],
-        )
-        self.assertEqual(
-            "signed_scope_handoff_required",
+            "external_owner_intent_required",
             prepared["outcome_survival"]["approval_boundary"],
         )
+        self.assertEqual("owner_intent_unknown", prepared["owner_intent"]["state"])
+
+    def test_prepare_detects_intent_impact_from_authorized_artifact(self):
+        """A capability-linked authorized path cannot be hidden by query underselection."""
+        module = self.module()
+        root, _ = self.prepared_repo("authorized-artifact-intent-impact")
+        (root / "src").mkdir()
+        (root / "src" / "capability_runtime.py").write_text(
+            "def run():\n    return 'native'\n", encoding="utf-8"
+        )
+        links_path = root / "docs" / "engineering-traceability" / "links.json"
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].extend(
+            [
+                {
+                    "id": "CAP-NATIVE-RUNTIME",
+                    "type": "capability",
+                    "title": "Native runtime capability",
+                    "source": {"path": "design.md", "line": 1},
+                },
+                {
+                    "id": "CODE-NATIVE-RUNTIME",
+                    "type": "code_symbol",
+                    "title": "Native runtime",
+                    "source": {"path": "src/capability_runtime.py", "line": 1},
+                },
+            ]
+        )
+        links["edges"].append(
+            {
+                "id": "EDGE-CAP-NATIVE-RUNTIME",
+                "from": "CAP-NATIVE-RUNTIME",
+                "to": "CODE-NATIVE-RUNTIME",
+                "type": "implements",
+                "provenance": "direct",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+        commit = self.commit_all(root, "add capability runtime fixture")
+        self.write_canonical_checkpoint(root, commit)
+        module.approve_checks(root)
+
+        prepared = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": ["src/capability_runtime.py"], "forbidden": []},
+        )
+
+        self.assertEqual("blocked", prepared["readiness"])
+        self.assertIn(
+            "intent-impacting work lacks a matching external owner-intent binding",
+            prepared["blockers"],
+        )
+        self.assertEqual("owner_intent_unknown", prepared["owner_intent"]["state"])
+
+    def test_complete_detects_capability_impact_from_actual_changed_artifact(self):
+        """Completion rechecks touched artifacts so a stale selection cannot bypass survival."""
+        module = self.module()
+        root, prepared = self.prepared_run(
+            "actual-artifact-intent-impact", scope=["README.md"]
+        )
+        checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
+        checkpoint["nodes"].append(
+            {
+                "id": "CAP-LATE-BOUND",
+                "type": "capability",
+                "title": "Late-bound capability",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        checkpoint["edges"].append(
+            {
+                "id": "EDGE-LATE-BOUND",
+                "from": "CAP-LATE-BOUND",
+                "to": "CODE-1",
+                "type": "implements",
+                "provenance": "direct",
+            }
+        )
+        (root / "README.md").write_text("# Changed capability artifact\n", encoding="utf-8")
+
+        with patch.object(module, "_load_checkpoint", return_value=checkpoint), self.assertRaisesRegex(
+            module.EngineeringError,
+            "completion detected unbound intent impact from actual artifacts",
+        ):
+            module.complete(root, prepared["run_id"], [])
+
+    def test_complete_fails_closed_for_new_capability_path_absent_from_base_checkpoint(self):
+        """A newly mapped capability must be assessed from the refreshed exact checkpoint."""
+        module = self.module()
+        links_name = "docs/engineering-traceability/links.json"
+        root, prepared = self.prepared_run(
+            "new-capability-path-intent-impact",
+            scope=["src/native_dispatch.py", links_name],
+        )
+        (root / "src").mkdir()
+        (root / "src" / "native_dispatch.py").write_text(
+            "def dispatch():\n    return 'native'\n", encoding="utf-8"
+        )
+        links_path = root / links_name
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].extend(
+            (
+                {
+                    "id": "CAP-NEW-NATIVE-DISPATCH",
+                    "type": "capability",
+                    "title": "New native dispatch capability",
+                    "source": {"path": "design.md", "line": 1},
+                },
+                {
+                    "id": "CODE-NEW-NATIVE-DISPATCH",
+                    "type": "code_symbol",
+                    "title": "New native dispatch implementation",
+                    "source": {"path": "src/native_dispatch.py", "line": 1},
+                },
+            )
+        )
+        links["edges"].append(
+            {
+                "id": "EDGE-NEW-NATIVE-DISPATCH",
+                "from": "CAP-NEW-NATIVE-DISPATCH",
+                "to": "CODE-NEW-NATIVE-DISPATCH",
+                "type": "implements",
+                "provenance": "direct",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+        refreshed_commit = self.commit_all(root, "add new native dispatch capability")
+        self.write_canonical_checkpoint(root, refreshed_commit)
+
+        with self.assertRaisesRegex(
+            module.EngineeringError,
+            "completion detected unbound intent impact from actual artifacts",
+        ):
+            module.complete(root, prepared["run_id"], [])
+
+    def test_complete_requires_result_checkpoint_for_new_owner_commitment_paths(self):
+        """New README, prose, and test commitments cannot bypass result assessment."""
+        module = self.module()
+        paths = (
+            ("README-owner-commitment.md", "# Owner commitment\n"),
+            ("docs/owner-commitment.md", "# Owner commitment\n"),
+            ("tests/test_owner_commitment.py", "def test_commitment():\n    pass\n"),
+        )
+        for index, (relative, content) in enumerate(paths, start=1):
+            with self.subTest(path=relative):
+                root, prepared = self.prepared_run(
+                    f"new-owner-commitment-{index}", scope=[relative]
+                )
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                head = self.commit_all(root, f"add {relative}")
+                self.write_canonical_checkpoint(root, head)
+                with (
+                    patch.object(
+                        module,
+                        "check_merge_readiness",
+                        return_value={"ready": False, "commit": head},
+                    ),
+                    patch.object(module, "rebuild", return_value={"freshness": "stale"}),
+                    self.assertRaisesRegex(
+                        module.EngineeringError,
+                        "feature checkpoint refresh failed",
+                    ),
+                ):
+                    module.complete(root, prepared["run_id"], [])
+
+    def test_complete_fails_closed_for_modified_unrepresented_owner_commitment_paths(self):
+        """Existing README/docs/tests omitted from base evidence still require refresh and intent."""
+        module = self.module()
+        paths = (
+            ("README-owner-commitment.md", "# Initial owner commitment\n"),
+            ("docs/specs/owner-intent.md", "# Initial owner commitment\n"),
+            ("tests/test_owner_intent.py", "def test_initial_commitment():\n    pass\n"),
+        )
+        for index, (relative, initial) in enumerate(paths, start=1):
+            with self.subTest(path=relative):
+                root, _ = self.prepared_repo(f"modified-owner-commitment-{index}")
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(initial, encoding="utf-8")
+                preparation_commit = self.commit_all(root, f"add {relative}")
+                self.write_canonical_checkpoint(root, preparation_commit)
+                module.approve_checks(root)
+                prepared = module.prepare(
+                    root,
+                    "change REQ-1",
+                    {"scope": [relative], "forbidden": ["publish", "deploy"]},
+                )
+                self.assertNotEqual("blocked", prepared["readiness"])
+                base = module._load_checkpoint(root, preparation_commit)
+                self.assertNotIn(relative, module._checkpoint_source_paths(base))
+
+                path.write_text(initial + "Updated owner commitment.\n", encoding="utf-8")
+                head = self.commit_all(root, f"modify {relative}")
+                self.write_canonical_checkpoint(root, head)
+                self.assertTrue(
+                    module._requires_refreshed_intent_checkpoint(
+                        root, preparation_commit, base, [relative]
+                    )
+                )
+                self.assertTrue(
+                    module._completion_intent_impact(
+                        root,
+                        preparation_commit,
+                        head,
+                        False,
+                        [relative],
+                        prepared["authorization"],
+                        prepared["authorization"].get("scope_handoff"),
+                        {"ready": True, "commit": head},
+                    )
+                )
+                with (
+                    patch.object(
+                        module,
+                        "check_merge_readiness",
+                        return_value={"ready": True, "commit": head},
+                    ),
+                    self.assertRaisesRegex(
+                        module.EngineeringError,
+                        "completion detected unbound intent impact from actual artifacts",
+                    ),
+                ):
+                    module.complete(root, prepared["run_id"], [])
+
+    def test_existing_unrepresented_governance_and_unknown_paths_require_refresh(self):
+        """Existing policy, release, automation, and unknown paths cannot bypass intent refresh."""
+        module = self.module()
+        paths = (
+            "SECURITY.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "CONTRIBUTING.md",
+            ".github/workflows/security.yml",
+            "release/public-export.json",
+            "unclassified/material-owner-impact.txt",
+        )
+        for index, relative in enumerate(paths, start=1):
+            with self.subTest(path=relative):
+                root, _ = self.prepared_repo(f"unrepresented-governance-{index}")
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("initial governed artifact\n", encoding="utf-8")
+                preparation_commit = self.commit_all(root, f"add {relative}")
+                self.write_canonical_checkpoint(root, preparation_commit)
+                base = module._load_checkpoint(root, preparation_commit)
+                self.assertNotIn(relative, module._checkpoint_source_paths(base))
+
+                path.write_text("changed governed artifact\n", encoding="utf-8")
+                head = self.commit_all(root, f"modify {relative}")
+
+                self.assertTrue(
+                    module._requires_refreshed_intent_checkpoint(
+                        root, preparation_commit, base, [relative]
+                    )
+                )
+                with self.assertRaisesRegex(
+                    module.EngineeringError, "feature checkpoint refresh failed"
+                ):
+                    module._completion_intent_impact(
+                        root,
+                        preparation_commit,
+                        head,
+                        False,
+                        [relative],
+                        {},
+                        None,
+                        {"ready": False, "commit": head},
+                    )
+
+    def test_complete_detects_capability_impact_across_authorized_rename(self):
+        """Both rename endpoints are assessed before an approved scope can complete."""
+        module = self.module()
+        root, prepared = self.prepared_run(
+            "renamed-artifact-intent-impact",
+            scope=["README.md", "README-renamed.md"],
+        )
+        checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
+        checkpoint["nodes"].append(
+            {
+                "id": "CAP-RENAMED",
+                "type": "capability",
+                "title": "Renamed capability",
+                "source": {"path": "design.md", "line": 1},
+            }
+        )
+        checkpoint["edges"].append(
+            {
+                "id": "EDGE-RENAMED",
+                "from": "CAP-RENAMED",
+                "to": "CODE-1",
+                "type": "implements",
+                "provenance": "direct",
+            }
+        )
+        (root / "README.md").rename(root / "README-renamed.md")
+
+        with patch.object(module, "_load_checkpoint", return_value=checkpoint), self.assertRaisesRegex(
+            module.EngineeringError,
+            "completion detected unbound intent impact from actual artifacts",
+        ):
+            module.complete(root, prepared["run_id"], [])
 
 
-    def test_seed_feedback_scope_handoff_uses_signed_approval_and_completion(self):
+    def test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown(self):
         module = self.module()
         root, _ = self.prepared_repo("scope-handoff")
         ledger = root / "docs" / "engineering-traceability" / "decision-ledger.md"
@@ -5883,36 +6609,17 @@ class Task5ContractTests(unittest.TestCase):
                 "scope_handoff": handoff,
             },
         )
-        self.assertNotEqual("blocked", prepared["readiness"], prepared)
-
-        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
-        with self.assertRaisesRegex(module.EngineeringError, "result scope"):
-            module.complete(
-                root,
-                prepared["run_id"],
-                receipts=[],
-                result_scope=["REQ-1"],
-            )
-        with self.assertRaisesRegex(module.EngineeringError, "result artifacts"):
-            module.complete(
-                root,
-                prepared["run_id"],
-                receipts=[],
-                result_scope=handoff["result_scope"],
-            )
-        (root / "requirements.md").write_text("# REQ-1\nupdated\n", encoding="utf-8")
-        completion = module.complete(
-            root,
-            prepared["run_id"],
-            receipts=[],
-            result_scope=handoff["result_scope"],
-        )
-        self.assertEqual(handoff["result_scope"], completion["scope_result"])
+        self.assertEqual("blocked", prepared["readiness"])
+        self.assertEqual("owner_intent_unknown", prepared["owner_intent"]["state"])
         self.assertEqual(
-            handoff["outcome_survival"], completion["outcome_survival"]
+            "owner_intent_unknown", prepared["outcome_survival"]["boundary"]
         )
-        replay = module.complete(root, prepared["run_id"], receipts=[])
-        self.assertEqual(completion, replay)
+        self.assertEqual(
+            handoff["outcome_survival"],
+            prepared["authorization"]["scope_handoff"]["outcome_survival"],
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "not completion-ready"):
+            module.complete(root, prepared["run_id"], receipts=[])
 
     def green_receipts(self, prepared: dict) -> list[dict]:
         module = self.module()
@@ -6692,17 +7399,13 @@ class Task6ContractTests(unittest.TestCase):
     cold_checkpoint = Task3ContractTests.cold_checkpoint
     commit_file = Task3ContractTests.commit_file
     graphify_environment = Task3ContractTests.graphify_environment
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
+    set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.private_files = patch.object(
             engineering, "_enforce_owner_private", side_effect=synthetic_owner_private
         )
@@ -7292,12 +7995,77 @@ class Task6ContractTests(unittest.TestCase):
 
     def test_completion_batches_maintenance_once_and_retains_opaque_ids(self):
         module = self.module()
-        root, prepared = self.prepared_run(
-            "maintenance-completion-producer", scope=["README.md"]
+        root, _ = self.prepared_repo("maintenance-completion-producer")
+        # This test exercises maintenance queuing for an already-known,
+        # non-owner-facing follow-up artifact.  It deliberately avoids README,
+        # docs, tests, and every unrepresented path: those must refresh and
+        # bind owner intent under the completion fail-closed regressions.
+        (root / "notes").mkdir(exist_ok=True)
+        (root / "notes" / "follow-up.txt").write_text(
+            "Follow up\n", encoding="utf-8"
         )
-        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
-        (root / "docs").mkdir(exist_ok=True)
-        (root / "docs" / "follow-up.md").write_text("# Follow up\n", encoding="utf-8")
+        links_path = root / "docs" / "engineering-traceability" / "links.json"
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].append(
+            {
+                "id": "NOTE-FOLLOW-UP",
+                "type": "code_symbol",
+                "title": "Follow-up maintenance note",
+                "source": {"path": "notes/follow-up.txt", "line": 1},
+            }
+        )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+        base = self.commit_all(root, "add known maintenance follow-up")
+        self.write_canonical_checkpoint(root, base)
+        module.approve_checks(root)
+        prepared = module.prepare(
+            root,
+            "change REQ-1",
+            {
+                "scope": ["notes/follow-up.txt"],
+                "forbidden": ["publish", "deploy"],
+            },
+        )
+        self.assertNotEqual("blocked", prepared["readiness"])
+        (root / "notes" / "follow-up.txt").write_text(
+            "Updated follow up\n", encoding="utf-8"
+        )
+
+        changed, _ = module._stable_completion_snapshot(
+            root, prepared["project"]["commit"]
+        )
+        self.assertEqual(["notes/follow-up.txt"], changed)
+        base_checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
+        self.assertIn("notes/follow-up.txt", module._checkpoint_source_paths(base_checkpoint))
+        self.assertFalse(
+            module._unrepresented_owner_commitment_paths(base_checkpoint, changed)
+        )
+        self.assertFalse(
+            module._requires_refreshed_intent_checkpoint(
+                root, prepared["project"]["commit"], base_checkpoint, changed
+            )
+        )
+        self.assertFalse(
+            module._intent_impacting(
+                base_checkpoint,
+                [],
+                prepared["authorization"].get("change_class"),
+                prepared["authorization"].get("scope_handoff"),
+                artifact_paths=changed,
+            )
+        )
+        self.assertFalse(
+            module._completion_intent_impact(
+                root,
+                prepared["project"]["commit"],
+                module.git(root, "rev-parse", "HEAD"),
+                True,
+                changed,
+                prepared["authorization"],
+                prepared["authorization"].get("scope_handoff"),
+                module.check_merge_readiness(root),
+            )
+        )
 
         first = module.complete(root, prepared["run_id"], receipts=[])
 
@@ -7306,7 +8074,7 @@ class Task6ContractTests(unittest.TestCase):
         ).read_bytes()
         second = module.complete(root, prepared["run_id"], receipts=[])
 
-        self.assertEqual(2, len(first["maintenance"]))
+        self.assertEqual(1, len(first["maintenance"]))
         self.assertTrue(
             all(re.fullmatch(r"maintenance-[0-9a-f]{12}", item) for item in first["maintenance"])
         )
@@ -7554,19 +8322,14 @@ class Task7ContractTests(unittest.TestCase):
     recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
     prepared_repo = Task2ContractTests.prepared_repo
     prepared_run = Task5ContractTests.prepared_run
+    start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.home = Path(self.temporary_directory.name) / "home"
         self.home.mkdir()
-        self.fake_graphify_environment = patch.dict(
-            os.environ,
-            {"PYTHONPATH": str(self.write_fake_graphify())},
-            clear=False,
-        )
-        self.fake_graphify_environment.start()
-        self.addCleanup(self.fake_graphify_environment.stop)
+        self.start_fake_graphify_interpreter()
         self.environment = patch.dict(
             os.environ,
             {"ENGINEERING_USER_HOME": str(self.home)},
@@ -7651,10 +8414,14 @@ class Task7ContractTests(unittest.TestCase):
             ],
         }
 
-    def bundle_repo(self, name="bundle"):
+    def bundle_repo(self, name="bundle", *, version="2.2.5"):
         root = Path(self.temporary_directory.name) / name
         source = root / ".agents" / "skills" / "engineering"
         shutil.copytree(SKILL_DIR, source, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        manifest_path = source / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = version
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         self.git(root, "init", "-b", "main")
         self.git(root, "config", "user.email", "synthetic")
         self.git(root, "config", "user.name", "Engineering Tests")
@@ -7703,6 +8470,8 @@ class Task7ContractTests(unittest.TestCase):
             expected_pre_state=None,
             *,
             preimage_path=None,
+            expected_source_state=None,
+            expected_target_state=None,
         ):
             nonlocal failed
             if not failed and Path(destination).resolve() == Path(target).resolve():
@@ -7713,6 +8482,8 @@ class Task7ContractTests(unittest.TestCase):
                 destination,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         return replace
@@ -8222,7 +8993,18 @@ class Task7ContractTests(unittest.TestCase):
         canonical = self.home / ".agents" / "skills" / "engineering" / "SKILL.md"
         claude = self.home / ".claude" / "skills" / "engineering" / "SKILL.md"
         shim = self.home / ".agents" / "skills" / "engineering-traceability" / "SKILL.md"
-        self.assertEqual(SKILL.read_bytes(), canonical.read_bytes())
+        expected_skill = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source.parents[2]),
+                "show",
+                "HEAD:.agents/skills/engineering/SKILL.md",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(expected_skill, canonical.read_bytes())
         self.assertIn("engineering.py", (canonical.parent / "scripts" / "engineering.cmd").read_text(encoding="utf-8"))
         self.assertIn("engineering.py", (canonical.parent / "scripts" / "engineering").read_text(encoding="utf-8"))
         self.assertIn("~/.agents/skills/engineering/SKILL.md", claude.read_text(encoding="utf-8"))
@@ -8242,6 +9024,207 @@ class Task7ContractTests(unittest.TestCase):
             self.home / ".agents" / "engineering" / "install-receipt.json"
         ).read_text(encoding="utf-8")
         self.assertNotIn(str(source), receipt_text)
+
+    def test_bundle_identity_and_install_bytes_are_stable_across_checkout_eol(self):
+        """One Git artifact has one bundle identity on LF and CRLF hosts."""
+        module = self.module()
+        origin_source = self.bundle_repo("bundle-object-eol")
+        origin = origin_source.parents[2]
+        lf_root = Path(self.temporary_directory.name) / "bundle-object-eol-lf"
+        crlf_root = Path(self.temporary_directory.name) / "bundle-object-eol-crlf"
+        subprocess.run(
+            ["git", "-c", "core.autocrlf=false", "clone", str(origin), str(lf_root)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "core.autocrlf=true", "clone", str(origin), str(crlf_root)],
+            check=True,
+            capture_output=True,
+        )
+        lf_source = lf_root / ".agents" / "skills" / "engineering"
+        crlf_source = crlf_root / ".agents" / "skills" / "engineering"
+        self.assertNotEqual(
+            (lf_source / "SKILL.md").read_bytes(),
+            (crlf_source / "SKILL.md").read_bytes(),
+            "fixture must exercise distinct checkout bytes",
+        )
+
+        _, _, lf_commit, lf_digest = module._bundle_files(lf_source)
+        _, _, crlf_commit, crlf_digest = module._bundle_files(crlf_source)
+        self.assertEqual(lf_commit, crlf_commit)
+        self.assertEqual(lf_digest, crlf_digest)
+        expected_tree = self.git(origin, "rev-parse", f"{lf_commit}^{{tree}}")
+        lf_receipt = module.install_bundle(lf_source, self.home)
+        installed_skill = self.home / ".agents" / "skills" / "engineering" / "SKILL.md"
+        committed_skill = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(origin),
+                "show",
+                f"{lf_commit}:.agents/skills/engineering/SKILL.md",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(committed_skill, installed_skill.read_bytes())
+        self.assertEqual(expected_tree, lf_receipt["source_git_tree"])
+        retained = module._load_install_receipt(
+            self.home / ".agents" / "engineering" / "install-receipt.json",
+            module._install_key(self.home),
+        )
+        self.assertEqual(expected_tree, retained["source_git_tree"])
+
+    def test_install_release_gate_preflight_requires_exact_token_pair(self):
+        """Installation may consume a verified token but never self-authorizes it."""
+        module = self.module()
+        source = self.bundle_repo("install-release-gate", version="2.2.6")
+        _, source_manifest, source_commit, source_digest = module._bundle_files(source)
+        source_tree = module._bundle_git_tree(source, source_commit)
+        with self.assertRaisesRegex(module.EngineeringError, "requires an exact release token"):
+            module.install_bundle(source, self.home)
+        self.assertFalse((self.home / ".agents" / "skills" / "engineering").exists())
+        with self.assertRaisesRegex(module.EngineeringError, "both token"):
+            module.install_bundle(
+                source,
+                self.home,
+                release_token={"root": str(self.home), "token_id": "release-token-" + "1" * 32},
+            )
+        with patch.object(
+            module,
+            "verify_release_token",
+            return_value={
+                "schema": "engineering.release-token.v2",
+                "token_id": "release-token-" + "1" * 32,
+                "token_digest": "sha256:" + "3" * 64,
+                "artifact_digest": "sha256:" + "1" * 64,
+                "action": "install",
+                "acceptance_id": "acceptance-a",
+                "native_approval_required": True,
+                "source_bundle": {
+                    "source_git_commit": source_commit,
+                    "source_git_tree": source_tree,
+                    "source_digest": source_digest,
+                    "skill_version": source_manifest["version"],
+                },
+            },
+        ) as verify:
+            receipt = module.install_bundle(
+                source,
+                self.home,
+                release_token={
+                    "root": str(source.parents[3]),
+                    "token_id": "release-token-" + "1" * 32,
+                },
+                release_artifact_digest="sha256:" + "1" * 64,
+            )
+        verify.assert_called_once_with(
+            source.parents[3],
+            "release-token-" + "1" * 32,
+            "sha256:" + "1" * 64,
+            "install",
+        )
+        self.assertTrue(receipt["release_gate"]["native_approval_required"])
+
+    def test_install_rejects_release_token_for_different_source_bundle(self):
+        """Replacing the copied bundle after acceptance must invalidate the install token."""
+        module = self.module()
+        source_a = self.bundle_repo("install-token-bundle-a", version="2.2.6")
+        source_b = self.bundle_repo("install-token-bundle-b", version="2.2.6")
+        (source_b / "SKILL.md").write_bytes(
+            (source_b / "SKILL.md").read_bytes() + b"\n# synthetic bundle B\n"
+        )
+        source_b_root = source_b.parents[2]
+        self.git(source_b_root, "add", ".")
+        self.git(source_b_root, "commit", "-m", "different bundle")
+        _, manifest_a, commit_a, digest_a = module._bundle_files(source_a)
+        tree_a = module._bundle_git_tree(source_a, commit_a)
+
+        with patch.object(
+            module,
+            "verify_release_token",
+            return_value={
+                "schema": "engineering.release-token.v2",
+                "token_id": "release-token-" + "1" * 32,
+                "artifact_digest": "sha256:" + "2" * 64,
+                "action": "install",
+                "acceptance_id": "acceptance-a",
+                "native_approval_required": True,
+                "source_bundle": {
+                    "source_git_commit": commit_a,
+                    "source_git_tree": tree_a,
+                    "source_digest": digest_a,
+                    "skill_version": manifest_a["version"],
+                },
+            },
+        ):
+            with self.assertRaisesRegex(module.EngineeringError, "source bundle"):
+                module.install_bundle(
+                    source_b,
+                    self.home,
+                    release_token={
+                        "root": str(source_b_root),
+                        "token_id": "release-token-" + "1" * 32,
+                    },
+                    release_artifact_digest="sha256:" + "2" * 64,
+                )
+
+        self.assertFalse((self.home / ".agents" / "skills" / "engineering").exists())
+
+    def test_install_receipt_reconciles_release_source_facts(self):
+        """The signed receipt must retain the exact gate and bundle that were installed."""
+        module = self.module()
+        source = self.bundle_repo("install-receipt-source-facts", version="2.2.6")
+        _, manifest, commit, source_digest = module._bundle_files(source)
+        source_tree = module._bundle_git_tree(source, commit)
+        authorization = {
+            "schema": "engineering.install-release-authorization.v1",
+            "token_id": "release-token-" + "1" * 32,
+            "token_digest": "sha256:" + "3" * 64,
+            "artifact_digest": "sha256:" + "2" * 64,
+            "acceptance_id": "acceptance-a",
+            "source_bundle": {
+                "source_git_commit": commit,
+                "source_git_tree": source_tree,
+                "source_digest": source_digest,
+                "skill_version": manifest["version"],
+            },
+        }
+        with patch.object(
+            module,
+            "verify_release_token",
+            return_value={
+                "schema": "engineering.release-token.v2",
+                "token_id": authorization["token_id"],
+                "token_digest": authorization["token_digest"],
+                "artifact_digest": authorization["artifact_digest"],
+                "action": "install",
+                "acceptance_id": authorization["acceptance_id"],
+                "native_approval_required": True,
+                "source_bundle": authorization["source_bundle"],
+            },
+        ):
+            receipt = module.install_bundle(
+                source,
+                self.home,
+                release_token={
+                    "root": str(source.parents[2]),
+                    "token_id": authorization["token_id"],
+                },
+                release_artifact_digest=authorization["artifact_digest"],
+            )
+
+        self.assertEqual("engineering.install.v5", receipt["schema"])
+        self.assertEqual(authorization, receipt.get("release_authorization"))
+        self.assertEqual(source_digest, receipt["source_digest"])
+        persisted = {key: value for key, value in receipt.items() if key != "release_gate"}
+        self.assertEqual(
+            persisted,
+            module._load_install_receipt(
+                module._install_paths(self.home)["receipt"], module._install_key(self.home)
+            ),
+        )
 
     def test_install_publishes_a_discoverable_windows_command_launcher(self):
         module = self.module()
@@ -8310,8 +9293,13 @@ class Task7ContractTests(unittest.TestCase):
             scripts = root / "scripts"
             scripts.mkdir()
             shutil.copy2(SKILL_DIR / "scripts" / "engineering.cmd", scripts / "engineering.cmd")
-            shutil.copy2(sys.executable, root / "python.exe")
-            runtime_dll = Path(sys.executable).with_name(
+            # The class normally patches sys.executable to the isolated fake
+            # Graphify venv.  A copied venv launcher is invalid without its
+            # sibling pyvenv.cfg, while this launcher-resolution test needs a
+            # standalone base interpreter only.
+            launcher_python = Path(getattr(sys, "_base_executable", sys.executable))
+            shutil.copy2(launcher_python, root / "python.exe")
+            runtime_dll = launcher_python.with_name(
                 f"python{sys.version_info.major}{sys.version_info.minor}.dll"
             )
             if runtime_dll.is_file():
@@ -8443,6 +9431,7 @@ class Task7ContractTests(unittest.TestCase):
         module = self.module()
         source = self.bundle_repo("active-home-path")
         first_bundle = module._bundle_files(source)
+        first_tree = module._bundle_git_tree(source, first_bundle[2])
         baseline = r"C:\\baseline"
         registry_state = {"path": baseline}
         registry = Mock()
@@ -8465,6 +9454,7 @@ class Task7ContractTests(unittest.TestCase):
             patch.dict(sys.modules, {"winreg": registry}),
             patch.dict(os.environ, {"PATH": baseline}, clear=False),
             patch.object(module, "_bundle_files", return_value=first_bundle),
+            patch.object(module, "_bundle_git_tree", return_value=first_tree),
         ):
             module.install_bundle(source, self.home)
             self.assertNotEqual(baseline, registry_state["path"])
@@ -8484,12 +9474,14 @@ class Task7ContractTests(unittest.TestCase):
 
         self.update_bundle(source, "2.1.1")
         updated_bundle = module._bundle_files(source)
+        updated_tree = module._bundle_git_tree(source, updated_bundle[2])
         with (
             patch.object(module.os, "name", "nt"),
             patch.object(Path, "home", return_value=self.home),
             patch.dict(sys.modules, {"winreg": registry}),
             patch.dict(os.environ, {"PATH": baseline}, clear=False),
             patch.object(module, "_bundle_files", return_value=updated_bundle),
+            patch.object(module, "_bundle_git_tree", return_value=updated_tree),
         ):
             registry_state["path"] = baseline
             registry.reset_mock()
@@ -8809,6 +9801,267 @@ class Task7ContractTests(unittest.TestCase):
             {key: module._tree_digest(paths[key]) for key in ("canonical", "claude", "shim")},
         )
         self.assertEqual(receipt_before, paths["receipt"].read_bytes())
+
+    def test_windows_atomic_publish_retries_transient_access_denied(self):
+        """A short Windows sharing race cannot invalidate an exact install."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "atomic-source"
+        target = Path(self.temporary_directory.name) / "atomic-target"
+        source.mkdir()
+        (source / "payload.txt").write_text("exact\n", encoding="utf-8")
+        real_replace = module.os.replace
+        attempts = []
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+
+        def transient_once(observed_source, observed_target):
+            attempts.append((Path(observed_source), Path(observed_target)))
+            if len(attempts) == 1:
+                raise denied
+            return real_replace(observed_source, observed_target)
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=transient_once),
+            patch.object(module.time, "sleep") as sleep,
+        ):
+            module._replace_install_path(
+                source,
+                target,
+                {
+                    "exists": False,
+                    "kind": "absent",
+                    "bytes_hex": None,
+                    "sha256": None,
+                    "mode": None,
+                },
+            )
+
+        self.assertEqual(2, len(attempts))
+        sleep.assert_called_once()
+        self.assertEqual("exact\n", (target / "payload.txt").read_text(encoding="utf-8"))
+
+    def test_windows_atomic_publish_retry_revalidates_the_preimage(self):
+        """A changed target during retry remains a hard publication failure."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "retry-source"
+        target = Path(self.temporary_directory.name) / "retry-target"
+        source.mkdir()
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+        attempts = 0
+
+        def substitute_target(observed_source, observed_target):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                Path(observed_target).mkdir()
+                raise denied
+            self.fail("changed publication target must be rejected before retry")
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=substitute_target),
+            patch.object(module.time, "sleep"),
+            self.assertRaisesRegex(module.EngineeringError, "target changed"),
+        ):
+            module._replace_install_path(
+                source,
+                target,
+                {
+                    "exists": False,
+                    "kind": "absent",
+                    "bytes_hex": None,
+                    "sha256": None,
+                    "mode": None,
+                },
+            )
+
+        self.assertEqual(1, attempts)
+
+    def test_existing_install_backup_retry_rejects_source_substitution(self):
+        """The real upgrade path cannot back up bytes changed during a retry."""
+        module = self.module()
+        source = self.bundle_repo("upgrade-backup-retry-race")
+        module.install_bundle(source, self.home)
+        self.update_bundle(source)
+        paths = module._install_paths(self.home)
+        real_replace = module.os.replace
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+        injected = False
+
+        def substitute_existing_install(observed_source, observed_target):
+            nonlocal injected
+            observed_source = Path(observed_source)
+            observed_target = Path(observed_target)
+            if (
+                not injected
+                and os.path.normcase(str(observed_source.resolve()))
+                == os.path.normcase(str(paths["canonical"].resolve()))
+                and observed_target.name.startswith(".engineering.backup-")
+            ):
+                injected = True
+                (observed_source / "SKILL.md").write_text(
+                    "# concurrently substituted install\n", encoding="utf-8"
+                )
+                raise denied
+            return real_replace(observed_source, observed_target)
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=substitute_existing_install),
+            patch.object(module.time, "sleep"),
+            self.assertRaisesRegex(module.EngineeringError, "target changed"),
+        ):
+            module.install_bundle(source, self.home)
+
+        self.assertTrue(injected)
+
+    def test_rollback_restoration_retry_rejects_target_substitution(self):
+        """The real rollback exception path cannot replace a raced restore target."""
+        module = self.module()
+        source = self.bundle_repo("rollback-restore-retry-race")
+        module.install_bundle(source, self.home)
+        self.update_bundle(source)
+        module.install_bundle(source, self.home)
+        paths = module._install_paths(self.home)
+        real_replace = module.os.replace
+        denied = PermissionError(13, "synthetic transient access denied")
+        denied.winerror = 5
+        forced_late_failure = False
+        restore_attempts = 0
+
+        def substitute_restoration_target(observed_source, observed_target):
+            nonlocal forced_late_failure, restore_attempts
+            observed_source = Path(observed_source)
+            observed_target = Path(observed_target)
+            if (
+                not forced_late_failure
+                and os.path.normcase(str(observed_target.resolve()))
+                == os.path.normcase(str(paths["previous"].resolve()))
+                and observed_source.name.startswith("..engineering.previous.stage-")
+            ):
+                forced_late_failure = True
+                raise OSError("synthetic later rollback publication failure")
+            if (
+                forced_late_failure
+                and os.path.normcase(str(observed_target.resolve()))
+                == os.path.normcase(str(paths["canonical"].resolve()))
+                and observed_source.name.startswith(".engineering.backup-")
+            ):
+                restore_attempts += 1
+                if restore_attempts == 1:
+                    observed_target.mkdir(parents=True)
+                    (observed_target / "substitute.txt").write_text(
+                        "concurrent\n", encoding="utf-8"
+                    )
+                    raise denied
+                shutil.rmtree(observed_target)
+            return real_replace(observed_source, observed_target)
+
+        with (
+            patch.object(module.os, "name", "nt"),
+            patch.object(module.os, "replace", side_effect=substitute_restoration_target),
+            patch.object(module.time, "sleep"),
+            self.assertRaisesRegex(module.EngineeringError, "target changed"),
+        ):
+            module.rollback_install(self.home)
+
+        self.assertTrue(forced_late_failure)
+        self.assertEqual(1, restore_attempts)
+
+    def test_transaction_cleanup_preserves_a_substituted_published_target(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-published-target"
+        stage = root / "stage"
+        target = root / "target"
+        stage.mkdir(parents=True)
+        (stage / "payload.txt").write_text("authorized\n", encoding="utf-8")
+
+        def substitute_then_fail():
+            shutil.rmtree(target)
+            target.mkdir()
+            (target / "substitute.txt").write_text("must survive\n", encoding="utf-8")
+            raise OSError("synthetic later publication failure")
+
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
+            module._transactional_replace(
+                [(stage, target)],
+                "1" * 32,
+                after_publication=substitute_then_fail,
+            )
+
+        self.assertEqual(
+            "must survive\n",
+            (target / "substitute.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_transaction_rejects_a_preexisting_backup_without_deleting_it(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-backup-target"
+        stage = root / "stage"
+        target = root / "target"
+        backup = root / (".target.backup-" + "2" * 32)
+        stage.mkdir(parents=True)
+        target.mkdir()
+        backup.mkdir()
+        (stage / "payload.txt").write_text("new\n", encoding="utf-8")
+        (target / "payload.txt").write_text("old\n", encoding="utf-8")
+        (backup / "substitute.txt").write_text("must survive\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
+            module._transactional_replace([(stage, target)], "2" * 32)
+
+        self.assertEqual(
+            "must survive\n",
+            (backup / "substitute.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_transaction_cleanup_preserves_a_substituted_stage(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-stage-target"
+        stage = root / "stage"
+        target = root / "target"
+        stage.mkdir(parents=True)
+        (stage / "payload.txt").write_text("authorized\n", encoding="utf-8")
+
+        def substitute_stage_after_publication():
+            stage.mkdir()
+            (stage / "substitute.txt").write_text("must survive\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
+            module._transactional_replace(
+                [(stage, target)],
+                "3" * 32,
+                after_publication=substitute_stage_after_publication,
+            )
+
+        self.assertEqual(
+            "must survive\n",
+            (stage / "substitute.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_install_removal_revalidates_lexical_reparse_ancestors(self):
+        module = self.module()
+        root = Path(self.temporary_directory.name) / "cas-reparse"
+        target = root / "target"
+        target.mkdir(parents=True)
+        (target / "payload.txt").write_text("must survive\n", encoding="utf-8")
+        expected = module._install_path_state(target)
+
+        with (
+            patch.object(
+                module,
+                "_reject_reparse_ancestors",
+                side_effect=module.EngineeringError("synthetic reparse ancestor"),
+            ) as reject,
+            self.assertRaisesRegex(module.EngineeringError, "reparse ancestor"),
+        ):
+            module._remove_install_path(target, expected)
+
+        reject.assert_called()
+        self.assertTrue(target.exists())
 
     def test_every_late_install_publication_failure_restores_exact_state(self):
         module = self.module()
@@ -9581,7 +10834,8 @@ class Task7ContractTests(unittest.TestCase):
         injected = False
 
         def inject_change(
-            source, target, expected_pre_state=None, *, preimage_path=None
+            source, target, expected_pre_state=None, *, preimage_path=None,
+            expected_source_state=None, expected_target_state=None,
         ):
             nonlocal injected
             if target == hook and not injected:
@@ -9592,6 +10846,8 @@ class Task7ContractTests(unittest.TestCase):
                 target,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         with (
@@ -9629,7 +10885,8 @@ class Task7ContractTests(unittest.TestCase):
         injected = False
 
         def inject_change(
-            stage, target, expected_pre_state=None, *, preimage_path=None
+            stage, target, expected_pre_state=None, *, preimage_path=None,
+            expected_source_state=None, expected_target_state=None,
         ):
             nonlocal injected
             if not injected:
@@ -9640,6 +10897,8 @@ class Task7ContractTests(unittest.TestCase):
                 target,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         with (
@@ -9664,7 +10923,8 @@ class Task7ContractTests(unittest.TestCase):
         injected = False
 
         def inject_change(
-            source, destination, expected_pre_state=None, *, preimage_path=None
+            source, destination, expected_pre_state=None, *, preimage_path=None,
+            expected_source_state=None, expected_target_state=None,
         ):
             nonlocal injected
             if destination == target and not injected:
@@ -9675,6 +10935,8 @@ class Task7ContractTests(unittest.TestCase):
                 destination,
                 expected_pre_state,
                 preimage_path=preimage_path,
+                expected_source_state=expected_source_state,
+                expected_target_state=expected_target_state,
             )
 
         with (
@@ -9686,7 +10948,7 @@ class Task7ContractTests(unittest.TestCase):
             )
         self.assertEqual("concurrent\n", target.read_text(encoding="utf-8"))
 
-    def test_post_publication_verification_failure_restores_exact_preimage(self):
+    def test_post_publication_verification_failure_preserves_concurrent_substitution(self):
         module = self.module()
         root = self.init_repo("setup-post-publication-rollback")
         target = root / "managed-hook"
@@ -9700,19 +10962,16 @@ class Task7ContractTests(unittest.TestCase):
             target.write_bytes(b"#!/bin/sh\nprintf tampered\n")
             raise module.EngineeringError("synthetic post-publication mismatch")
 
-        with self.assertRaisesRegex(
-            module.EngineeringError, "post-publication mismatch"
-        ):
+        with self.assertRaisesRegex(module.EngineeringError, "target changed"):
             module._transactional_replace(
                 [(stage, target)],
                 "post-publication-test",
                 {target: expected},
                 after_publication=fail_verification,
             )
-        self.assertEqual(original, target.read_bytes())
-        self.assertFalse(
-            target.with_name(".managed-hook.backup-post-publication-test").exists()
-        )
+        self.assertEqual(b"#!/bin/sh\nprintf tampered\n", target.read_bytes())
+        backup = target.with_name(".managed-hook.backup-post-publication-test")
+        self.assertEqual(original, backup.read_bytes())
 
     def test_project_document_cas_preserves_concurrent_instruction_change(self):
         module = self.module()
@@ -10508,6 +11767,12 @@ class DeliveryEvaluationContractTests(unittest.TestCase):
             "verdict": "accepted_exact_artifact",
             "trigger": "completion",
             "model": {"requested": "requested-model", "actual": "actual-model", "fallback": None},
+            "routing": {
+                "reasoning": {"state": "unknown"},
+                "owner_override": {"state": "unknown"},
+                "execution_target": {"state": "unknown"},
+                "scope": {"state": "unknown"},
+            },
             "lanes": {"dependencies": 2, "parallelism": 3},
             "terminal": {
                 "artifact_identity": "sha256:ddb48e5b1d320ff88ac89675b60f8b5f61fb64881c7e8b247efbaff3c87bf075",
@@ -10595,6 +11860,48 @@ class DeliveryEvaluationContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(self.module().EngineeringError, "delivery evaluation"):
                     self.record(root, "run-a1b2c3", value)
+
+    def test_delivery_evaluation_requires_typed_provider_neutral_routing_disclosure(self):
+        """New records disclose routing facts or typed Unknown without provider guessing."""
+        module = self.module()
+        root = self.init_repo("delivery-routing")
+        missing = self.evaluation_input()
+        missing.pop("routing", None)
+        with self.assertRaisesRegex(module.EngineeringError, "routing"):
+            self.record(root, "run-a1b2c3", missing)
+
+        unknown = self.evaluation_input(
+            routing={
+                "reasoning": {"state": "unknown"},
+                "owner_override": {"state": "unknown"},
+                "execution_target": {"state": "unknown"},
+                "scope": {"state": "unknown"},
+            }
+        )
+        recorded = self.record(root, "run-b2c3d4", unknown, digest="sha256:" + "2" * 64)
+        self.assertEqual("unknown", recorded["input"]["routing"]["reasoning"]["state"])
+
+        private = self.evaluation_input(
+            routing={
+                "reasoning": {"state": "recorded", "value": "password=secret"},
+                "owner_override": {"state": "unknown"},
+                "execution_target": {"state": "unknown"},
+                "scope": {"state": "unknown"},
+            }
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "routing"):
+            self.record(root, "run-c3d4e5", private, digest="sha256:" + "3" * 64)
+
+        legacy = self.evaluation_input()
+        legacy.pop("routing", None)
+        self.assertEqual(
+            legacy,
+            module._validate_delivery_evaluation(
+                legacy,
+                allow_legacy_terminal=True,
+                allow_legacy_routing=True,
+            ),
+        )
 
     def test_delivery_evaluation_tracks_reconciled_terminal_event(self):
         root = self.init_repo("delivery-terminal")
@@ -11426,6 +12733,13 @@ class Task10ContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
+        self.home = Path(self.temporary_directory.name) / "host-owned-home"
+        self.home.mkdir()
+        self.engineering_home = patch.dict(
+            os.environ, {"ENGINEERING_USER_HOME": str(self.home)}, clear=False
+        )
+        self.engineering_home.start()
+        self.addCleanup(self.engineering_home.stop)
         self.root = Path(self.temporary_directory.name) / "authority-project"
         subprocess.run(
             ["git", "init", "--initial-branch=main", str(self.root)],
@@ -11456,9 +12770,87 @@ class Task10ContractTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
+        self.auditor_key = Path(self.temporary_directory.name) / "auditor-1-key"
+        self.reviewer_key = Path(self.temporary_directory.name) / "reviewer-1-key"
+        for key in (self.auditor_key, self.reviewer_key):
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+                check=True,
+                capture_output=True,
+            )
         public_key = self.host_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        auditor_public_key = self.auditor_key.with_suffix(".pub").read_text(
+            encoding="ascii"
+        ).strip()
+        reviewer_public_key = self.reviewer_key.with_suffix(".pub").read_text(
+            encoding="ascii"
+        ).strip()
+        self.host_allowed_signers = (
+            "\n".join(
+                (
+                    f"synthetic-host {public_key}",
+                    f"writer-1 {public_key}",
+                    f"auditor-1 {auditor_public_key}",
+                    f"reviewer-1 {reviewer_public_key}",
+                )
+            )
+            + "\n"
+        ).encode("ascii")
+        self.host_authority_dir = (
+            self.home / ".agents" / "engineering" / "host-authority"
+        )
+        self.host_authority_dir.mkdir(parents=True)
+        self.host_anchor_path = self.host_authority_dir / "host-trust-anchor.json"
+        self.host_signers_path = self.host_authority_dir / "allowed-signers"
+        self.host_signers_path.write_bytes(self.host_allowed_signers)
+        self.host_anchor_path.write_text(
+            json.dumps(
+                {
+                    "schema": "engineering.host-trust-anchor.v2",
+                    "anchor_id": "host-anchor-synthetic",
+                    "format_version": 1,
+                    "signers_digest": "sha256:"
+                    + hashlib.sha256(self.host_allowed_signers).hexdigest(),
+                    "identity": {"state": "unknown"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.bootstrap_authority_dir = (
+            self.home / ".agents" / "engineering" / "bootstrap-authority"
+        )
+        self.bootstrap_authority_dir.mkdir(parents=True)
+        self.bootstrap_signers_path = self.bootstrap_authority_dir / "allowed-signers"
+        self.bootstrap_anchor_path = (
+            self.bootstrap_authority_dir / "bootstrap-trust-anchor.json"
+        )
+        self.bootstrap_allowed_signers = (
+            "\n".join(
+                (
+                    f"bootstrap-owner {public_key}",
+                    f"bootstrap-semantic {auditor_public_key}",
+                    f"bootstrap-technical {reviewer_public_key}",
+                )
+            )
+            + "\n"
+        ).encode("ascii")
+        self.bootstrap_signers_path.write_bytes(self.bootstrap_allowed_signers)
+        self.bootstrap_anchor_path.write_text(
+            json.dumps(
+                {
+                    "schema": "engineering.v2.2.6-bootstrap-trust-anchor.v1",
+                    "anchor_id": "bootstrap-anchor-synthetic",
+                    "format_version": 1,
+                    "signers_digest": "sha256:"
+                    + hashlib.sha256(self.bootstrap_allowed_signers).hexdigest(),
+                    "identity": {"state": "unknown"},
+                }
+            ),
+            encoding="utf-8",
+        )
         (self.root / ".engineering-host-approvers").write_text(
-            f"synthetic-host {public_key}\n", encoding="ascii"
+            self.host_allowed_signers.decode("ascii"),
+            encoding="ascii",
         )
         (self.root / "README.md").write_text("# Authority fixture\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
@@ -11468,21 +12860,39 @@ class Task10ContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        self.authority_remote = Path(self.temporary_directory.name) / "authority-origin.git"
         subprocess.run(
-            ["git", "-C", str(self.root), "remote", "add", "origin", "https://example.invalid/authority.git"],
+            ["git", "init", "--bare", "--initial-branch=main", str(self.authority_remote)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "remote", "add", "origin", str(self.authority_remote)],
             check=True,
         )
         subprocess.run(
-            ["git", "-C", str(self.root), "update-ref", "refs/remotes/origin/main", "HEAD"],
+            ["git", "-C", str(self.root), "push", "-u", "origin", "main"],
             check=True,
+            capture_output=True,
+            text=True,
         )
         subprocess.run(
-            ["git", "-C", str(self.root), "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            ["git", "-C", str(self.root), "remote", "set-head", "origin", "-a"],
             check=True,
+            capture_output=True,
+            text=True,
         )
         self.repository_id = engineering._project_contribution_digest(self.root)
+        self.repository_identity_original = engineering._project_contribution_digest
         self.repository_identity = patch.object(
-            engineering, "_project_contribution_digest", return_value=self.repository_id
+            engineering,
+            "_project_contribution_digest",
+            side_effect=lambda root: (
+                self.repository_id
+                if Path(root).resolve() == self.root.resolve()
+                else self.repository_identity_original(Path(root))
+            ),
         )
         self.repository_identity.start()
         self.addCleanup(self.repository_identity.stop)
@@ -11496,11 +12906,79 @@ class Task10ContractTests(unittest.TestCase):
         )
         self.private_reader.start()
         self.addCleanup(self.private_reader.stop)
+        self.canonical_host_home = patch.object(
+            engineering, "_canonical_host_home", return_value=self.home
+        )
+        self.canonical_host_home.start()
+        self.addCleanup(self.canonical_host_home.stop)
 
     def module(self):
         if engineering is None:
             self.fail("scripts/engineering.py must exist")
         return engineering
+
+    def host_receipt_for(
+        self,
+        *,
+        contract,
+        authority_epoch="epoch-local-1",
+        repository_id=None,
+        anchor=None,
+    ):
+        anchor = anchor or json.loads(self.host_anchor_path.read_text(encoding="utf-8"))
+        return {
+            "schema": "engineering.host-receipt.v1",
+            "receipt_id": "host-receipt-synthetic",
+            "repository_id": repository_id or self.repository_id,
+            "authority_epoch": authority_epoch,
+            "contract": contract,
+            "identity": {"state": "unknown"},
+            "trust_anchor": anchor,
+        }
+
+    def sign_host_approval(
+        self,
+        *,
+        schema,
+        claims_schema,
+        claims,
+        namespace,
+        contract,
+        authority_epoch,
+        signer=None,
+        approver="synthetic-host",
+        receipt=None,
+    ):
+        module = self.module()
+        receipt = receipt or self.host_receipt_for(
+            contract=contract, authority_epoch=authority_epoch
+        )
+        material = module._canonical_json(
+            {"schema": claims_schema, "claims": claims, "host_receipt": receipt}
+        )
+        claims_path = Path(self.temporary_directory.name) / f"host-approval-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(signer or self.host_key),
+                "-n",
+                namespace,
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": schema,
+            "approver": approver,
+            "claims": claims,
+            "host_receipt": receipt,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
 
     def binding(self, **changes):
         module = self.module()
@@ -11521,31 +12999,14 @@ class Task10ContractTests(unittest.TestCase):
     def approval(self, value):
         module = self.module()
         normalized = module._scoped_authority_binding(self.root, value)
-        material = module._canonical_json(
-            {"schema": "engineering.host-authority-claims.v1", "claims": normalized}
+        return self.sign_host_approval(
+            schema=module.HOST_AUTHORITY_APPROVAL_SCHEMA,
+            claims_schema="engineering.host-authority-claims.v3",
+            claims=normalized,
+            namespace="engineering-authority",
+            contract=module.SCOPED_AUTHORITY_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
         )
-        claims_path = Path(self.temporary_directory.name) / f"claims-{time.time_ns()}.json"
-        claims_path.write_bytes(material)
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "sign",
-                "-f",
-                str(self.host_key),
-                "-n",
-                "engineering-authority",
-                str(claims_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return {
-            "schema": "engineering.host-authority-approval.v1",
-            "approver": "synthetic-host",
-            "claims": normalized,
-            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
-        }
 
     def persist(self, binding=None, **changes):
         module = self.module()
@@ -11846,7 +13307,11 @@ class Task10ContractTests(unittest.TestCase):
             worker.start()
         barrier.wait()
         for worker in workers:
-            worker.join(timeout=10)
+            # Authority mutations use the shared completion cleanup boundary,
+            # whose bounded recovery budget is 30 seconds.  Keep this test
+            # fail-closed for a real liveness fault without declaring a busy
+            # Windows host deadlocked halfway through that documented budget.
+            worker.join(timeout=35)
             self.assertFalse(worker.is_alive())
         self.assertEqual(1, sum(item in {"revoked", "consumed"} for item in outcomes))
         self.assertEqual(
@@ -11889,6 +13354,2525 @@ class Task10ContractTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, contract)
+
+class Task11OwnerIntentContractTests(Task10ContractTests):
+    """Owner-private intent bindings prevent candidate-local scope narrowing."""
+
+    def owner_intent_binding(self, **changes):
+        value = {
+            "schema": "engineering.owner-intent.v1",
+            "intent_id": "intent-native-graph",
+            "repository_id": self.repository_id,
+            "authority_epoch": "epoch-local-1",
+            "source_evidence": [
+                {
+                    "identity": "source-owner-approval",
+                    "digest": "sha256:" + "1" * 64,
+                }
+            ],
+            "outcomes": [
+                {
+                    "id": "OUTCOME-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                        }
+                    ],
+                }
+            ],
+            "predecessor": {
+                "schema": "engineering.owner-intent-predecessor.v1",
+                "state": "none",
+            },
+        }
+        value.update(changes)
+        return value
+
+    def owner_intent_approval(
+        self, binding, *, receipt_changes=None, signer=None, approver="synthetic-host"
+    ):
+        return self.host_owner_intent_approval(
+            binding,
+            receipt_changes=receipt_changes,
+            signer=signer,
+            approver=approver,
+        )
+
+    def bound_native_owner_intent(self):
+        module = self.module()
+        binding = self.owner_intent_binding()
+        return module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+
+    def owner_exception(
+        self,
+        intent,
+        outcome_id,
+        disposition,
+        *,
+        exception_id="exception-native-graph",
+        receipt_changes=None,
+        signer=None,
+        approver="synthetic-host",
+    ):
+        module = self.module()
+        claims = {
+            "exception_id": exception_id,
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "outcome_id": outcome_id,
+            "disposition": disposition,
+        }
+        receipt = self.host_receipt(
+            contract=module.OWNER_EXCEPTION_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+        )
+        receipt.update(receipt_changes or {})
+        return self.sign_host_approval(
+            schema=module.OWNER_EXCEPTION_SCHEMA,
+            claims_schema="engineering.host-owner-exception-claims.v3",
+            claims=claims,
+            namespace="engineering-owner-exception",
+            contract=module.OWNER_EXCEPTION_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            signer=signer,
+            approver=approver,
+            receipt=receipt,
+        )
+
+    def outcome_equivalence(self, owner_intent=None, **changes):
+        module = self.module()
+        value = {
+            "schema": "engineering.outcome-equivalence.v2",
+            "reviewer_id": "reviewer-1",
+            "architect_id": "architect-1",
+            "implementer_id": "implementer-1",
+            "writer_id": "writer-1",
+            "evidence_id": "evidence-equivalence",
+            "evidence_digest": "sha256:" + "6" * 64,
+        }
+        signer = changes.pop("signer", self.reviewer_key)
+        approver = changes.pop("approver", value["reviewer_id"])
+        value.update(changes)
+        claims = {
+            name: value[name]
+            for name in (
+                "reviewer_id",
+                "architect_id",
+                "implementer_id",
+                "writer_id",
+                "evidence_id",
+                "evidence_digest",
+            )
+        }
+        owner_intent = owner_intent or module._active_owner_intent(self.root)
+        return {
+            **value,
+            "equivalence_attestation": self.sign_host_approval(
+                schema=module.OUTCOME_EQUIVALENCE_ATTESTATION_SCHEMA,
+                claims_schema="engineering.outcome-equivalence-claims.v2",
+                claims=claims,
+                namespace="engineering-outcome-equivalence",
+                contract=module.OUTCOME_EQUIVALENCE_SCHEMA,
+                authority_epoch=owner_intent["authority_epoch"],
+                signer=signer,
+                approver=approver,
+            ),
+        }
+
+    def outcome_survival_v2(self, intent, **changes):
+        outcome_id = intent["outcomes"][0]["id"]
+        value = {
+            "schema": "engineering.outcome-survival.v2",
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "mappings": [
+                {
+                    "outcome_id": outcome_id,
+                    "disposition": "INCLUDED",
+                    "reason": "Retain executable native graph outcome.",
+                    "verification_ids": ["evidence-native-graph"],
+                    "replacement_ids": [],
+                    "equivalence": None,
+                    "owner_exception": None,
+                }
+            ],
+        }
+        value.update(changes)
+        return value
+
+    def installable_bundle_source(self):
+        module = self.module()
+        source = self.root / ".agents" / "skills" / "engineering"
+        (source / "scripts").mkdir(parents=True)
+        (source / "references").mkdir()
+        (source / "SKILL.md").write_text(
+            "---\nname: engineering\ndescription: synthetic release bundle\n---\n",
+            encoding="utf-8",
+        )
+        (source / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "name": "engineering",
+                    "version": "2.2.6",
+                    "graphify": {"commit": module.GRAPHIFY_COMMIT},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (source / "scripts" / "engineering.py").write_text(
+            "# synthetic release bundle\n", encoding="utf-8"
+        )
+        (source / "references" / "controller-contract.md").write_text(
+            "# Synthetic controller contract\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".agents"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "add release bundle"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return source
+
+    def bootstrap_anchor(self):
+        return json.loads(self.bootstrap_anchor_path.read_text(encoding="utf-8"))
+
+    def bootstrap_host_receipt(self, *, contract, authority_epoch="epoch-local-1"):
+        return {
+            "schema": "engineering.v2.2.6-bootstrap-host-receipt.v1",
+            "receipt_id": "bootstrap-host-receipt-synthetic",
+            "repository_id": self.repository_id,
+            "authority_epoch": authority_epoch,
+            "contract": contract,
+            "identity": {"state": "unknown"},
+            "trust_anchor": self.bootstrap_anchor(),
+        }
+
+    def sign_bootstrap_evidence(
+        self,
+        *,
+        schema,
+        claims_schema,
+        claims,
+        namespace,
+        contract,
+        signer,
+        approver,
+        authority_epoch="epoch-local-1",
+    ):
+        module = self.module()
+        receipt = self.bootstrap_host_receipt(
+            contract=contract, authority_epoch=authority_epoch
+        )
+        material = module._canonical_json(
+            {"schema": claims_schema, "claims": claims, "host_receipt": receipt}
+        )
+        claims_path = Path(
+            self.temporary_directory.name
+        ) / f"bootstrap-evidence-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(signer),
+                "-n",
+                namespace,
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": schema,
+            "approver": approver,
+            "claims": claims,
+            "host_receipt": receipt,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def installed_v225_receipt(self):
+        if hasattr(self, "_installed_v225_receipt"):
+            return self._installed_v225_receipt
+        module = self.module()
+        source_root = Path(self.temporary_directory.name) / "installed-v225-source"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(source_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        source = source_root / ".agents" / "skills" / "engineering"
+        (source / "scripts").mkdir(parents=True)
+        (source / "references").mkdir()
+        (source / "SKILL.md").write_text(
+            "---\nname: engineering\ndescription: synthetic v2.2.5 bundle\n---\n",
+            encoding="utf-8",
+        )
+        (source / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "name": "engineering",
+                    "version": "2.2.5",
+                    "graphify": {"commit": module.GRAPHIFY_COMMIT},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (source / "scripts" / "engineering.py").write_text(
+            "# synthetic v2.2.5 release bundle\n", encoding="utf-8"
+        )
+        (source / "references" / "controller-contract.md").write_text(
+            "# Synthetic v2.2.5 controller contract\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(source_root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(source_root), "commit", "-m", "add v2.2.5 bundle"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        module.install_bundle(source, self.home)
+        receipt_path = module._install_paths(self.home)["receipt"]
+        key = module._controller_key(
+            self.home / ".agents" / "engineering" / "controller", required=True
+        )
+        self._installed_v225_receipt = module._load_install_receipt(receipt_path, key)
+        return self._installed_v225_receipt
+
+    def public_bundle_source(self, source):
+        public_root = Path(self.temporary_directory.name) / f"public-v226-{time.time_ns()}"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(public_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(public_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(public_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        (public_root / "README.md").write_text("# Public bootstrap base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(public_root), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(public_root), "commit", "-m", "public bootstrap base"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        destination = public_root / ".agents" / "skills" / "engineering"
+        shutil.copytree(source, destination)
+        subprocess.run(["git", "-C", str(public_root), "add", ".agents"], check=True)
+        subprocess.run(
+            ["git", "-C", str(public_root), "commit", "-m", "add public v2.2.6 bundle"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return destination
+
+    def bootstrap_candidate(self, source, role):
+        module = self.module()
+        _, manifest, source_commit, source_digest = module._bundle_files(source)
+        repository = Path(
+            subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        ).resolve()
+        source_tree = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        base_commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD^"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        candidate = {
+            "role": role,
+            "repository_id": module._project_contribution_digest(repository),
+            "source_git_commit": source_commit,
+            "source_git_tree": source_tree,
+            "source_digest": source_digest,
+            "skill_version": manifest["version"],
+            "base_commit": base_commit,
+        }
+        candidate["artifact_digest"] = "sha256:" + hashlib.sha256(
+            module._canonical_json(candidate)
+        ).hexdigest()
+        return candidate
+
+    def bootstrap_pair_digest(self, candidates):
+        module = self.module()
+        return "sha256:" + hashlib.sha256(
+            module._canonical_json(sorted(candidates, key=lambda item: item["role"]))
+        ).hexdigest()
+
+    def bootstrap_ancestry_digest(self, candidates):
+        module = self.module()
+        return "sha256:" + hashlib.sha256(
+            module._canonical_json(
+                [
+                    {
+                        "role": item["role"],
+                        "base_commit": item["base_commit"],
+                        "source_git_commit": item["source_git_commit"],
+                    }
+                    for item in sorted(candidates, key=lambda item: item["role"])
+                ]
+            )
+        ).hexdigest()
+
+    def bootstrap_authorization(self, source, *, issued_at=None, audit_specs=None):
+        module = self.module()
+        public_source = self.public_bundle_source(source)
+        candidates = [
+            self.bootstrap_candidate(source, "internal"),
+            self.bootstrap_candidate(public_source, "public"),
+        ]
+        pair_digest = self.bootstrap_pair_digest(candidates)
+        ancestry_digest = self.bootstrap_ancestry_digest(candidates)
+        receipt = self.installed_v225_receipt()
+        issued_at = issued_at or module._utc_now()
+        installed_v225 = {
+            "receipt_digest": module._json_digest(receipt),
+            "skill_version": receipt["skill_version"],
+            "source_git_commit": receipt["source_git_commit"],
+            "source_digest": receipt["source_digest"],
+        }
+        owner_claims = {
+            "approval_id": "bootstrap-owner-approval",
+            "repository_id": self.repository_id,
+            "authority_epoch": "epoch-local-1",
+            "candidate_pair_digest": pair_digest,
+            "installed_v225_receipt_digest": installed_v225["receipt_digest"],
+            "decision": "owner_approved",
+            "issued_at": issued_at,
+            "replay_nonce": "bootstrap-owner-nonce",
+        }
+        owner_approval = self.sign_bootstrap_evidence(
+            schema="engineering.v2.2.6-bootstrap-owner-approval.v1",
+            claims_schema="engineering.v2.2.6-bootstrap-owner-claims.v1",
+            claims=owner_claims,
+            namespace="engineering-v226-bootstrap-owner",
+            contract="engineering.v2.2.6-bootstrap-owner-approval.v1",
+            signer=self.host_key,
+            approver="bootstrap-owner",
+        )
+        audits = []
+        audit_specs = audit_specs or (
+            ("bootstrap-audit-semantic", "semantic", self.auditor_key, "bootstrap-semantic", "bootstrap-semantic-nonce"),
+            ("bootstrap-audit-technical", "technical", self.reviewer_key, "bootstrap-technical", "bootstrap-technical-nonce"),
+        )
+        for audit_id, auditor_role, signer, approver, nonce in audit_specs:
+            claims = {
+                "audit_id": audit_id,
+                "auditor_role": auditor_role,
+                "repository_id": self.repository_id,
+                "authority_epoch": "epoch-local-1",
+                "candidate_pair_digest": pair_digest,
+                "candidate_ancestry_digest": ancestry_digest,
+                "decision": "accepted",
+                "issued_at": issued_at,
+                "replay_nonce": nonce,
+            }
+            audits.append(
+                self.sign_bootstrap_evidence(
+                    schema="engineering.v2.2.6-bootstrap-audit.v1",
+                    claims_schema="engineering.v2.2.6-bootstrap-audit-claims.v1",
+                    claims=claims,
+                    namespace="engineering-v226-bootstrap-audit",
+                    contract="engineering.v2.2.6-bootstrap-audit.v1",
+                    signer=signer,
+                    approver=approver,
+                )
+            )
+        record = {
+            "schema": "engineering.v2.2.6-bootstrap-host-record.v1",
+            "record_id": "bootstrap-record-v226",
+            "repository_id": self.repository_id,
+            "authority_epoch": "epoch-local-1",
+            "candidate_pair": sorted(candidates, key=lambda item: item["role"]),
+            "candidate_pair_digest": pair_digest,
+            "installed_v225": installed_v225,
+            "owner_approval": owner_approval,
+            "independent_audits": audits,
+            "issued_at": issued_at,
+            "replay_nonce": "bootstrap-record-nonce",
+            "public_source": str(public_source),
+            "identity": {"state": "unknown"},
+        }
+        _, manifest, source_commit, source_digest = module._bundle_files(source)
+        source_tree = module._bundle_git_tree(source, source_commit)
+        return {
+            "record": record,
+            "authorization": {
+                "schema": "engineering.v2.2.6-bootstrap-authorization.v2",
+                "record_id": record["record_id"],
+                "record_digest": module._json_digest(record),
+                "source_bundle": {
+                    "source_git_commit": source_commit,
+                    "source_git_tree": source_tree,
+                    "source_digest": source_digest,
+                    "skill_version": manifest["version"],
+                },
+            },
+        }
+
+    def publish_bootstrap_authorization(self, material):
+        path = self.bootstrap_authority_dir / "v2.2.6-authorization.json"
+        path.write_text(json.dumps(material["record"]), encoding="utf-8")
+        return material["authorization"]
+
+    def host_anchor(self, **changes):
+        value = json.loads(self.host_anchor_path.read_text(encoding="utf-8"))
+        value.update(changes)
+        return value
+
+    def host_receipt(
+        self,
+        *,
+        contract,
+        authority_epoch="epoch-local-1",
+        repository_id=None,
+        anchor=None,
+    ):
+        return {
+            "schema": "engineering.host-receipt.v1",
+            "receipt_id": "host-receipt-synthetic",
+            "repository_id": repository_id or self.repository_id,
+            "authority_epoch": authority_epoch,
+            "contract": contract,
+            "identity": {"state": "unknown"},
+            "trust_anchor": anchor or self.host_anchor(),
+        }
+
+    def host_owner_intent_approval(
+        self, binding, *, receipt_changes=None, signer=None, approver="synthetic-host"
+    ):
+        module = self.module()
+        normalized = module._owner_intent_binding(self.root, binding)
+        receipt = self.host_receipt(
+            contract="engineering.owner-intent.v1",
+            authority_epoch=normalized["authority_epoch"],
+        )
+        receipt.update(receipt_changes or {})
+        return self.sign_host_approval(
+            schema=module.HOST_OWNER_INTENT_APPROVAL_SCHEMA,
+            claims_schema="engineering.host-owner-intent-claims.v3",
+            claims=normalized,
+            namespace="engineering-owner-intent",
+            contract=module.OWNER_INTENT_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
+            signer=signer,
+            approver=approver,
+            receipt=receipt,
+        )
+
+    def owner_intent_import(self, intent):
+        return {
+            "schema": "engineering.owner-intent-import.v1",
+            "import_id": "intent-import-native-graph",
+            "repository_id": intent["repository_id"],
+            "authority_epoch": intent["authority_epoch"],
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "outcome_ids": sorted(item["id"] for item in intent["outcomes"]),
+            "coverage_scopes": ["accepted_owner_outcomes", "product_releases"],
+        }
+
+    def owner_intent_import_approval(self, imported):
+        module = self.module()
+        receipt = self.host_receipt(
+            contract="engineering.owner-intent-import.v1",
+            authority_epoch=imported["authority_epoch"],
+        )
+        material = module._canonical_json(
+            {
+                "schema": "engineering.host-owner-intent-import-claims.v1",
+                "claims": imported,
+                "host_receipt": receipt,
+            }
+        )
+        claims_path = Path(self.temporary_directory.name) / f"owner-intent-import-{time.time_ns()}.json"
+        claims_path.write_bytes(material)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(self.host_key),
+                "-n",
+                "engineering-owner-intent-import",
+                str(claims_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return {
+            "schema": "engineering.host-owner-intent-import-approval.v1",
+            "approver": "synthetic-host",
+            "claims": imported,
+            "host_receipt": receipt,
+            "signature": claims_path.with_suffix(".json.sig").read_text(encoding="ascii"),
+        }
+
+    def terminal_completion(self, survival):
+        return {
+            "schema": "engineering.complete.v1",
+            "run_id": "run-a1b2c3",
+            "authorization": {"scope_handoff": {"outcome_survival": survival}},
+            "owner_intent": {
+                "intent_id": survival["owner_intent_id"],
+                "owner_intent_digest": survival["owner_intent_digest"],
+                "authority_epoch": "epoch-local-1",
+            },
+            "result_identity": {
+                "commit": "a" * 40,
+                "dirty_tree_digest": None,
+            },
+            "changed_artifacts": ["src/native_graph.py"],
+            "scope_result_artifacts": ["src/native_graph.py"],
+        }
+
+    def outcome_acceptance(
+        self, intent, survival, evidence_class="real_outcome", evidence=None
+    ):
+        module = self.module()
+        completion = self.terminal_completion(survival)
+        completion_digest = "sha256:" + "3" * 64
+        artifact_digest = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        value = {
+            "schema": "engineering.outcome-acceptance.v1",
+            "acceptance_id": "acceptance-native-graph",
+            "completion_digest": completion_digest,
+            "artifact_digest": artifact_digest,
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "mapping_digest": survival["mapping_digest"],
+            "evidence_digest": None,
+            "roles": {
+                "architect_id": "architect-1",
+                "implementer_id": "implementer-1",
+                "writer_id": "writer-1",
+                "auditor_id": "auditor-1",
+            },
+            "audit_attestation": None,
+            "outcomes": [
+                {
+                    "outcome_id": intent["outcomes"][0]["id"],
+                    "state": "accepted",
+                    "evidence": evidence if evidence is not None else [
+                        {
+                            "evidence_id": "evidence-native-graph",
+                            "evidence_digest": "sha256:" + "4" * 64,
+                            "class": evidence_class,
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                            "producer_role": "codex_native",
+                        }
+                    ],
+                }
+            ],
+        }
+        value["evidence_digest"] = module._outcome_evidence_matrix_digest(
+            value["outcomes"]
+        )
+        value["audit_attestation"] = self.audit_attestation(value)
+        return completion, completion_digest, value
+
+    def audit_attestation(
+        self, acceptance, *, receipt_changes=None, signer=None, approver=None
+    ):
+        module = self.module()
+        claims = module._outcome_audit_claims(acceptance)
+        intent = module._active_owner_intent(
+            self.root, acceptance["owner_intent_id"], acceptance["owner_intent_digest"]
+        )
+        receipt = self.host_receipt(
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+        )
+        receipt.update(receipt_changes or {})
+        return self.sign_host_approval(
+            schema=module.INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
+            claims_schema="engineering.independent-outcome-audit-claims.v3",
+            claims=claims,
+            namespace="engineering-independent-audit",
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            signer=signer or self.auditor_key,
+            approver=approver or acceptance["roles"]["auditor_id"],
+            receipt=receipt,
+        )
+
+    def traceability_host_attestation(
+        self, receipt, *, host_receipt=None, signer=None, approver="synthetic-host"
+    ):
+        module = self.module()
+        claims = module._traceability_host_claims(receipt)
+        return self.sign_host_approval(
+            schema=module.TRACEABILITY_HOST_ATTESTATION_SCHEMA,
+            claims_schema="engineering.traceability-host-claims.v3",
+            claims=claims,
+            namespace="engineering-traceability",
+            contract="engineering.traceability-host-attestation.v2",
+            authority_epoch="epoch-local-1",
+            signer=signer,
+            approver=approver,
+            receipt=host_receipt,
+        )
+
+    def test_owner_intent_requires_external_host_signature(self):
+        """Accepting a forged owner baseline would reintroduce self-approval."""
+        module = self.module()
+        with self.assertRaisesRegex(module.EngineeringError, "owner intent host approval"):
+            module.bind_owner_intent(
+                self.root,
+                self.owner_intent_binding(),
+                {"fabricated": True},
+            )
+
+    def test_owner_intent_successor_requires_explicit_complete_predecessor_dispositions(self):
+        """An active approved baseline cannot disappear behind a new binding."""
+        module = self.module()
+        missing = self.owner_intent_binding()
+        missing.pop("predecessor", None)
+        with self.assertRaisesRegex(module.EngineeringError, "predecessor"):
+            module.bind_owner_intent(
+                self.root, missing, self.owner_intent_approval(missing)
+            )
+
+        initial_binding = self.owner_intent_binding(
+            predecessor={"schema": "engineering.owner-intent-predecessor.v1", "state": "none"}
+        )
+        initial = module.bind_owner_intent(
+            self.root,
+            initial_binding,
+            self.owner_intent_approval(initial_binding),
+        )
+        partial = self.owner_intent_binding(
+            intent_id="intent-successor",
+            predecessor={"schema": "engineering.owner-intent-predecessor.v1", "state": "none"},
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "predecessor"):
+            module.bind_owner_intent(
+                self.root, partial, self.owner_intent_approval(partial)
+            )
+
+        transition = {
+            "schema": "engineering.owner-intent-predecessor.v1",
+            "state": "successor",
+            "intent_id": initial["intent_id"],
+            "owner_intent_digest": initial["owner_intent_digest"],
+            "dispositions": [
+                {
+                    "outcome_id": "OUTCOME-NATIVE-GRAPH",
+                    "disposition": "CARRIED_FORWARD",
+                    "successor_outcome_id": "OUTCOME-NATIVE-GRAPH",
+                }
+            ],
+        }
+        successor_binding = self.owner_intent_binding(
+            intent_id="intent-successor", predecessor=transition
+        )
+        approval = self.owner_intent_approval(successor_binding)
+        successor = module.bind_owner_intent(self.root, successor_binding, approval)
+        replay = module.bind_owner_intent(self.root, successor_binding, approval)
+        self.assertEqual(successor, replay)
+        self.assertEqual(transition, successor["predecessor"])
+        ledger = module._load_owner_intents(self.root)
+        prior = next(item for item in ledger["intents"] if item["intent_id"] == initial["intent_id"])
+        self.assertEqual("superseded", prior["status"])
+
+    def test_v226_bootstrap_acceptance_does_not_call_postactivation_trust(self):
+        """The first v2.2.6 delivery cannot depend on its uninstalled host gate."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        authorization = self.publish_bootstrap_authorization(self.bootstrap_authorization(source))
+        with patch.object(
+            module,
+            "_host_owned_trust_anchor",
+            create=True,
+            side_effect=AssertionError("post-activation trust must not run"),
+        ):
+            receipt = module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization=authorization,
+            )
+        self.assertEqual("installed", receipt["status"])
+        self.assertEqual(
+            authorization["source_bundle"], receipt["bootstrap_authorization"]["source_bundle"]
+        )
+
+    def test_v226_bootstrap_needs_no_github_policy_collaborator_or_personal_key(self):
+        """Bootstrap facts are sufficient without repository administration or a human key."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(source)
+        self.publish_bootstrap_authorization(material)
+        with patch.object(
+            module,
+            "_host_owned_trust_anchor",
+            create=True,
+            side_effect=AssertionError("post-activation trust must not run"),
+        ):
+            status = module.v226_bootstrap_handoff_status(source, self.home)
+        self.assertEqual("post_audit_authorization_available", status["state"])
+        self.assertEqual(material["authorization"], status["bootstrap_authorization"])
+
+    def test_v226_bootstrap_requires_semantic_and_technical_audit_categories(self):
+        """Distinct arbitrary labels cannot stand in for the required two audit categories."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(
+            source,
+            audit_specs=(
+                ("bootstrap-audit-semantic", "architecture", self.auditor_key, "bootstrap-semantic", "bootstrap-architecture-nonce"),
+                ("bootstrap-audit-technical", "verification", self.reviewer_key, "bootstrap-technical", "bootstrap-verification-nonce"),
+            ),
+        )
+        self.publish_bootstrap_authorization(material)
+
+        with self.assertRaisesRegex(module.EngineeringError, "semantic.*technical|required audit"):
+            module.v226_bootstrap_handoff_status(source, self.home)
+
+    def test_v226_bootstrap_rejects_an_authorization_for_a_different_source_bundle(self):
+        """Bootstrap audit facts for A cannot authorize copying clean bundle B."""
+        module = self.module()
+        source_a = self.installable_bundle_source()
+        authorization = self.publish_bootstrap_authorization(self.bootstrap_authorization(source_a))
+        other_root = Path(self.temporary_directory.name) / "bootstrap-bundle-b"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(other_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        source_b = other_root / ".agents" / "skills" / "engineering"
+        shutil.copytree(source_a, source_b)
+        (source_b / "scripts" / "engineering.py").write_text(
+            "# distinct clean bootstrap bundle B\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(other_root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(other_root), "commit", "-m", "bootstrap bundle B"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "bootstrap authorization|source bundle"):
+            module.install_bundle(
+                source_b,
+                self.home,
+                bootstrap_authorization=authorization,
+            )
+
+    def test_v226_bootstrap_rejects_candidate_supplied_authorization_absent_from_host_boundary(self):
+        """A candidate cannot invent the durable root package-approval record."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        authorization = self.bootstrap_authorization(source)["authorization"]
+
+        with self.assertRaisesRegex(module.EngineeringError, "host.*bootstrap"):
+            module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization=authorization,
+            )
+
+    def test_v226_bootstrap_reports_pre_audit_capability_without_self_authorizing(self):
+        """Before audits, the supported handoff exposes evidence but never installs a candidate."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        self.installed_v225_receipt()
+        with patch.object(
+            module,
+            "_host_owned_trust_anchor",
+            create=True,
+            side_effect=AssertionError("post-activation trust must not run"),
+        ):
+            status = module.v226_bootstrap_handoff_status(source, self.home)
+        self.assertEqual("pre_audit_capability_evidence", status["state"])
+        self.assertEqual("root", status["post_audit_authority"])
+        self.assertEqual(
+            {"installed_v225", "owner_approval", "independent_audits"},
+            set(status["required_external_evidence"]),
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "host bootstrap"):
+            module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization={
+                    "schema": "engineering.v2.2.6-bootstrap-authorization.v2",
+                    "record_id": "bootstrap-record-v226",
+                    "record_digest": "sha256:" + "a" * 64,
+                    "source_bundle": status["source_bundle"],
+                },
+            )
+
+    def test_v226_bootstrap_handoff_status_cli_is_read_only_and_exact(self):
+        """The supported pre/post-audit handoff is a public read-only controller command."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "candidate-skill"
+        home = Path(self.temporary_directory.name) / "host-home"
+        output = io.StringIO()
+        expected = {
+            "schema": "engineering.v2.2.6-bootstrap-handoff.v1",
+            "state": "pre_audit_capability_evidence",
+            "post_audit_authority": "root",
+        }
+        with (
+            patch.object(module, "v226_bootstrap_handoff_status", return_value=expected) as status,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "bootstrap-handoff-status",
+                    str(source),
+                    "--home",
+                    str(home),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        status.assert_called_once_with(source, home)
+        self.assertEqual(expected, json.loads(output.getvalue()))
+
+    def test_v226_bootstrap_fails_closed_for_invalid_external_evidence(self):
+        """The host record must resolve signed, current, distinct, exact evidence."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(source)
+        now = module.datetime.now(module.timezone.utc)
+        cases = []
+
+        forged = json.loads(json.dumps(material))
+        forged["record"]["owner_approval"]["claims"]["decision"] = "owner_rejected"
+        cases.append(("forged", forged))
+
+        stale = self.bootstrap_authorization(
+            source,
+            issued_at=(now - module.timedelta(days=31)).isoformat().replace("+00:00", "Z"),
+        )
+        cases.append(("stale", stale))
+
+        mismatched = json.loads(json.dumps(material))
+        mismatched["record"]["candidate_pair"][0]["source_digest"] = "sha256:" + "f" * 64
+        mismatched["authorization"]["record_digest"] = module._json_digest(
+            mismatched["record"]
+        )
+        cases.append(("mismatched", mismatched))
+
+        duplicate = json.loads(json.dumps(material))
+        duplicate["record"]["independent_audits"] = [
+            duplicate["record"]["independent_audits"][0],
+            duplicate["record"]["independent_audits"][0],
+        ]
+        duplicate["authorization"]["record_digest"] = module._json_digest(
+            duplicate["record"]
+        )
+        cases.append(("duplicate", duplicate))
+
+        owner_as_auditor = json.loads(json.dumps(material))
+        owner_audit_claims = owner_as_auditor["record"]["independent_audits"][1]["claims"]
+        owner_audit_claims["replay_nonce"] = "bootstrap-owner-audit-nonce"
+        owner_as_auditor["record"]["independent_audits"][1] = self.sign_bootstrap_evidence(
+            schema="engineering.v2.2.6-bootstrap-audit.v1",
+            claims_schema="engineering.v2.2.6-bootstrap-audit-claims.v1",
+            claims=owner_audit_claims,
+            namespace="engineering-v226-bootstrap-audit",
+            contract="engineering.v2.2.6-bootstrap-audit.v1",
+            signer=self.host_key,
+            approver="bootstrap-owner",
+        )
+        owner_as_auditor["authorization"]["record_digest"] = module._json_digest(
+            owner_as_auditor["record"]
+        )
+        cases.append(("owner_as_auditor", owner_as_auditor))
+
+        for field, value in (
+            ("repository_id", "sha256:" + "f" * 64),
+            ("authority_epoch", "epoch-wrong"),
+            ("contract", "engineering.wrong-bootstrap-contract.v1"),
+        ):
+            wrong_receipt = json.loads(json.dumps(material))
+            wrong_receipt["record"]["owner_approval"]["host_receipt"][field] = value
+            wrong_receipt["authorization"]["record_digest"] = module._json_digest(
+                wrong_receipt["record"]
+            )
+            cases.append((f"wrong_{field}", wrong_receipt))
+
+        for label, candidate in cases:
+            with self.subTest(label=label):
+                self.publish_bootstrap_authorization(candidate)
+                with self.assertRaisesRegex(module.EngineeringError, "bootstrap"):
+                    module.v226_bootstrap_handoff_status(source, self.home)
+
+    def test_v226_bootstrap_fails_closed_when_installed_v225_receipt_is_unavailable(self):
+        """A host record cannot stand in for the actual installed v2.2.5 evidence."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(source)
+        self.publish_bootstrap_authorization(material)
+        module._install_paths(self.home)["receipt"].unlink()
+        with self.assertRaisesRegex(module.EngineeringError, "v2.2.5 installed receipt"):
+            module.v226_bootstrap_handoff_status(source, self.home)
+
+    def test_v226_bootstrap_replay_is_exact_and_cannot_replace_host_record(self):
+        """An exact record is idempotent; a changed record cannot replace its installed receipt."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        material = self.bootstrap_authorization(source)
+        authorization = self.publish_bootstrap_authorization(material)
+        first = module.install_bundle(
+            source, self.home, bootstrap_authorization=authorization
+        )
+        replay = module.install_bundle(
+            source, self.home, bootstrap_authorization=authorization
+        )
+        self.assertEqual(first, replay)
+
+        replacement = json.loads(json.dumps(material))
+        replacement["record"]["replay_nonce"] = "bootstrap-replacement-nonce"
+        replacement["authorization"]["record_digest"] = module._json_digest(
+            replacement["record"]
+        )
+        self.publish_bootstrap_authorization(replacement)
+        with self.assertRaisesRegex(module.EngineeringError, "bootstrap authorization"):
+            module.install_bundle(
+                source,
+                self.home,
+                bootstrap_authorization=replacement["authorization"],
+            )
+
+    def test_candidate_local_signer_substitution_is_rejected_after_activation(self):
+        """A candidate Git signer file cannot replace the host-owned anchor."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        trusted = self.host_owner_intent_approval(binding)
+        attacker_key = Path(self.temporary_directory.name) / "attacker-host-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_signers = (
+            "attacker-host "
+            + attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+            + "\n"
+        ).encode("ascii")
+        (self.root / ".engineering-host-approvers").write_bytes(attacker_signers)
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", ".engineering-host-approvers"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate signer substitution"],
+            check=True,
+            capture_output=True,
+        )
+        trusted_record = module.bind_owner_intent(self.root, binding, trusted)
+        self.assertEqual("intent-native-graph", trusted_record["intent_id"])
+
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(attacker_signers).hexdigest(),
+        )
+        attacker = self.host_owner_intent_approval(
+            self.owner_intent_binding(intent_id="intent-attacker"),
+            receipt_changes={"trust_anchor": attacker_anchor},
+            signer=attacker_key,
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
+            module.bind_owner_intent(
+                self.root, self.owner_intent_binding(intent_id="intent-attacker"), attacker
+            )
+
+    def test_restart_preserves_host_owned_trust_and_intent_state(self):
+        """A fresh controller process rereads the host anchor and retained intent ledger."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        bound = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        first_anchor, _ = module._host_owned_trust_anchor()
+        restarted = load_engineering()
+        with (
+            patch.object(restarted, "_canonical_host_home", return_value=self.home),
+            patch.object(restarted, "_verify_owner_private", return_value=None),
+            patch.object(restarted, "_enforce_owner_private", side_effect=synthetic_owner_private),
+        ):
+            second_anchor, _ = restarted._host_owned_trust_anchor()
+            status = restarted.owner_intent_status(self.root, bound["intent_id"])
+        self.assertEqual(first_anchor, second_anchor)
+        self.assertEqual("bound", status["state"])
+
+    def test_host_receipt_wrong_repository_epoch_or_contract_fails_closed(self):
+        """Host receipt fields are exact admission facts, not advisory metadata."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        cases = (
+            ("repository_id", "sha256:" + "f" * 64, "repository"),
+            ("authority_epoch", "epoch-wrong", "epoch"),
+            ("contract", "engineering.wrong-contract.v1", "contract"),
+        )
+        for field, value, label in cases:
+            with self.subTest(field=field):
+                approval = self.host_owner_intent_approval(
+                    binding, receipt_changes={field: value}
+                )
+                with self.assertRaisesRegex(module.EngineeringError, label):
+                    module.bind_owner_intent(self.root, binding, approval)
+
+    def test_postactivation_import_is_required_before_v061_or_frontend_dispatch(self):
+        """No downstream product-release or owner-outcome admission precedes import."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        intent = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        for scope in ("product_releases", "accepted_owner_outcomes"):
+            with self.subTest(scope=scope), self.assertRaisesRegex(
+                module.EngineeringError, "post-activation.*import"
+            ):
+                module.dependent_dispatch_status(self.root, scope)
+        imported = self.owner_intent_import(intent)
+        module.import_owner_intent(
+            self.root, imported, self.owner_intent_import_approval(imported)
+        )
+        for scope in ("product_releases", "accepted_owner_outcomes"):
+            with self.subTest(scope=scope):
+                admitted = module.dependent_dispatch_status(self.root, scope)
+                self.assertEqual("admitted", admitted["state"])
+
+    def test_candidate_cannot_replace_host_owned_trust_anchor(self):
+        """A candidate-local signer edit cannot replace the private host anchor."""
+        module = self.module()
+        attacker_key = Path(self.temporary_directory.name) / "attacker-host-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-host {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        binding = self.owner_intent_binding()
+        trusted = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        self.assertEqual(binding["intent_id"], trusted["intent_id"])
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-host {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
+        )
+        attacker_binding = self.owner_intent_binding(intent_id="intent-attacker")
+        attacker_approval = self.owner_intent_approval(
+            attacker_binding,
+            receipt_changes={"trust_anchor": attacker_anchor},
+            signer=attacker_key,
+            approver="attacker-host",
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
+            module.bind_owner_intent(
+                self.root,
+                attacker_binding,
+                attacker_approval,
+            )
+
+    def test_caller_home_override_cannot_redirect_shared_postactivation_trust(self):
+        """Caller environment cannot redirect every approval gate to attacker trust."""
+        module = self.module()
+        attacker_home = Path(self.temporary_directory.name) / "attacker-home"
+        attacker_authority = attacker_home / ".agents" / "engineering" / "host-authority"
+        attacker_authority.mkdir(parents=True)
+        attacker_key = Path(self.temporary_directory.name) / "attacker-redirect-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_allowed = (
+            "attacker-host "
+            + attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+            + "\n"
+        ).encode("ascii")
+        attacker_anchor = {
+            "schema": module.HOST_TRUST_ANCHOR_SCHEMA,
+            "anchor_id": "host-anchor-attacker-redirect",
+            "format_version": 1,
+            "signers_digest": "sha256:"
+            + hashlib.sha256(attacker_allowed).hexdigest(),
+            "identity": {"state": "unknown"},
+        }
+        (attacker_authority / "allowed-signers").write_bytes(attacker_allowed)
+        (attacker_authority / "host-trust-anchor.json").write_text(
+            json.dumps(attacker_anchor), encoding="utf-8"
+        )
+        binding = self.owner_intent_binding(intent_id="intent-host-redirect")
+        normalized = module._owner_intent_binding(self.root, binding)
+        receipt = self.host_receipt(
+            contract=module.OWNER_INTENT_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
+            anchor=attacker_anchor,
+        )
+        approval = self.sign_host_approval(
+            schema=module.HOST_OWNER_INTENT_APPROVAL_SCHEMA,
+            claims_schema="engineering.host-owner-intent-claims.v3",
+            claims=normalized,
+            namespace="engineering-owner-intent",
+            contract=module.OWNER_INTENT_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
+            signer=attacker_key,
+            approver="attacker-host",
+            receipt=receipt,
+        )
+
+        with (
+            patch.object(module, "_canonical_host_home", return_value=self.home, create=True),
+            patch.dict(
+                os.environ,
+                {
+                    "ENGINEERING_USER_HOME": str(attacker_home),
+                    "HOME": str(attacker_home),
+                    "USERPROFILE": str(attacker_home),
+                },
+                clear=False,
+            ),
+            self.assertRaisesRegex(
+                module.EngineeringError, "host receipt|host.*anchor|signature"
+            ),
+        ):
+            module.bind_owner_intent(self.root, binding, approval)
+
+    def test_caller_home_override_cannot_mint_outcome_acceptance_or_release_token(self):
+        """Outcome and release gates retain the same OS-bound external trust root."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+
+        attacker_home = Path(self.temporary_directory.name) / "attacker-audit-home"
+        attacker_authority = (
+            attacker_home / ".agents" / "engineering" / "host-authority"
+        )
+        attacker_authority.mkdir(parents=True)
+        attacker_key = Path(self.temporary_directory.name) / "attacker-audit-redirect-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_allowed = (
+            "attacker-auditor "
+            + attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+            + "\n"
+        ).encode("ascii")
+        attacker_anchor = {
+            "schema": module.HOST_TRUST_ANCHOR_SCHEMA,
+            "anchor_id": "host-anchor-attacker-audit-redirect",
+            "format_version": 1,
+            "signers_digest": "sha256:"
+            + hashlib.sha256(attacker_allowed).hexdigest(),
+            "identity": {"state": "unknown"},
+        }
+        (attacker_authority / "allowed-signers").write_bytes(attacker_allowed)
+        (attacker_authority / "host-trust-anchor.json").write_text(
+            json.dumps(attacker_anchor), encoding="utf-8"
+        )
+        acceptance["roles"]["auditor_id"] = "attacker-auditor"
+        claims = module._outcome_audit_claims(acceptance)
+        receipt = self.host_receipt(
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            anchor=attacker_anchor,
+        )
+        acceptance["audit_attestation"] = self.sign_host_approval(
+            schema=module.INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
+            claims_schema="engineering.independent-outcome-audit-claims.v3",
+            claims=claims,
+            namespace="engineering-independent-audit",
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            signer=attacker_key,
+            approver="attacker-auditor",
+            receipt=receipt,
+        )
+
+        with (
+            patch.object(module, "_terminal_completion", return_value=(completion, completion_digest)),
+            patch.dict(
+                os.environ,
+                {
+                    "ENGINEERING_USER_HOME": str(attacker_home),
+                    "HOME": str(attacker_home),
+                    "USERPROFILE": str(attacker_home),
+                },
+                clear=False,
+            ),
+            self.assertRaisesRegex(
+                module.EngineeringError, "host receipt|host.*anchor|signature"
+            ),
+        ):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+        self.assertFalse(module._release_token_path(self.root).exists())
+
+    def test_traceability_attestation_cannot_use_candidate_controlled_signers(self):
+        """New traceability proof uses the same immutable external signer anchor."""
+        module = self.module()
+        receipt = {
+            "project_id": "project-a",
+            "worktree_id": "worktree-a",
+            "commit": "a" * 40,
+            "checkpoint": "checkpoint-a",
+        }
+        trusted = self.traceability_host_attestation(receipt)
+        self.assertTrue(
+            module._verify_traceability_host_attestation(self.root, receipt, trusted).startswith(
+                "traceability-host-attestation-"
+            )
+        )
+
+        attacker_key = Path(self.temporary_directory.name) / "attacker-traceability-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-host {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate traceability signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-host {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
+        )
+        attacker_attestation = self.traceability_host_attestation(
+            receipt,
+            host_receipt=self.host_receipt(
+                contract="engineering.traceability-host-attestation.v2",
+                anchor=attacker_anchor,
+            ),
+            signer=attacker_key,
+            approver="attacker-host",
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
+            module._verify_traceability_host_attestation(
+                self.root, receipt, attacker_attestation
+            )
+
+    def test_intent_bind_and_status_cli_return_only_bound_owner_identity(self):
+        """A valid external intent becomes queryable without exposing its source body."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        binding_path = Path(self.temporary_directory.name) / "owner-intent.json"
+        approval_path = Path(self.temporary_directory.name) / "owner-intent-approval.json"
+        binding_path.write_text(json.dumps(binding), encoding="utf-8")
+        approval_path.write_text(
+            json.dumps(self.owner_intent_approval(binding)), encoding="utf-8"
+        )
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "intent-bind",
+                    str(self.root),
+                    "--binding-file",
+                    str(binding_path),
+                    "--approval-file",
+                    str(approval_path),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        bound = json.loads(output.getvalue())
+        self.assertEqual("engineering.owner-intent.v1", bound["schema"])
+        self.assertNotIn("source_body", json.dumps(bound))
+
+        status_output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "intent-status",
+                    str(self.root),
+                    "--authority-id",
+                    "intent-native-graph",
+                ],
+            ),
+            contextlib.redirect_stdout(status_output),
+        ):
+            self.assertEqual(0, module.main())
+        status = json.loads(status_output.getvalue())
+        self.assertEqual("bound", status["state"])
+        self.assertEqual("intent-native-graph", status["intent_id"])
+
+    def test_bound_owner_intent_stays_in_private_controller_state(self):
+        """A binding must not materialize owner-private intent as a project artifact."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        ledger = module._owner_intent_path(self.root)
+        self.assertTrue(ledger.is_file())
+        common = Path(
+            subprocess.run(
+                ["git", "-C", str(self.root), "rev-parse", "--git-common-dir"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        if not common.is_absolute():
+            common = self.root / common
+        self.assertTrue(ledger.is_relative_to(common.resolve()))
+        status = subprocess.run(
+            ["git", "-C", str(self.root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual("", status)
+        self.assertNotIn("source_body", json.dumps(intent))
+
+    def test_candidate_cannot_replace_owner_baseline_or_exclude_without_exception(self):
+        """A candidate cannot supply its own baseline or self-exclude a core outcome."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        narrowed = self.outcome_survival_v2(intent)
+        narrowed["baseline_ids"] = ["OUTCOME-UNIT"]
+        with self.assertRaisesRegex(module.EngineeringError, "controller-injected"):
+            module._outcome_survival_v2(narrowed, intent)
+
+        omitted = self.outcome_survival_v2(intent)
+        omitted["mappings"] = []
+        with self.assertRaisesRegex(module.EngineeringError, "incomplete|mapping"):
+            module._outcome_survival_v2(omitted, intent)
+
+        excluded = self.outcome_survival_v2(intent)
+        excluded["mappings"][0]["disposition"] = "EXCLUDED"
+        with self.assertRaisesRegex(module.EngineeringError, "owner exception"):
+            module._outcome_survival_v2(excluded, intent)
+
+    def test_intent_impact_detection_follows_exact_graph_links(self):
+        """Only exact links to explicit capability/assurance nodes require new intent."""
+        module = self.module()
+        self.assertTrue(
+            {
+                "capability",
+                "capability_assurance",
+                "assurance_obligation",
+                "obligation",
+            }.issubset(module.NODE_TYPES)
+        )
+        checkpoint = {
+            "nodes": [
+                {"id": "REQ-NATIVE", "type": "requirement"},
+                {
+                    "id": "CAP-NATIVE",
+                    "type": "capability",
+                    "source": {"path": "docs/native-capability.md"},
+                },
+                {
+                    "id": "code-native",
+                    "type": "code_symbol",
+                    "source": {"path": "src/native_graph.py"},
+                },
+                {
+                    "id": "code-isolated",
+                    "type": "code_symbol",
+                    "source": {"path": "src/capability_runtime.py"},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "edge-native",
+                    "from": "REQ-NATIVE",
+                    "to": "code-native",
+                    "type": "implements",
+                    "provenance": "direct",
+                },
+                {
+                    "id": "edge-capability",
+                    "from": "CAP-NATIVE",
+                    "to": "code-isolated",
+                    "type": "may_impact",
+                    "provenance": "direct",
+                },
+            ],
+        }
+        self.assertFalse(
+            module._intent_impacting(
+                checkpoint, ["code-native"], None, None
+            )
+        )
+        self.assertTrue(
+            module._intent_impacting(
+                checkpoint, ["code-isolated"], None, None
+            )
+        )
+        self.assertTrue(
+            module._intent_impacting(
+                checkpoint,
+                [],
+                None,
+                None,
+                artifact_paths=["src/capability_runtime.py"],
+            )
+        )
+        nodes = {item["id"]: item for item in checkpoint["nodes"]}
+        selected, missing = module._explicit_context_ids(
+            "change CAP-NATIVE", {}, nodes
+        )
+        self.assertEqual(["CAP-NATIVE"], selected)
+        self.assertEqual([], missing)
+
+    def test_controller_injects_active_owner_baseline_into_v2_handoff(self):
+        """Scope approval receives mappings but never a candidate-owned baseline."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        raw = {
+            "seed_evidence": ["OUTCOME-NATIVE-GRAPH"],
+            "reconstructed_scope": [
+                "OUTCOME-NATIVE-GRAPH",
+                "evidence-native-graph",
+            ],
+            "architect_scope": [
+                "OUTCOME-NATIVE-GRAPH",
+                "evidence-native-graph",
+            ],
+            "result_scope": [
+                "OUTCOME-NATIVE-GRAPH",
+                "evidence-native-graph",
+            ],
+            "result_artifacts": ["src/native_graph.py"],
+            "outcome_survival": self.outcome_survival_v2(intent),
+        }
+        bound = module._bind_owner_intent_handoff(
+            self.root, module._scope_handoff(raw, require_approval=False)
+        )
+        survival = bound["outcome_survival"]
+        self.assertEqual(["OUTCOME-NATIVE-GRAPH"], survival["baseline_ids"])
+        self.assertRegex(survival["mapping_digest"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_signed_owner_exception_is_required_for_excluding_core_outcome(self):
+        """Only a host-signed exception can defer or exclude an owner baseline."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        excluded = self.outcome_survival_v2(intent)
+        mapping = excluded["mappings"][0]
+        mapping["disposition"] = "EXCLUDED"
+        mapping["owner_exception"] = self.owner_exception(
+            intent, mapping["outcome_id"], "EXCLUDED"
+        )
+        survival = module._outcome_survival_v2(
+            excluded, intent, root=self.root
+        )
+        self.assertEqual("EXCLUDED", survival["mappings"][0]["disposition"])
+
+    def test_multiple_active_authorities_and_owner_exceptions_are_additive_and_idempotent(self):
+        """Concurrent scopes and distinct core exceptions must not overwrite one another."""
+        module = self.module()
+        issued = module.datetime.now(module.timezone.utc)
+        authority_a_binding = self.binding(
+            target="candidate-a",
+            scope=["src/a.py"],
+            issued_at=issued.isoformat(),
+            expires_at=(issued + module.timedelta(hours=2)).isoformat(),
+        )
+        authority_b_binding = self.binding(
+            target="candidate-b",
+            scope=["src/b.py"],
+            issued_at=issued.isoformat(),
+            expires_at=(issued + module.timedelta(hours=2)).isoformat(),
+        )
+        authority_a = self.persist(binding=authority_a_binding)
+        authority_b = self.persist(binding=authority_b_binding)
+        replay_a = self.persist(binding=authority_a_binding)
+        self.assertEqual(authority_a["authority_id"], replay_a["authority_id"])
+        self.assertNotEqual(authority_a["authority_id"], authority_b["authority_id"])
+        for authority, target, scope in (
+            (authority_a, "candidate-a", ["src/a.py"]),
+            (authority_b, "candidate-b", ["src/b.py"]),
+        ):
+            with self.subTest(authority=authority["authority_id"]):
+                resolved = module.resolve_scoped_authority(
+                    self.root,
+                    self.request(authority["authority_id"], target=target, scope=scope),
+                )
+                self.assertEqual("authorized", resolved["decision"])
+        ledger = module._load_scoped_authorities(self.root)
+        self.assertEqual(
+            {authority_a["authority_id"], authority_b["authority_id"]},
+            {
+                item["authority_id"]
+                for item in ledger["authorities"]
+                if item["authority_id"] in {authority_a["authority_id"], authority_b["authority_id"]}
+            },
+        )
+
+        binding = self.owner_intent_binding(
+            intent_id="intent-multiple-exceptions",
+            outcomes=[
+                {
+                    "id": "OUTCOME-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                        }
+                    ],
+                },
+                {
+                    "id": "OUTCOME-NATIVE-RECOVERY",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "3" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "native_harness",
+                            "environment": "candidate",
+                        }
+                    ],
+                },
+            ],
+        )
+        intent = module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+        mappings = []
+        for outcome_id, disposition, exception_id in (
+            ("OUTCOME-NATIVE-GRAPH", "EXCLUDED", "exception-native-graph"),
+            ("OUTCOME-NATIVE-RECOVERY", "DEFERRED", "exception-native-recovery"),
+        ):
+            mappings.append(
+                {
+                    "outcome_id": outcome_id,
+                    "disposition": disposition,
+                    "reason": "Externally authorized synthetic exception.",
+                    "verification_ids": [
+                        "evidence-native-graph"
+                        if outcome_id == "OUTCOME-NATIVE-GRAPH"
+                        else "evidence-native-recovery"
+                    ],
+                    "replacement_ids": [],
+                    "equivalence": None,
+                    "owner_exception": self.owner_exception(
+                        intent,
+                        outcome_id,
+                        disposition,
+                        exception_id=exception_id,
+                    ),
+                }
+            )
+        survival = self.outcome_survival_v2(intent, mappings=mappings)
+        first = module._outcome_survival_v2(survival, intent, root=self.root)
+        replay = module._outcome_survival_v2(survival, intent, root=self.root)
+        self.assertEqual(first, replay)
+        self.assertEqual(
+            {"exception-native-graph", "exception-native-recovery"},
+            {
+                mapping["owner_exception"]["claims"]["exception_id"]
+                for mapping in first["mappings"]
+            },
+        )
+
+    def test_candidate_cannot_replace_host_owned_exception_anchor(self):
+        """A candidate signer edit cannot grant itself a core-outcome exception."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        attacker_key = Path(self.temporary_directory.name) / "attacker-exception-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-host {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate exception signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        excluded = self.outcome_survival_v2(intent)
+        mapping = excluded["mappings"][0]
+        mapping["disposition"] = "EXCLUDED"
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-host {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
+        )
+        mapping["owner_exception"] = self.owner_exception(
+            intent,
+            mapping["outcome_id"],
+            "EXCLUDED",
+            receipt_changes={"trust_anchor": attacker_anchor},
+            signer=attacker_key,
+            approver="attacker-host",
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
+            module._outcome_survival_v2(excluded, intent, root=self.root)
+
+    def test_replacement_requires_an_independent_equivalence_reviewer(self):
+        """A candidate cannot call its own replacement equivalent to the baseline."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        replacement = self.outcome_survival_v2(intent)
+        mapping = replacement["mappings"][0]
+        mapping["disposition"] = "REPLACED"
+        mapping["replacement_ids"] = ["replacement-native-graph"]
+        mapping["equivalence"] = self.outcome_equivalence(
+            reviewer_id="writer-1",
+            signer=self.host_key,
+            approver="writer-1",
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "not independent"):
+            module._outcome_survival_v2(replacement, intent, root=self.root)
+
+        mapping["equivalence"] = self.outcome_equivalence()
+        normalized = module._outcome_survival_v2(replacement, intent, root=self.root)
+        self.assertEqual("REPLACED", normalized["mappings"][0]["disposition"])
+
+    def test_replaced_outcome_requires_external_equivalence_attestation(self):
+        """A candidate-supplied reviewer field is not independent equivalence evidence."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        replacement = self.outcome_survival_v2(intent)
+        mapping = replacement["mappings"][0]
+        mapping["disposition"] = "REPLACED"
+        mapping["replacement_ids"] = ["replacement-native-graph"]
+        mapping["equivalence"] = {
+            "schema": "engineering.outcome-equivalence.v2",
+            "reviewer_id": "reviewer-1",
+            "architect_id": "architect-1",
+            "implementer_id": "implementer-1",
+            "writer_id": "writer-1",
+            "evidence_id": "evidence-equivalence",
+            "evidence_digest": "sha256:" + "6" * 64,
+        }
+        with self.assertRaisesRegex(module.EngineeringError, "external equivalence attestation"):
+            module._outcome_survival_v2(replacement, intent, root=self.root)
+
+    def test_execution_context_carries_owner_intent_digest_and_rejects_tampering(self):
+        """A dispatched continuation cannot shed or replace the bound owner intent."""
+        module = self.module()
+        preparation = {
+            "schema": "engineering.prepare.v1",
+            "run_id": "run-a1b2c3",
+            "project": {
+                "root_digest": "sha256:" + "1" * 64,
+                "commit": "a" * 40,
+            },
+            "authorization": {"scope": ["src/native_graph.py"]},
+            "context": [{"id": "OUTCOME-NATIVE-GRAPH", "provenance": "direct"}],
+            "owner_intent": {
+                "schema": "engineering.owner-intent-status.v1",
+                "state": "bound",
+                "intent_id": "intent-native-graph",
+                "owner_intent_digest": "sha256:" + "2" * 64,
+                "authority_epoch": "epoch-local-1",
+                "core_outcome_count": 1,
+                "intent_impacting": True,
+                "bound_to_scope_handoff": True,
+            },
+        }
+        bundle = module.build_execution_context(preparation)
+        self.assertEqual(
+            "sha256:" + "2" * 64,
+            bundle["owner_intent"]["owner_intent_digest"],
+        )
+        self.assertEqual(
+            "enforced",
+            module.validate_execution_context(
+                bundle, preparation, runner_enforces_boundary=True
+            )["mode"],
+        )
+        tampered = {**bundle, "owner_intent": {**bundle["owner_intent"], "owner_intent_digest": "sha256:" + "3" * 64}}
+        with self.assertRaisesRegex(module.EngineeringError, "digest|scope|owner intent"):
+            module.validate_execution_context(
+                tampered, preparation, runner_enforces_boundary=True
+            )
+
+    def test_unit_evidence_cannot_satisfy_real_native_harness_requirement(self):
+        """Typed evidence cannot upgrade a unit result into a native runtime proof."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival, evidence_class="unit"
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "required evidence"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_independent_audit_binds_role_assignments_and_outcome_states(self):
+        """An attestation cannot be replayed after actor or outcome-state changes."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["roles"]["architect_id"] = "architect-replaced"
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "independent outcome audit"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_audit_principal_must_equal_declared_auditor(self):
+        """A trusted host cannot stand in for the named independent auditor."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(
+            acceptance,
+            signer=self.host_key,
+            approver="synthetic-host",
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "principal.*declared independent reviewer"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_candidate_cannot_replace_host_owned_audit_anchor(self):
+        """A candidate signer edit cannot manufacture an independently audited acceptance."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        attacker_key = Path(self.temporary_directory.name) / "attacker-audit-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_public = attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+        (self.root / ".engineering-host-approvers").write_text(
+            f"attacker-auditor {attacker_public}\n", encoding="ascii"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", ".engineering-host-approvers"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "candidate audit signer replacement"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        acceptance["roles"]["auditor_id"] = "attacker-auditor"
+        attacker_anchor = self.host_anchor(
+            anchor_id="host-anchor-attacker",
+            signers_digest="sha256:" + hashlib.sha256(
+                f"attacker-auditor {attacker_public}\n".encode("ascii")
+            ).hexdigest(),
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(
+            acceptance,
+            receipt_changes={"trust_anchor": attacker_anchor},
+            signer=attacker_key,
+            approver="attacker-auditor",
+        )
+
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "host.*anchor|host receipt|signature"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_accepted_evidence_must_retain_the_mapped_verification_identity(self):
+        """A matching class/interface cannot swap out the approved evidence identity."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["outcomes"][0]["evidence"][0]["evidence_id"] = "evidence-substitute"
+        acceptance["evidence_digest"] = module._outcome_evidence_matrix_digest(
+            acceptance["outcomes"]
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "mapped verification evidence"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+        acceptance["outcomes"][0]["state"] = "unknown"
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "independent outcome audit"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+
+    def test_v060_proxy_only_self_exclusion_cannot_receive_release_token(self):
+        """v0.6.0 policy evidence cannot exclude native fan-out/fan-in runtime proof."""
+        module = self.module()
+        binding = self.owner_intent_binding(
+            outcomes=[
+                {
+                    "id": "OUTCOME-EXECUTABLE-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "real_outcome",
+                            "interface": "executable_native_graph",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "autonomous_fanout_fanin",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "no_prompt_steering",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "codex_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "real_outcome",
+                            "interface": "claude_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                    ],
+                }
+            ]
+        )
+        intent = module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+        excluded = self.outcome_survival_v2(intent)
+        excluded["mappings"][0]["disposition"] = "EXCLUDED"
+        with self.assertRaisesRegex(module.EngineeringError, "owner exception"):
+            module._outcome_survival_v2(excluded, intent)
+
+        policy_kernel_unit = [
+            {
+                "evidence_id": "evidence-policy-kernel-unit",
+                "evidence_digest": "sha256:" + "4" * 64,
+                "class": "unit",
+                "interface": "policy_kernel",
+                "environment": "candidate",
+                "producer_role": "policy_kernel",
+            }
+        ]
+        raw_survival = self.outcome_survival_v2(intent)
+        raw_survival["mappings"][0]["verification_ids"] = [
+            item["evidence_id"] for item in policy_kernel_unit
+        ]
+        survival = module._outcome_survival_v2(raw_survival, intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival, evidence=policy_kernel_unit
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ), self.assertRaisesRegex(module.EngineeringError, "required evidence"):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+        acceptance["outcomes"][0]["state"] = "unknown"
+        acceptance["evidence_digest"] = module._outcome_evidence_matrix_digest(
+            acceptance["outcomes"]
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            with self.assertRaisesRegex(module.EngineeringError, "core outcome"):
+                module.release_gate(
+                    self.root, completion["run_id"], recorded["acceptance_id"]
+                )
+
+    def test_codex_and_claude_native_e2e_evidence_with_independent_auditor_receives_token(self):
+        """Both native harnesses plus an independent exact-artifact audit release."""
+        module = self.module()
+        binding = self.owner_intent_binding(
+            outcomes=[
+                {
+                    "id": "OUTCOME-NATIVE-GRAPH",
+                    "criticality": "core",
+                    "statement_digest": "sha256:" + "2" * 64,
+                    "required_evidence": [
+                        {
+                            "class": "end_to_end",
+                            "interface": "codex_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                        {
+                            "class": "end_to_end",
+                            "interface": "claude_native_dispatch_wake",
+                            "environment": "candidate",
+                        },
+                        *[
+                            {
+                                "class": "real_outcome",
+                                "interface": interface,
+                                "environment": "candidate",
+                            }
+                            for interface in (
+                                "capability_negotiation",
+                                "authenticated_ipc",
+                                "anti_replay",
+                                "idempotent_effects",
+                                "bounded_retry_cycle_detection",
+                                "distinct_completion_states",
+                            )
+                        ],
+                    ],
+                }
+            ]
+        )
+        intent = module.bind_owner_intent(
+            self.root, binding, self.owner_intent_approval(binding)
+        )
+        evidence = [
+            {
+                "evidence_id": "evidence-codex-native",
+                "evidence_digest": "sha256:" + "4" * 64,
+                "class": "end_to_end",
+                "interface": "codex_native_dispatch_wake",
+                "environment": "candidate",
+                "producer_role": "codex_native",
+            },
+            {
+                "evidence_id": "evidence-claude-native",
+                "evidence_digest": "sha256:" + "5" * 64,
+                "class": "end_to_end",
+                "interface": "claude_native_dispatch_wake",
+                "environment": "candidate",
+                "producer_role": "claude_native",
+            },
+            *[
+                {
+                    "evidence_id": f"evidence-{interface}",
+                    "evidence_digest": "sha256:"
+                    + hashlib.sha256(interface.encode("ascii")).hexdigest(),
+                    "class": "real_outcome",
+                    "interface": interface,
+                    "environment": "candidate",
+                    "producer_role": "independent_runtime_audit",
+                }
+                for interface in (
+                    "capability_negotiation",
+                    "authenticated_ipc",
+                    "anti_replay",
+                    "idempotent_effects",
+                    "bounded_retry_cycle_detection",
+                    "distinct_completion_states",
+                )
+            ],
+        ]
+        raw_survival = self.outcome_survival_v2(intent)
+        raw_survival["mappings"][0]["verification_ids"] = [
+            item["evidence_id"] for item in evidence
+        ]
+        survival = module._outcome_survival_v2(raw_survival, intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival, evidence=evidence
+        )
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root, completion["run_id"], recorded["acceptance_id"]
+            )
+            verified = module.verify_release_token(
+                self.root, token["token_id"], token["artifact_digest"], "activation"
+            )
+        self.assertEqual("engineering.release-token.v2", token["schema"])
+        self.assertNotIn("install", token["actions"])
+        self.assertEqual("activation", verified["action"])
+
+    def test_install_release_token_binds_the_exact_clean_source_bundle(self):
+        """An install token is issued only for the clean accepted bundle it names."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(self.outcome_survival_v2(intent), intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(intent, survival)
+        completion["result_identity"]["commit"] = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        acceptance["artifact_digest"] = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root,
+                completion["run_id"],
+                recorded["acceptance_id"],
+                install_source=source,
+            )
+            verified = module.verify_release_token(
+                self.root, token["token_id"], token["artifact_digest"], "install"
+            )
+        _, manifest, commit, digest = module._bundle_files(source)
+        tree = module._bundle_git_tree(source, commit)
+        self.assertEqual(
+            {
+                "source_git_commit": commit,
+                "source_git_tree": tree,
+                "source_digest": digest,
+                "skill_version": manifest["version"],
+            },
+            verified["source_bundle"],
+        )
+        self.assertRegex(verified["token_digest"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_actual_install_rejects_a_release_token_for_a_different_bundle(self):
+        """A signed token for A cannot authorize copying the distinct clean bundle B."""
+        module = self.module()
+        source_a = self.installable_bundle_source()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(self.outcome_survival_v2(intent), intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(intent, survival)
+        completion["result_identity"]["commit"] = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        acceptance["artifact_digest"] = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root,
+                completion["run_id"],
+                recorded["acceptance_id"],
+                install_source=source_a,
+            )
+
+        other_root = Path(self.temporary_directory.name) / "other-bundle-project"
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(other_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.email", "synthetic"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(other_root), "config", "user.name", "Synthetic Test"],
+            check=True,
+        )
+        source_b = other_root / ".agents" / "skills" / "engineering"
+        shutil.copytree(source_a, source_b)
+        (source_b / "scripts" / "engineering.py").write_text(
+            "# distinct clean bundle B\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(other_root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(other_root), "commit", "-m", "bundle B"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(module.EngineeringError, "exact source bundle"):
+            module.install_bundle(
+                source_b,
+                Path(self.temporary_directory.name) / "installed-home",
+                release_token={"root": str(self.root), "token_id": token["token_id"]},
+                release_artifact_digest=token["artifact_digest"],
+            )
+
+    def test_actual_install_receipt_reconciles_the_signed_source_bundle(self):
+        """The installed receipt retains the signed source facts after the actual copy."""
+        module = self.module()
+        source = self.installable_bundle_source()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(self.outcome_survival_v2(intent), intent)
+        completion, completion_digest, acceptance = self.outcome_acceptance(intent, survival)
+        completion["result_identity"]["commit"] = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        acceptance["artifact_digest"] = module._completion_artifact_digest(
+            completion, completion_digest
+        )
+        acceptance["audit_attestation"] = self.audit_attestation(acceptance)
+        with patch.object(
+            module,
+            "_terminal_completion",
+            return_value=(completion, completion_digest),
+        ):
+            recorded = module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+            token = module.release_gate(
+                self.root,
+                completion["run_id"],
+                recorded["acceptance_id"],
+                install_source=source,
+            )
+        home = Path(self.temporary_directory.name) / "installed-home"
+        with (
+            patch.object(module, "_engineering_user_home", return_value=home),
+            patch.object(module, "_register_windows_command_directory"),
+        ):
+            receipt = module.install_bundle(
+                source,
+                home,
+                release_token={"root": str(self.root), "token_id": token["token_id"]},
+                release_artifact_digest=token["artifact_digest"],
+            )
+        _, manifest, commit, digest = module._bundle_files(source)
+        tree = module._bundle_git_tree(source, commit)
+        self.assertEqual("engineering.install.v5", receipt["schema"])
+        self.assertEqual(
+            {
+                "source_git_commit": commit,
+                "source_git_tree": tree,
+                "source_digest": digest,
+                "skill_version": manifest["version"],
+            },
+            receipt["release_authorization"]["source_bundle"],
+        )
+        self.assertEqual(receipt["source_digest"], module._tree_digest(home / ".agents" / "skills" / "engineering"))
+
+    def test_legacy_release_token_stays_readable_but_cannot_authorize_new_install(self):
+        """Historical tokens remain inspectable but cannot acquire a v2 install privilege."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        token = {
+            "schema": "engineering.release-token.v1",
+            "token_id": "release-token-" + "1" * 32,
+            "completion_id": "run-a1b2c3",
+            "completion_digest": "sha256:" + "2" * 64,
+            "artifact_digest": "sha256:" + "3" * 64,
+            "owner_intent_id": intent["intent_id"],
+            "owner_intent_digest": intent["owner_intent_digest"],
+            "mapping_digest": "sha256:" + "4" * 64,
+            "evidence_digest": "sha256:" + "5" * 64,
+            "acceptance_id": "acceptance-legacy",
+            "acceptance_digest": "sha256:" + "6" * 64,
+            "actions": ["activation", "install", "merge"],
+        }
+        key = module._controller_key(module._project_controller_dir(self.root), required=True)
+        record = {"token": token, "issued_at": module._utc_now()}
+        record["signature"] = module._release_token_signature(key, record)
+        module._publish_release_tokens(
+            self.root,
+            {"schema": module.RELEASE_TOKEN_LEDGER_SCHEMA, "tokens": [record]},
+            None,
+        )
+
+        verified = module.verify_release_token(
+            self.root, token["token_id"], token["artifact_digest"], "activation"
+        )
+        self.assertEqual("engineering.release-token.v1", verified["schema"])
+        with self.assertRaisesRegex(module.EngineeringError, "exact install source bundle"):
+            module.verify_release_token(
+                self.root, token["token_id"], token["artifact_digest"], "install"
+            )
+
+    def test_outcome_acceptance_and_release_gate_cli_dispatch_exact_inputs(self):
+        """The public controller commands preserve exact local gate inputs."""
+        module = self.module()
+        source = Path(self.temporary_directory.name) / "acceptance.json"
+        source.write_text("{}", encoding="utf-8")
+        output = io.StringIO()
+        with (
+            patch.object(
+                module,
+                "record_outcome_acceptance",
+                return_value={"schema": "engineering.outcome-acceptance.v1"},
+            ) as accept,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "outcome-accept",
+                    str(self.root),
+                    "run-a1b2c3",
+                    "--input-file",
+                    str(source),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        accept.assert_called_once()
+        self.assertEqual("run-a1b2c3", accept.call_args.args[1])
+        self.assertEqual({}, accept.call_args.args[2])
+        self.assertEqual("engineering.outcome-acceptance.v1", json.loads(output.getvalue())["schema"])
+
+        with (
+            patch.object(
+                module,
+                "release_gate",
+                return_value={"schema": "engineering.release-token.v2"},
+            ) as gate,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "release-gate",
+                    str(self.root),
+                    "run-a1b2c3",
+                    "--acceptance-id",
+                    "acceptance-native-graph",
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(0, module.main())
+        gate.assert_called_once()
+        self.assertEqual(
+            ("run-a1b2c3", "acceptance-native-graph"), gate.call_args.args[1:]
+        )
+
+        bundle = Path(self.temporary_directory.name) / "bundle-source"
+        with (
+            patch.object(
+                module,
+                "release_gate",
+                return_value={"schema": "engineering.release-token.v2"},
+            ) as gate,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "release-gate",
+                    str(self.root),
+                    "run-a1b2c3",
+                    "--acceptance-id",
+                    "acceptance-native-graph",
+                    "--install-source",
+                    str(bundle),
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(0, module.main())
+        self.assertEqual(Path(bundle), gate.call_args.kwargs["install_source"])
+
+    def test_postactivation_import_and_dependent_status_cli_dispatch_exact_inputs(self):
+        """The public controller exposes the mandatory import and read-only fence."""
+        module = self.module()
+        imported_path = Path(self.temporary_directory.name) / "owner-intent-import.json"
+        approval_path = Path(self.temporary_directory.name) / "owner-intent-import-approval.json"
+        imported_path.write_text("{}", encoding="utf-8")
+        approval_path.write_text("{}", encoding="utf-8")
+        output = io.StringIO()
+        with (
+            patch.object(
+                module,
+                "import_owner_intent",
+                return_value={"schema": "engineering.owner-intent-import.v1"},
+            ) as imported,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "intent-import",
+                    str(self.root),
+                    "--import-file",
+                    str(imported_path),
+                    "--approval-file",
+                    str(approval_path),
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        imported.assert_called_once()
+        self.assertEqual({}, imported.call_args.args[1])
+        self.assertEqual({}, imported.call_args.args[2])
+        self.assertEqual(
+            "engineering.owner-intent-import.v1", json.loads(output.getvalue())["schema"]
+        )
+
+        output = io.StringIO()
+        with (
+            patch.object(
+                module,
+                "dependent_dispatch_status",
+                return_value={"state": "admitted", "dispatch_performed": False},
+            ) as status,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "engineering",
+                    "dependent-dispatch-status",
+                    str(self.root),
+                    "--scope",
+                    "product_releases",
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+        status.assert_called_once()
+        self.assertEqual("product_releases", status.call_args.args[1])
+        self.assertEqual(False, json.loads(output.getvalue())["dispatch_performed"])
+
 
 class TraceabilityViewV225ContractTests(unittest.TestCase):
     """Regression coverage for the v2.2.5 query-only traceability projection."""
@@ -12124,6 +16108,30 @@ class TraceabilityViewV225ContractTests(unittest.TestCase):
         payload["receipts"][0]["receipt"]["route"] = "other-route"
         with self.assertRaisesRegex(module.EngineeringError, "admission|receipt"):
             module._load_signed_traceability_receipts_payload(payload, key)
+
+    def test_legacy_host_attestation_remains_readable_but_cannot_become_trusted(self):
+        """v1 history is retained as evidence, never upgraded by the v2 trust path."""
+        module = self.module()
+        receipt = self.receipt()
+        key = b"a" * 32
+        normalized = module._traceability_receipt(
+            receipt,
+            module._assurance_timestamp(receipt["observed_at"]) + module.timedelta(minutes=5),
+        )
+        digest = json.loads(
+            module._receipt_admission_material(normalized).decode("utf-8")
+        )["receipt_digest"]
+        payload = module._signed_traceability_receipt_payload(
+            [receipt],
+            key,
+            host_attestations={
+                digest: {"schema": "engineering.traceability-host-attestation.v1"}
+            },
+        )
+        loaded = module._load_signed_traceability_receipts_payload(
+            payload, key, root=Path("not-a-canonical-project")
+        )
+        self.assertNotIn("_traceability_trust_token", loaded[0])
 
     def test_map_uses_the_canonical_view_and_digest_matched_renderer(self):
         module = self.module()

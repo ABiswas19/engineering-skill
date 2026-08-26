@@ -4,7 +4,10 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import importlib.util
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -20,6 +23,7 @@ EXPECTED_SKILL_FILES = {
     "scripts/engineering",
     "scripts/engineering.cmd",
     "scripts/engineering.py",
+    "scripts/engineering_host_boundary.py",
     "tests/scenarios.json",
     "tests/test_engineering.py",
 }
@@ -42,9 +46,1128 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
-    def test_release_manifest_is_v2_2_5_with_pinned_graphify(self) -> None:
+    def write_public_only_overlay(self, destination: Path) -> None:
+        path = destination / "docs" / "public-contributing.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Public contribution route\n", encoding="utf-8")
+
+    def candidate_owner_baseline(self) -> dict:
+        """Explicit test-only projection; production resolves a signed host ledger."""
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        return {
+            "ledger": {
+                "schema": "engineering.v2.2.6-owner-approved-ledger.v1",
+                "requirements": [
+                    {
+                        "id": row["id"],
+                        "lifecycle_state": row["lifecycle_state"],
+                        "runtime_behavior": row["runtime_behavior"],
+                        "native_evidence": row["native_evidence"],
+                    }
+                    for row in registry["requirements"]
+                ],
+                "obligations": registry["obligations"],
+            },
+            "authority_epoch": "test-only-owner-baseline-epoch",
+            "role_separation": {
+                "owner_principal": "owner-test",
+                "architect_principal": "architect-test",
+                "implementer_principal": "implementer-test",
+                "writer_principal": "implementer-test",
+                "auditors": [],
+            },
+            "source_evidence": {
+                "schema": "engineering.owner-approved-bootstrap-source.v1",
+                "kind": "test_fixture",
+            },
+            "approval_digest": "sha256:" + "1" * 64,
+            "trust_anchor_digest": "sha256:" + "2" * 64,
+            "allowed_signers": b"",
+        }
+
+    def test_v226_release_matrix_is_exact_complete_and_fail_closed(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        registry = ROOT / "release" / "v2.2.6-requirements.json"
+        self.assertTrue(tool.is_file())
+        self.assertTrue(registry.is_file())
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_release_matrix", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        role = (
+            "internal"
+            if (ROOT / "release" / "audience-classification.json").is_file()
+            else "public"
+        )
+        with patch.object(
+            module, "_owner_approved_ledger", return_value=self.candidate_owner_baseline()
+        ):
+            unknown = module.generate_matrix(ROOT, role, None)
+        self.assertEqual(
+            set(module.V226_REQUIRED_REQUIREMENTS),
+            {row["requirement_id"] for row in unknown["rows"]},
+        )
+        self.assertFalse(unknown["gates"]["artifact_acceptance_ready"])
+        self.assertFalse(unknown["gates"]["post_activation_ready"])
+        self.assertTrue(unknown["unknowns"])
+        with self.assertRaisesRegex(module.MatrixError, "external owner ledger"):
+            module._normalize_registry(
+                {
+                    "schema": module.REQUIREMENTS_SCHEMA,
+                    "requirements": [],
+                    "obligations": json.loads(registry.read_text(encoding="utf-8"))[
+                        "obligations"
+                    ],
+                },
+                self.candidate_owner_baseline()["ledger"],
+            )
+
+        artifact_rows = [
+            row
+            for row in unknown["rows"]
+            if row["gate"] == "artifact_acceptance"
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            host_home = Path(temporary) / "host-home"
+            evidence_root = Path(temporary) / "native-evidence"
+            key_path = host_home / ".agents" / "engineering" / "controller" / "attestation.key"
+            key_path.parent.mkdir(parents=True)
+            key = bytes.fromhex("42" * 32)
+            key_path.write_text(key.hex() + "\n", encoding="ascii")
+            evidence_root.mkdir()
+            def reference(path: Path) -> dict:
+                return {
+                    "path": path.relative_to(evidence_root).as_posix(),
+                    "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            commands = []
+            for row in artifact_rows:
+                if row["requirement_id"] == "independent_exact_artifact_acceptance":
+                    continue
+                selector = row["negative_test"]["selector"]
+                command_id = "requirement-" + row["requirement_id"]
+                log = evidence_root / f"{command_id}.log"
+                meta = evidence_root / f"{command_id}.meta.json"
+                log.write_text("Ran 1 test in 0.001s\n\nOK\n", encoding="utf-8")
+                argv = (
+                    [
+                        "python", "-m", "unittest",
+                        f"tests.test_repository.RepositoryContractTests.{selector}",
+                    ]
+                    if row["negative_test"]["path"] == "tests/test_repository.py"
+                    else [
+                        "python",
+                        str((ROOT / row["negative_test"]["path"]).resolve()),
+                        selector,
+                    ]
+                )
+                meta.write_text(
+                    json.dumps(
+                        {
+                            "schema": module.NATIVE_EXECUTION_META_SCHEMA,
+                            "command_id": command_id,
+                            "executor": {
+                                "role": "native_test_runner",
+                                "identity": {"state": "unknown"},
+                            },
+                            "artifact_before": unknown["artifact"],
+                            "artifact_after": unknown["artifact"],
+                            "role": role,
+                            "argv": argv,
+                            "cwd": str(ROOT.resolve()),
+                            "started_at": "2026-08-25T08:00:00+00:00",
+                            "finished_at": "2026-08-25T08:01:00+00:00",
+                            "exit_code": 0,
+                            "parser": "python-unittest-v1",
+                            "counts": {
+                                "run": 1, "failures": 0, "errors": 0, "skipped": 0
+                            },
+                            "selector": selector,
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                commands.append(
+                    {"command_id": command_id, "meta": reference(meta), "log": reference(log)}
+                )
+
+            auditor_keys = {}
+            allowed_lines = []
+            for category in ("semantic", "technical_security"):
+                principal = f"auditor-{category}"
+                signer = Path(temporary) / principal
+                subprocess.run(
+                    ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(signer)],
+                    check=True,
+                    capture_output=True,
+                )
+                public = signer.with_suffix(".pub").read_text(encoding="ascii").strip()
+                allowed_lines.append(f"{principal} {public}\n")
+                auditor_keys[category] = signer
+            allowed_signers = "".join(allowed_lines).encode("ascii")
+            baseline = self.candidate_owner_baseline()
+            baseline["allowed_signers"] = allowed_signers
+            baseline["role_separation"]["auditors"] = [
+                {
+                    "category": category,
+                    "principal_id": f"auditor-{category}",
+                    "signer_fingerprint": module._allowed_signer_fingerprint(
+                        allowed_signers, f"auditor-{category}"
+                    ),
+                }
+                for category in ("semantic", "technical_security")
+            ]
+            for command in commands:
+                try:
+                    module._native_command(
+                        ROOT,
+                        unknown["artifact"],
+                        role,
+                        evidence_root,
+                        command,
+                        {row["requirement_id"] for row in artifact_rows},
+                    )
+                except module.MatrixError as error:
+                    self.fail(f"{command['command_id']}: {error}")
+
+            envelope_payload = {
+                "schema": module.HOST_EXECUTION_ENVELOPE_SCHEMA,
+                "issuer": {
+                    "boundary_id": "native-host-controller",
+                    "key_id": "sha256:" + hashlib.sha256(key).hexdigest(),
+                    "identity": {"state": "unknown"},
+                },
+                "artifact": unknown["artifact"],
+                "evidence_root": str(evidence_root.resolve()),
+                "commands": commands,
+                "incidents": [],
+                "audits": [],
+            }
+
+            def write_envelope(payload: dict) -> Path:
+                signed = dict(payload)
+                signed["signature"] = "hmac-sha256:" + hmac.new(
+                    key, module._canonical(payload), hashlib.sha256
+                ).hexdigest()
+                path = Path(temporary) / "host-execution-envelope.json"
+                path.write_text(json.dumps(signed, sort_keys=True), encoding="utf-8")
+                return path
+
+            envelope = write_envelope(envelope_payload)
+            with (
+                patch.object(module, "_canonical_host_home", return_value=host_home),
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+                patch.object(
+                    module,
+                    "_owner_approved_ledger",
+                    return_value=baseline,
+                ),
+            ):
+                exact_without_audits = module.generate_matrix(ROOT, role, envelope)
+            independent = next(
+                row
+                for row in exact_without_audits["rows"]
+                if row["requirement_id"] == "independent_exact_artifact_acceptance"
+            )
+            self.assertEqual("unknown", independent["evidence_state"])
+            self.assertFalse(
+                exact_without_audits["gates"]["artifact_acceptance_ready"]
+            )
+
+            audit_references = []
+            for category in ("semantic", "technical_security"):
+                report = evidence_root / f"{category}.report.txt"
+                report.write_text("ACCEPT exact artifact\n", encoding="utf-8")
+                audit_meta = evidence_root / f"{category}.meta.json"
+                audit_meta.write_text(
+                    json.dumps(
+                        {
+                            "schema": module.INDEPENDENT_AUDIT_META_SCHEMA,
+                            "audit_id": f"audit-{category}",
+                            "category": category,
+                            "auditor": {
+                                "role": "independent_auditor",
+                                "principal_id": f"auditor-{category}",
+                                "signer_fingerprint": module._allowed_signer_fingerprint(
+                                    allowed_signers, f"auditor-{category}"
+                                ),
+                                "identity": {"state": "unknown"},
+                            },
+                            "artifact": unknown["artifact"],
+                            "decision": "accepted",
+                            "issued_at": "2026-08-25T08:02:00+00:00",
+                            "report_digest": reference(report)["digest"],
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                claims_path = evidence_root / f"{category}.claims.json"
+                claims_path.write_bytes(
+                    module._canonical(
+                        {
+                            "schema": "engineering.independent-audit-claims.v1",
+                            "meta": json.loads(audit_meta.read_text(encoding="utf-8")),
+                        }
+                    )
+                )
+                subprocess.run(
+                    [
+                        "ssh-keygen", "-Y", "sign", "-f", str(auditor_keys[category]),
+                        "-n", f"engineering-v226-{category}-audit", str(claims_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                signature = claims_path.with_suffix(".json.sig")
+                audit_references.append(
+                    {
+                        "audit_id": f"audit-{category}",
+                        "meta": reference(audit_meta),
+                        "report": reference(report),
+                        "signature": reference(signature),
+                    }
+                )
+            accepted_payload = dict(envelope_payload)
+            accepted_payload["audits"] = audit_references
+            with (
+                patch.object(module, "_canonical_host_home", return_value=host_home),
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+                patch.object(
+                    module,
+                    "_owner_approved_ledger",
+                    return_value=baseline,
+                ),
+            ):
+                accepted = module.generate_matrix(
+                    ROOT, role, write_envelope(accepted_payload)
+                )
+            self.assertTrue(accepted["gates"]["artifact_acceptance_ready"])
+            self.assertFalse(accepted["gates"]["post_activation_ready"])
+
+            unsigned = json.loads(envelope.read_text(encoding="utf-8"))
+            unsigned["signature"] = "hmac-sha256:" + "0" * 64
+            envelope.write_text(json.dumps(unsigned), encoding="utf-8")
+            with self.assertRaisesRegex(module.MatrixError, "authenticated"):
+                with (
+                    patch.object(module, "_canonical_host_home", return_value=host_home),
+                    patch.object(module, "_verify_owner_private_path", return_value=None),
+                    patch.object(
+                        module,
+                        "_owner_approved_ledger",
+                        return_value=baseline,
+                    ),
+                ):
+                    module.generate_matrix(ROOT, role, envelope)
+
+            for row in accepted["rows"]:
+                self.assertEqual(accepted["artifact"], row["exact_artifact_identity"])
+                self.assertRegex(row["design_blob"], r"^sha256:[0-9a-f]{64}$")
+                self.assertRegex(row["contract_blob"], r"^sha256:[0-9a-f]{64}$")
+                self.assertRegex(row["negative_test_blob"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(accepted["matrix_digest"], module.matrix_digest(accepted))
+
+    def test_v226_registry_completeness_comes_from_external_owner_ledger(self) -> None:
+        """Candidate constants cannot omit the same owner outcome as candidate JSON."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_external_owner_ledger", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        owner_ledger = {
+            "schema": "engineering.v2.2.6-owner-approved-ledger.v1",
+            "requirements": [
+                {
+                    "id": row["id"],
+                    "lifecycle_state": row["lifecycle_state"],
+                    "runtime_behavior": row["runtime_behavior"],
+                    "native_evidence": row["native_evidence"],
+                }
+                for row in registry["requirements"]
+            ],
+            "obligations": registry["obligations"],
+        }
+        module._normalize_registry(registry, owner_ledger)
+        omitted = json.loads(json.dumps(registry))
+        omitted["requirements"] = omitted["requirements"][:-1]
+        with self.assertRaisesRegex(module.MatrixError, "external owner ledger"):
+            module._normalize_registry(omitted, owner_ledger)
+
+    def test_v226_owner_baseline_is_fixed_host_private_and_fail_closed(self) -> None:
+        """The candidate cannot supply a path when the native owner ledger is absent."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_owner_baseline_missing", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = (
+            "internal"
+            if (ROOT / "release" / "audience-classification.json").is_file()
+            else "public"
+        )
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            module, "_canonical_host_home", return_value=Path(temporary)
+        ):
+            with self.assertRaisesRegex(
+                module.MatrixError, "owner-approved baseline is unavailable"
+            ):
+                module._owner_approved_ledger(ROOT, role)
+
+    def test_v226_governing_host_root_is_shared_and_owner_private(self) -> None:
+        """Release and runtime gates share one native root and reject weak ACLs."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_shared_host_boundary", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(
+            "engineering_host_boundary", module._shared_canonical_host_home.__module__
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            weak = Path(temporary) / "attestation.key"
+            weak.write_text("00" * 32 + "\n", encoding="ascii")
+            if os.name != "nt":
+                os.chmod(weak, 0o644)
+            with self.assertRaisesRegex(module.MatrixError, "owner-private"):
+                module._verify_owner_private_path(weak, directory=False)
+
+    def test_v226_owner_baseline_cli_renders_exact_pair_without_writing_authority(self) -> None:
+        tool = ROOT / "tools" / "v226_owner_baseline.py"
+        result = subprocess.run(
+            [
+                "python", str(tool), "ledger",
+                "--internal-root", str(ROOT),
+                "--public-root", str(ROOT),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        ledger = json.loads(result.stdout)
+        self.assertEqual("engineering.v2.2.6-owner-approved-ledger.v1", ledger["schema"])
+        self.assertEqual(
+            len(self.candidate_owner_baseline()["ledger"]["requirements"]),
+            len(ledger["requirements"]),
+        )
+        source = tool.read_text(encoding="utf-8")
+        self.assertNotIn("v2.2.6-owner-approved-ledger.json\").write", source)
+
+    def test_v226_owner_baseline_binds_source_repo_epoch_and_role_separation(self) -> None:
+        """Signed external ledger is exact; changed durable authority fails closed."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_owner_baseline_exact", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = (
+            "internal"
+            if (ROOT / "release" / "audience-classification.json").is_file()
+            else "public"
+        )
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        ledger = {
+            "schema": "engineering.v2.2.6-owner-approved-ledger.v1",
+            "requirements": [
+                {
+                    "id": row["id"],
+                    "lifecycle_state": row["lifecycle_state"],
+                    "runtime_behavior": row["runtime_behavior"],
+                    "native_evidence": row["native_evidence"],
+                }
+                for row in registry["requirements"]
+            ],
+            "obligations": registry["obligations"],
+        }
+        root_commit = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-list", "--max-parents=0", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        repository_id = "sha256:" + hashlib.sha256(
+            f"git-root\0{root_commit}".encode("ascii")
+        ).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            host_home = Path(temporary) / "host-home"
+            authority = host_home / ".agents" / "engineering" / "bootstrap-authority"
+            trust = authority
+            trust.mkdir(parents=True)
+            owner_key = Path(temporary) / "owner-key"
+            semantic_key = Path(temporary) / "semantic-key"
+            technical_key = Path(temporary) / "technical-key"
+            for key in (owner_key, semantic_key, technical_key):
+                subprocess.run(
+                    ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+                    check=True,
+                    capture_output=True,
+                )
+
+            def public(key: Path) -> str:
+                return key.with_suffix(".pub").read_text(encoding="ascii").strip()
+
+            allowed = (
+                f"owner-baseline-owner {public(owner_key)}\n"
+                f"semantic-auditor {public(semantic_key)}\n"
+                f"technical-auditor {public(technical_key)}\n"
+            ).encode("ascii")
+            (trust / "allowed-signers").write_bytes(allowed)
+            anchor = {
+                "schema": "engineering.v2.2.6-bootstrap-trust-anchor.v1",
+                "anchor_id": "owner-baseline-anchor-fixture",
+                "format_version": 1,
+                "signers_digest": "sha256:" + hashlib.sha256(allowed).hexdigest(),
+                "identity": {"state": "unknown"},
+            }
+            (trust / "bootstrap-trust-anchor.json").write_text(
+                json.dumps(anchor), encoding="utf-8"
+            )
+            ledger_path = authority / "v2.2.6-owner-approved-ledger.json"
+            ledger_path.write_text(json.dumps(ledger, sort_keys=True), encoding="utf-8")
+            source = Path(temporary) / "owner-automation.toml"
+            source.write_text("prompt = 'owner approved package'\n", encoding="utf-8")
+
+            def signer_fingerprint(key: Path) -> str:
+                parts = public(key).split()
+                return "sha256:" + hashlib.sha256(
+                    (parts[0] + " " + parts[1]).encode("ascii")
+                ).hexdigest()
+
+            claims = {
+                "baseline_id": "owner-approved-v226-bootstrap-fixture",
+                "authority_epoch": "owner-approved-v226-epoch-fixture",
+                "repository_ids": {
+                    role: repository_id,
+                    "public" if role == "internal" else "internal": "sha256:" + "f" * 64,
+                },
+                "source_evidence": {
+                    "schema": "engineering.owner-approved-bootstrap-source.v1",
+                    "kind": "codex_automation_prompt",
+                    "automation_id": "office-automations-residual-closure",
+                    "path": str(source.resolve()),
+                    "digest": "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "length": source.stat().st_size,
+                    "version": "2026-08-13T22:40:50.9723607Z",
+                },
+                "ledger_digest": "sha256:"
+                + hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+                "role_separation": {
+                    "owner_principal": "owner-baseline-owner",
+                    "architect_principal": "architect-principal",
+                    "implementer_principal": "implementer-principal",
+                    "writer_principal": "implementer-principal",
+                    "auditors": [
+                        {
+                            "category": "semantic",
+                            "principal_id": "semantic-auditor",
+                            "signer_fingerprint": signer_fingerprint(semantic_key),
+                        },
+                        {
+                            "category": "technical_security",
+                            "principal_id": "technical-auditor",
+                            "signer_fingerprint": signer_fingerprint(technical_key),
+                        },
+                    ],
+                },
+                "issued_at": "2026-08-25T09:00:00+00:00",
+                "expires_at": "2026-09-24T09:00:00+00:00",
+                "status": "active",
+                "replay_policy": "idempotent_same_digest_only",
+                "replay_nonce": "owner-baseline-fixture-nonce",
+            }
+            host_receipt = {
+                "schema": "engineering.v2.2.6-owner-baseline-host-receipt.v1",
+                "receipt_id": "owner-baseline-host-receipt-fixture",
+                "authority_epoch": claims["authority_epoch"],
+                "contract": "engineering.v2.2.6-owner-approved-ledger.v1",
+                "identity": {"state": "unknown"},
+                "trust_anchor": anchor,
+            }
+            material = module._canonical(
+                {
+                    "schema": "engineering.v2.2.6-owner-baseline-claims.v1",
+                    "claims": claims,
+                    "host_receipt": host_receipt,
+                }
+            )
+            material_path = Path(temporary) / "owner-baseline-claims.json"
+            material_path.write_bytes(material)
+            subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "sign",
+                    "-f",
+                    str(owner_key),
+                    "-n",
+                    "engineering-v226-owner-baseline",
+                    str(material_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            approval = {
+                "schema": "engineering.v2.2.6-owner-baseline-approval.v1",
+                "approver": "owner-baseline-owner",
+                "claims": claims,
+                "host_receipt": host_receipt,
+                "signature": material_path.with_suffix(".json.sig").read_text(
+                    encoding="ascii"
+                ),
+            }
+            (authority / "v2.2.6-owner-approved-ledger-approval.json").write_text(
+                json.dumps(approval), encoding="utf-8"
+            )
+            with (
+                patch.object(module, "_canonical_host_home", return_value=host_home),
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+            ):
+                resolved = module._owner_approved_ledger(ROOT, role)
+            self.assertEqual(ledger, resolved["ledger"])
+            self.assertEqual(claims["authority_epoch"], resolved["authority_epoch"])
+            self.assertEqual(claims["role_separation"], resolved["role_separation"])
+
+            source.write_text("prompt = 'changed authority'\n", encoding="utf-8")
+            with (
+                patch.object(module, "_canonical_host_home", return_value=host_home),
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+            ):
+                with self.assertRaisesRegex(
+                    module.MatrixError, "owner-approved source evidence is mismatched"
+                ):
+                    module._owner_approved_ledger(ROOT, role)
+
+    def test_v226_release_matrix_rejects_fabricated_native_evidence(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_matrix_negative", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
+        artifact = module._artifact(ROOT, role)
+        with (
+            patch.object(
+                module,
+                "_owner_approved_ledger",
+                return_value=self.candidate_owner_baseline(),
+            ),
+            self.assertRaisesRegex(module.MatrixError, "host envelope path"),
+        ):
+            module.generate_matrix(
+                ROOT,
+                role,
+                {
+                    "schema": module.HOST_EXECUTION_ENVELOPE_SCHEMA,
+                    "artifact": artifact,
+                    "evidence_class": "real_outcome",
+                    "requirement_ids": list(module.V226_REQUIRED_REQUIREMENTS),
+                },
+            )
+
+    def test_v226_native_command_cannot_self_promote_or_claim_requirements(self) -> None:
+        """A generic unit-suite receipt cannot label itself E2E for arbitrary rows."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_no_self_promotion", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = (
+            "internal"
+            if (ROOT / "release" / "audience-classification.json").is_file()
+            else "public"
+        )
+        artifact = module._artifact(ROOT, role)
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_root = Path(temporary).resolve()
+            log = evidence_root / "generic.log"
+            log.write_text("Ran 491 tests in 1.000s\n\nOK\n", encoding="utf-8")
+            meta = evidence_root / "generic.meta.json"
+            meta.write_text(
+                json.dumps(
+                    {
+                        "schema": module.NATIVE_EXECUTION_META_SCHEMA,
+                        "command_id": "caller-promoted-suite",
+                        "executor": {
+                            "role": "implementer",
+                            "identity": {"state": "unknown"},
+                        },
+                        "artifact_before": artifact,
+                        "artifact_after": artifact,
+                        "role": role,
+                        "argv": ["python", ".agents/skills/engineering/tests/test_engineering.py"],
+                        "cwd": str(ROOT.resolve()),
+                        "started_at": "2026-08-25T10:00:00+00:00",
+                        "finished_at": "2026-08-25T10:01:00+00:00",
+                        "exit_code": 0,
+                        "parser": "python-unittest-v1",
+                        "counts": {
+                            "run": 491,
+                            "failures": 0,
+                            "errors": 0,
+                            "skipped": 0,
+                        },
+                        "evidence_class": "end_to_end",
+                        "requirement_ids": sorted(
+                            item
+                            for item in module.V226_REQUIRED_REQUIREMENTS
+                            if item != "independent_exact_artifact_acceptance"
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            reference = lambda path: {
+                "path": path.relative_to(evidence_root).as_posix(),
+                "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            with self.assertRaisesRegex(
+                module.MatrixError, "selector-specific|self-declared"
+            ):
+                module._native_command(
+                    ROOT,
+                    artifact,
+                    role,
+                    evidence_root,
+                    {
+                        "command_id": "caller-promoted-suite",
+                        "meta": reference(meta),
+                        "log": reference(log),
+                    },
+                    set(module.V226_REQUIRED_REQUIREMENTS),
+                )
+
+    def test_v226_independent_audit_requires_external_role_signature(self) -> None:
+        """A host-envelope principal label is not an independent audit signature."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_signed_auditor", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
+        artifact = module._artifact(ROOT, role)
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_root = Path(temporary).resolve()
+            allowed = b"semantic-auditor ssh-ed25519 " + b"A" * 68 + b"\n"
+            fingerprint = module._allowed_signer_fingerprint(
+                allowed, "semantic-auditor"
+            )
+            report = evidence_root / "semantic.report.txt"
+            report.write_text("ACCEPT exact artifact\n", encoding="utf-8")
+            meta = evidence_root / "semantic.meta.json"
+            signature = evidence_root / "semantic.sig"
+            signature.write_text("not signed\n", encoding="ascii")
+            meta.write_text(
+                json.dumps(
+                    {
+                        "schema": module.INDEPENDENT_AUDIT_META_SCHEMA,
+                        "audit_id": "unsigned-semantic",
+                        "category": "semantic",
+                        "auditor": {
+                            "role": "independent_auditor",
+                            "principal_id": "semantic-auditor",
+                            "signer_fingerprint": fingerprint,
+                            "identity": {"state": "unknown"},
+                        },
+                        "artifact": artifact,
+                        "decision": "accepted",
+                        "issued_at": "2026-08-25T09:00:00+00:00",
+                        "report_digest": "sha256:"
+                        + hashlib.sha256(report.read_bytes()).hexdigest(),
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            def reference(path: Path) -> dict:
+                return {
+                    "path": path.relative_to(evidence_root).as_posix(),
+                    "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            with self.assertRaisesRegex(module.MatrixError, "signature"):
+                module._independent_audit(
+                    ROOT,
+                    artifact,
+                    evidence_root,
+                    {
+                        "audit_id": "unsigned-semantic",
+                        "meta": reference(meta),
+                        "report": reference(report),
+                        "signature": reference(signature),
+                    },
+                    {
+                        "category": "semantic",
+                        "principal_id": "semantic-auditor",
+                        "signer_fingerprint": fingerprint,
+                    },
+                    allowed,
+                )
+
+    def test_v226_same_artifact_requirement_pass_cannot_mask_failure(self) -> None:
+        """A duplicate or conflicting selector history is never evidence satisfaction."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_command_conflict", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        passed = {
+            "command_id": "pass",
+            "selector": "test_exact_requirement",
+            "exit_code": 0,
+            "counts": {"run": 1, "failures": 0, "errors": 0, "skipped": 0},
+        }
+        failed = {
+            "command_id": "fail",
+            "selector": "test_exact_requirement",
+            "exit_code": 1,
+            "counts": {"run": 1, "failures": 1, "errors": 0, "skipped": 0},
+        }
+        with self.assertRaisesRegex(module.MatrixError, "conflict|ambiguous"):
+            module._validate_command_set([failed, passed])
+        with self.assertRaisesRegex(module.MatrixError, "ambiguous"):
+            module._validate_command_set([passed, {**passed, "command_id": "pass-2"}])
+
+    def test_v226_incident_evidence_is_exact_and_role_bound(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_incident", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
+        artifact = module._artifact(ROOT, role)
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_root = Path(temporary).resolve()
+            log = evidence_root / "incident.log"
+            log.write_text(
+                "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n",
+                encoding="utf-8",
+            )
+            meta = evidence_root / "incident.meta.json"
+            wrong_role = "public" if role == "internal" else "internal"
+            meta.write_text(
+                json.dumps(
+                    {
+                        "schema": module.NATIVE_INCIDENT_META_SCHEMA,
+                        "incident_id": "incident-wrong-role",
+                        "observed_at": "2026-08-24T10:00:00+00:00",
+                        "artifact": {**artifact, "role": wrong_role},
+                        "role": wrong_role,
+                        "executor": {"role": "implementer", "identity": {"state": "unknown"}},
+                        "argv": ["python", "-m", "unittest"],
+                        "cwd": str(ROOT.resolve()),
+                        "result": "failed",
+                        "exit_code": 1,
+                        "parser": "python-unittest-v1",
+                        "counts": {"run": 1, "failures": 1, "errors": 0, "skipped": 0},
+                        "evidence_state": "canonical_log",
+                        "reconciliation": {
+                            "state": "superseded_by_exact_artifact",
+                            "exact_artifact": artifact,
+                        },
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            reference = lambda path: {
+                "path": path.relative_to(evidence_root).as_posix(),
+                "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            with self.assertRaisesRegex(module.MatrixError, "role-bound"):
+                module._native_incident(
+                    ROOT,
+                    artifact,
+                    role,
+                    evidence_root,
+                    {
+                        "incident_id": "incident-wrong-role",
+                        "meta": reference(meta),
+                        "log": reference(log),
+                    },
+                )
+
+    def test_v226_requirement_registry_has_complete_generic_obligation_dag(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_obligations", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
+        )
+        requirements, obligations = module._normalize_registry(
+            registry, self.candidate_owner_baseline()["ledger"]
+        )
+        self.assertEqual(
+            set(module.V226_REQUIRED_REQUIREMENTS),
+            {row["id"] for row in requirements},
+        )
+        self.assertEqual(
+            tuple(module.V226_REQUIRED_OBLIGATIONS),
+            tuple(row["id"] for row in obligations),
+        )
+        required_categories = {
+            "graphify_overlay", "trace_coverage_impact_why", "setup_checkpoint_completion",
+            "authority_persistence", "maintenance", "semantic_matrices",
+            "capability_assurance", "learning", "v061_runtime", "ctao_api",
+            "headless_product", "consumer_integration", "decision_studio",
+            "native_harness", "project_identity", "measurement", "first_pass",
+            "false_acceptance", "graph_engineering", "readme", "langfuse_deferment",
+            "postactivation_completeness",
+        }
+        self.assertTrue(required_categories <= {row["category"] for row in obligations})
+        for row in obligations:
+            self.assertIn(row["disposition"]["state"], {"included", "deferred"})
+            self.assertTrue(row["acceptance_criteria"]["fail_closed"])
+        missing = json.loads(json.dumps(registry))
+        missing["obligations"].pop()
+        with self.assertRaisesRegex(module.MatrixError, "external owner ledger"):
+            module._normalize_registry(
+                missing, self.candidate_owner_baseline()["ledger"]
+            )
+
+    def test_v226_graph_semantic_owner_obligations_are_explicit_and_unbound(self) -> None:
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
+        )
+        obligations = {row["id"]: row for row in registry["obligations"]}
+        required = {
+            "graph_false_edge_rejection",
+            "graph_amdahl_parallelism_semantics",
+            "graph_fresh_verifier_enforcement",
+            "graph_critical_path_enforcement",
+        }
+        self.assertTrue(required <= obligations.keys())
+        for identifier in required:
+            self.assertEqual("post_activation", obligations[identifier]["phase"])
+            self.assertEqual(
+                "real_outcome",
+                obligations[identifier]["acceptance_criteria"]["evidence_class"],
+            )
+            self.assertTrue(obligations[identifier]["acceptance_criteria"]["fail_closed"])
+
+    def test_v226_graph_one_writer_is_full_graph_and_postactivation(self) -> None:
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
+        )
+        row = next(
+            item for item in registry["obligations"]
+            if item["id"] == "graph_full_one_writer_enforcement"
+        )
+        self.assertEqual("post_activation", row["phase"])
+        self.assertIn("all active graph lanes", row["acceptance_criteria"]["environment"])
+        self.assertEqual("real_outcome", row["acceptance_criteria"]["evidence_class"])
+
+    def test_v226_decision_studio_authority_remains_external_and_unbound(self) -> None:
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
+        )
+        obligations = {row["id"]: row for row in registry["obligations"]}
+        receipt = obligations["decision_studio_external_receipt"]
+        consumer = obligations["decision_studio_consumer_integration"]
+        self.assertIn("external", receipt["acceptance_criteria"]["interface"].lower())
+        self.assertIn("decision_studio_external_receipt", consumer["dependencies"])
+        self.assertEqual("post_activation", receipt["phase"])
+
+    def test_v226_manage_kaka_correction_is_a_separate_downstream_gate(self) -> None:
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
+        )
+        obligations = {row["id"]: row for row in registry["obligations"]}
+        correction = obligations["manage_kaka_consumer_correction"]
+        integration = obligations["kaka_consumer_integration"]
+        self.assertIn("ctao_observability_api", correction["dependencies"])
+        self.assertIn("manage_kaka_consumer_correction", integration["dependencies"])
+        self.assertNotEqual(correction["dispatch_gate"], integration["dispatch_gate"])
+
+    def test_v226_adjacent_tool_comparison_is_factual_and_dependency_scanned(self) -> None:
+        registry = json.loads(
+            (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
+        )
+        obligations = {row["id"]: row for row in registry["obligations"]}
+        comparison = obligations["adjacent_orchestrator_comparison"]
+        self.assertIn("dependency-scan", comparison["acceptance_criteria"]["interface"])
+        self.assertIn("langfuse_deferred", comparison["dependencies"])
+        self.assertEqual("post_activation", comparison["phase"])
+
+    def test_v226_native_command_meta_and_log_tampering_fail_closed(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location("engineering_v226_native_tamper", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
+        artifact = module._artifact(ROOT, role)
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_root = Path(temporary).resolve()
+            log = evidence_root / "command.log"
+            meta = evidence_root / "command.meta.json"
+            log.write_text("Ran 1 test in 0.001s\n\nOK\n", encoding="utf-8")
+            selector = "test_v226_release_matrix_is_exact_complete_and_fail_closed"
+            base = {
+                "schema": module.NATIVE_EXECUTION_META_SCHEMA,
+                "command_id": "exact-command",
+                "executor": {"role": "implementer", "identity": {"state": "unknown"}},
+                "artifact_before": artifact,
+                "artifact_after": artifact,
+                "role": role,
+                "argv": [
+                    "python",
+                    "-m",
+                    "unittest",
+                    f"tests.test_repository.RepositoryContractTests.{selector}",
+                ],
+                "cwd": str(ROOT.resolve()),
+                "started_at": "2026-08-24T10:00:00+00:00",
+                "finished_at": "2026-08-24T10:01:00+00:00",
+                "exit_code": 0,
+                "parser": "python-unittest-v1",
+                "counts": {"run": 1, "failures": 0, "errors": 0, "skipped": 0},
+                "selector": selector,
+            }
+            def reference(path: Path) -> dict:
+                return {
+                    "path": path.relative_to(evidence_root).as_posix(),
+                    "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            def command_reference() -> dict:
+                return {
+                    "command_id": "exact-command",
+                    "meta": reference(meta),
+                    "log": reference(log),
+                }
+            meta.write_text(json.dumps(base, sort_keys=True), encoding="utf-8")
+            original_meta_reference = reference(meta)
+            module._native_command(
+                ROOT,
+                artifact,
+                role,
+                evidence_root,
+                command_reference(),
+                set(module.V226_REQUIRED_REQUIREMENTS),
+            )
+            original_log_reference = reference(log)
+            log.write_text("substituted\n", encoding="utf-8")
+            with self.assertRaisesRegex(module.MatrixError, "digest"):
+                module._native_command(
+                    ROOT,
+                    artifact,
+                    role,
+                    evidence_root,
+                    {
+                        "command_id": "exact-command",
+                        "meta": reference(meta),
+                        "log": original_log_reference,
+                    },
+                    set(module.V226_REQUIRED_REQUIREMENTS),
+                )
+            log.write_text("Ran 1 test in 0.001s\n\nOK\n", encoding="utf-8")
+            mutations = [
+                {"cwd": str(evidence_root)},
+                {"role": "public" if role == "internal" else "internal"},
+                {"argv": ["python", "different.py"]},
+                {"artifact_before": {**artifact, "commit": "0" * 40}},
+                {"artifact_after": {**artifact, "tree": "0" * 40}},
+            ]
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    changed = {**base, **mutation}
+                    meta.write_text(json.dumps(changed, sort_keys=True), encoding="utf-8")
+                    with self.assertRaisesRegex(module.MatrixError, "digest"):
+                        module._native_command(
+                            ROOT,
+                            artifact,
+                            role,
+                            evidence_root,
+                            {
+                                "command_id": "exact-command",
+                                "meta": original_meta_reference,
+                                "log": reference(log),
+                            },
+                            set(module.V226_REQUIRED_REQUIREMENTS),
+                        )
+            fabricated = {**base, "requirement_ids": ["fabricated_requirement"]}
+            meta.write_text(json.dumps(fabricated, sort_keys=True), encoding="utf-8")
+            with self.assertRaisesRegex(module.MatrixError, "self-declared native evidence"):
+                module._native_command(
+                    ROOT,
+                    artifact,
+                    role,
+                    evidence_root,
+                    command_reference(),
+                    set(module.V226_REQUIRED_REQUIREMENTS),
+                )
+
+    def test_v226_internal_plans_receipt_docs_and_utf8_are_truthful(self) -> None:
+        audience_path = ROOT / "release" / "audience-classification.json"
+        if audience_path.is_file():
+            audience = json.loads(audience_path.read_text(encoding="utf-8"))
+            shared = set(
+                json.loads(
+                    (ROOT / "release" / "public-export.json").read_text(encoding="utf-8")
+                )["files"]
+            )
+            classified = (
+                shared
+                | set(audience["internal_only"])
+                | set(audience["public_only"])
+                | set(audience["audience_specific"])
+            )
+            tracked = subprocess.check_output(
+                ["git", "-C", str(ROOT), "ls-files", "docs/plans", "docs/superpowers/plans"],
+                text=True,
+                encoding="utf-8",
+            ).splitlines()
+            self.assertEqual([], sorted(set(tracked) - classified))
+        receipt_doc = (
+            ROOT / "docs" / "specs" / "engineering-v2.2.6-owner-intent-audit-repair.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("engineering.install.v5", receipt_doc)
+        self.assertIn("after the one-time bootstrap", receipt_doc)
+        self.assertNotIn("retained as `engineering.install.v4`", receipt_doc)
+        for relative in sorted(subprocess.check_output(
+            ["git", "-C", str(ROOT), "ls-files"], text=True, encoding="utf-8"
+        ).splitlines()):
+            path = ROOT / relative
+            try:
+                content = path.read_bytes()
+                text = content.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+            self.assertFalse(content.startswith(b"\xef\xbb\xbf"), relative)
+            self.assertTrue(normalized.endswith("\n"), relative)
+            self.assertFalse(normalized.endswith("\n\n"), relative)
+            self.assertFalse(
+                any(line.endswith((" ", "\t")) for line in text.splitlines()), relative
+            )
+
+    def test_release_manifest_is_v2_2_6_with_owner_intent_gate(self) -> None:
         manifest = json.loads((SKILL_ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual("2.2.5", manifest["version"])
+        self.assertEqual("2.2.6", manifest["version"])
         self.assertEqual(1, manifest["controller_schema"])
         self.assertEqual(
             {
@@ -55,6 +1178,22 @@ class RepositoryContractTests(unittest.TestCase):
             },
             manifest["graphify"],
         )
+
+    def test_shared_controller_contract_documents_owner_intent_release_gate(self) -> None:
+        contract = (SKILL_ROOT / "references" / "controller-contract.md").read_text(
+            encoding="utf-8"
+        )
+        for command in (
+            "intent-bind",
+            "intent-status",
+            "outcome-accept",
+            "release-gate",
+            "verify-release-token",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, contract)
+        self.assertIn("engineering.owner-intent.v1", contract)
+        self.assertIn("engineering.release-token.v2", contract)
 
     def test_ci_installs_the_pinned_graphify_dependency(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "security.yml").read_text(
@@ -597,6 +1736,16 @@ class RepositoryContractTests(unittest.TestCase):
             with self.subTest(sample=sample):
                 self.assertIsNotNone(pattern.search(sample))
 
+    def test_shared_tree_passes_sensitive_scanner(self) -> None:
+        result = subprocess.run(
+            ["python", "-B", "tools/check_sensitive.py"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def test_audience_guard_rejects_crossflow_metadata_history_and_unknowns(self) -> None:
         spec = importlib.util.spec_from_file_location(
             "engineering_audience", ROOT / "tools" / "check_audience.py"
@@ -805,6 +1954,77 @@ Residual risk: No repository-supported vulnerability intake is available.
         self.assertEqual([], tracked_offenders)
         self.assertEqual([], local_offenders)
 
+    def test_public_export_accepts_an_independent_linked_worktree_destination(self) -> None:
+        """An isolated public worktree retains its own Git common directory."""
+        if not (ROOT / "tools" / "export_public.py").is_file():
+            self.skipTest("canonical-only exporter is intentionally absent")
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            primary = base / "public-primary"
+            destination = base / "public-linked"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(primary)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(primary), "config", "user.name", "Synthetic"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(primary),
+                    "config",
+                    "user.email",
+                    "synthetic" + "@" + "example.invalid",
+                ],
+                check=True,
+            )
+            (primary / "SECURITY.md").write_text(
+                "# Security\n\nUse GitHub private vulnerability reporting at "
+                "https://example.invalid/security/advisories/new.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(primary), "add", "SECURITY.md"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(primary), "commit", "-m", "security overlay"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(primary),
+                    "worktree",
+                    "add",
+                    "-b",
+                    "candidate",
+                    str(destination),
+                    "HEAD",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            self.assertTrue((destination / ".git").is_file())
+            self.write_public_only_overlay(destination)
+
+            result = module.export_tree(ROOT, destination)
+
+            self.assertEqual(module._source_commit(ROOT), result["source_commit"])
+            self.assertTrue(
+                (primary / ".git" / "engineering-public-export.json").is_file()
+            )
+
     def test_public_export_is_allowlisted_and_history_independent(self) -> None:
         if not (ROOT / "tools" / "export_public.py").is_file():
             self.skipTest("canonical-only exporter is intentionally absent")
@@ -831,6 +2051,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     "https://example.invalid/security/advisories/new.\n",
                     encoding="utf-8",
                 )
+            self.write_public_only_overlay(destination)
 
             result = module.export_tree(ROOT, destination)
 
@@ -840,7 +2061,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     encoding="utf-8"
                 )
             )
-            self.assertEqual("engineering.public-export-receipt.v3", receipt["schema"])
+            self.assertEqual("engineering.public-export-receipt.v4", receipt["schema"])
             source_commit = subprocess.run(
                 ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
                 check=True,
@@ -866,6 +2087,7 @@ Residual risk: No repository-supported vulnerability intake is available.
             self.assertFalse((destination / "release" / "audience-classification.json").exists())
             self.assertFalse((destination / "CONTRIBUTING.md").exists())
             self.assertFalse((destination / "docs" / "internal-installation.md").exists())
+            self.assertTrue((destination / "docs" / "public-contributing.md").is_file())
             self.assertEqual(has_audience_policy, (destination / "SECURITY.md").exists())
             self.assertFalse((destination / ".github" / "ISSUE_TEMPLATE" / "bug-idea.yml").exists())
             self.assertFalse((destination / ".github" / "ISSUE_TEMPLATE" / "code-proposal.yml").exists())
@@ -877,11 +2099,14 @@ Residual risk: No repository-supported vulnerability intake is available.
                 for path in destination.rglob("*")
                 if path.is_file() and ".git" not in path.parts
             }
-            actual_shared = actual - ({"SECURITY.md"} if has_audience_policy else set())
+            overlays = {"docs/public-contributing.md"}
+            if has_audience_policy:
+                overlays.add("SECURITY.md")
+            actual_shared = actual - overlays
             self.assertEqual(expected, actual_shared)
             for relative in expected:
                 self.assertEqual(
-                    (ROOT / relative).read_bytes(),
+                    module._git_blob_bytes(ROOT, source_commit, relative),
                     (destination / relative).read_bytes(),
                     relative,
                 )
@@ -1000,8 +2225,37 @@ Residual risk: No repository-supported vulnerability intake is available.
                 check=True,
                 capture_output=True,
             )
+            self.write_public_only_overlay(destination)
             with self.assertRaisesRegex(module.ExportError, "audience-specific security"):
                 module.export_tree(ROOT, destination)
+
+    def test_public_export_requires_every_declared_public_only_destination_file(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            destination = Path(temporary) / "public"
+            (source / "release").mkdir(parents=True)
+            destination.mkdir()
+            (source / "release" / "audience-classification.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "engineering.audience-classification.v1",
+                        "shared_manifest": "release/public-export.json",
+                        "internal_only": ["release/audience-classification.json"],
+                        "public_only": ["docs/public-contributing.md"],
+                        "audience_specific": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(module.ExportError, "public-only destination"):
+                module._validate_audience_classification(
+                    source, [], destination=destination
+                )
 
     def test_public_export_cannot_delete_an_absolute_retained_path(self) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -1029,6 +2283,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     "https://example.invalid/security/advisories/new.\n",
                     encoding="utf-8",
                 )
+            self.write_public_only_overlay(destination)
             module.export_tree(ROOT, destination)
             self.assertEqual("keep\n", sentinel.read_text(encoding="utf-8"))
 
@@ -1063,6 +2318,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     "https://example.invalid/security/advisories/new.\n",
                     encoding="utf-8",
                 )
+            self.write_public_only_overlay(destination)
             module.export_tree(ROOT, destination)
             self.assertEqual("keep\n", retained.read_text(encoding="utf-8"))
 
@@ -1197,6 +2453,110 @@ Residual risk: No repository-supported vulnerability intake is available.
             (source / "README.md").write_text("modified\n", encoding="utf-8")
             with self.assertRaises(module.ExportError):
                 module._assert_clean_head_snapshot(source, ["README.md"])
+
+    def test_public_export_identity_and_bytes_are_stable_across_checkout_eol(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            origin = base / "origin"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(origin)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(origin), "config", "user.name", "Synthetic"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(origin),
+                    "config",
+                    "user.email",
+                    "synthetic" + "@" + "example.invalid",
+                ],
+                check=True,
+            )
+            (origin / "release").mkdir()
+            (origin / "README.md").write_bytes(b"one\ntwo\n")
+            (origin / "release" / "public-export.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "engineering.public-export.v1",
+                        "files": ["README.md"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(origin), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(origin), "commit", "-m", "exact source"],
+                check=True,
+                capture_output=True,
+            )
+            results = []
+            isolated_git_config = base / "empty.gitconfig"
+            isolated_git_config.write_text("", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "GIT_CONFIG_GLOBAL": str(isolated_git_config),
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                },
+            ):
+                for name, autocrlf in (("lf", "false"), ("crlf", "true")):
+                    source = base / f"source-{name}"
+                    destination = base / f"public-{name}"
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "--config",
+                            f"core.autocrlf={autocrlf}",
+                            str(origin),
+                            str(source),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "init", "--initial-branch=main", str(destination)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    results.append((module.export_tree(source, destination), destination))
+            self.assertNotEqual(
+                (base / "source-lf" / "README.md").read_bytes(),
+                (base / "source-crlf" / "README.md").read_bytes(),
+            )
+            self.assertEqual(results[0][0]["tree_digest"], results[1][0]["tree_digest"])
+            expected_tree = subprocess.run(
+                ["git", "-C", str(origin), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(expected_tree, results[0][0]["source_git_tree"])
+            expected_readme = subprocess.run(
+                ["git", "-C", str(origin), "show", "HEAD:README.md"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            for _, destination in results:
+                self.assertEqual(expected_readme, (destination / "README.md").read_bytes())
+            receipts = [
+                json.loads(
+                    (destination / ".git" / "engineering-public-export.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                for _, destination in results
+            ]
+            self.assertEqual(receipts[0], receipts[1])
 
     def test_public_export_rejects_a_hard_linked_receipt(self) -> None:
         spec = importlib.util.spec_from_file_location(
