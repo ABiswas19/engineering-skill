@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
 import os
 import re
+import stat
 import subprocess
+import sys
+import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
+
+_SHARED_SCRIPTS = str(
+    Path(__file__).resolve().parents[1] / ".agents" / "skills" / "engineering" / "scripts"
+)
+sys.path.insert(0, _SHARED_SCRIPTS)
+try:
+    from engineering_host_boundary import (
+        HostBoundaryError,
+        canonical_host_home as _shared_canonical_host_home,
+        reject_reparse_ancestors as _shared_reject_reparse_ancestors,
+        verify_owner_private as _shared_verify_owner_private,
+    )
+finally:
+    sys.path.remove(_SHARED_SCRIPTS)
 
 
 class MatrixError(RuntimeError):
@@ -24,17 +43,22 @@ EVIDENCE_CLASSES = ("proxy", "design", "unit", "integration", "end_to_end", "rea
 GATES = ("artifact_acceptance", "post_activation")
 V226_REQUIRED_REQUIREMENTS = (
     "complete_owner_obligation_ledger",
+    "adjacent_tool_comparison_gate",
     "authenticated_execution_envelopes",
     "deterministic_release_matrix",
+    "decision_studio_external_authority",
     "exact_release_install_binding",
     "external_owner_authority",
     "git_object_byte_identity",
+    "graph_execution_semantics",
+    "graph_one_writer_enforcement",
     "host_private_postactivation_trust",
     "hostile_git_environment",
     "independent_equivalence",
     "independent_exact_artifact_acceptance",
     "intent_digest_continuity",
     "model_routing_disclosure",
+    "manage_kaka_consumer_correction",
     "native_harness_real_outcome_gate",
     "noncircular_bootstrap",
     "outcome_survival_baseline",
@@ -63,15 +87,23 @@ V226_REQUIRED_OBLIGATIONS = (
     "first_pass_incident_preservation",
     "false_acceptance_prevention",
     "graph_engineering_contract",
+    "graph_false_edge_rejection",
+    "graph_amdahl_parallelism_semantics",
+    "graph_fresh_verifier_enforcement",
+    "graph_critical_path_enforcement",
+    "graph_full_one_writer_enforcement",
     "readme_contract_truth",
     "langfuse_deferred",
     "v226_activation_boundary",
     "postactivation_completeness_import",
     "all_owner_outcome_release_enforcement",
     "native_codex_claude_harness_proof",
+    "adjacent_orchestrator_comparison",
     "v061_runtime_delivery",
     "ctao_observability_api",
+    "manage_kaka_consumer_correction",
     "kaka_consumer_integration",
+    "decision_studio_external_receipt",
     "decision_studio_consumer_integration",
     "headless_unified_product",
     "remaining_plugin_independent_frontend",
@@ -123,7 +155,9 @@ def _blob(root: Path, commit: str, relative: str) -> bytes:
     return _git(root, "cat-file", "blob", f"{commit}:{relative}", binary=True)
 
 
-def _normalize_registry(value: object) -> tuple[list[dict], list[dict]]:
+def _normalize_registry(
+    value: object, owner_ledger: object | None = None
+) -> tuple[list[dict], list[dict]]:
     expected_row = {
         "id",
         "lifecycle_state",
@@ -143,8 +177,26 @@ def _normalize_registry(value: object) -> tuple[list[dict], list[dict]]:
         raise MatrixError("authoritative requirement registry is invalid")
     rows = value["requirements"]
     ids = [row.get("id") for row in rows if isinstance(row, dict)]
-    if tuple(ids) != V226_REQUIRED_REQUIREMENTS:
-        raise MatrixError("authoritative requirement coverage is incomplete")
+    if (
+        not isinstance(owner_ledger, dict)
+        or set(owner_ledger) != {"schema", "requirements", "obligations"}
+        or owner_ledger.get("schema")
+        != "engineering.v2.2.6-owner-approved-ledger.v1"
+        or not isinstance(owner_ledger.get("requirements"), list)
+        or not isinstance(owner_ledger.get("obligations"), list)
+    ):
+        raise MatrixError("external owner ledger is required and invalid")
+    owner_ids = [
+        row.get("id")
+        for row in owner_ledger["requirements"]
+        if isinstance(row, dict)
+    ]
+    if (
+        ids != owner_ids
+        or len(ids) != len(set(ids))
+        or any(not isinstance(item, str) or not item for item in ids)
+    ):
+        raise MatrixError("candidate registry mismatches external owner ledger")
     normalized = []
     for row in rows:
         if not isinstance(row, dict) or set(row) != expected_row:
@@ -167,9 +219,13 @@ def _normalize_registry(value: object) -> tuple[list[dict], list[dict]]:
         evidence = row.get("native_evidence")
         if (
             not isinstance(evidence, dict)
-            or set(evidence) != {"gate", "minimum_class"}
+            or set(evidence) != {"gate", "minimum_class", "interface", "environment"}
             or evidence.get("gate") not in GATES
             or evidence.get("minimum_class") not in EVIDENCE_CLASSES
+            or not isinstance(evidence.get("interface"), str)
+            or not evidence["interface"]
+            or not isinstance(evidence.get("environment"), str)
+            or not evidence["environment"]
             or not isinstance(row.get("runtime_behavior"), str)
             or not row["runtime_behavior"]
         ):
@@ -177,8 +233,11 @@ def _normalize_registry(value: object) -> tuple[list[dict], list[dict]]:
         normalized.append(dict(row))
     obligation_rows = value["obligations"]
     obligation_ids = [row.get("id") for row in obligation_rows if isinstance(row, dict)]
-    if tuple(obligation_ids) != V226_REQUIRED_OBLIGATIONS:
-        raise MatrixError("authoritative obligation coverage is incomplete")
+    if (
+        len(obligation_ids) != len(set(obligation_ids))
+        or any(not isinstance(item, str) or not item for item in obligation_ids)
+    ):
+        raise MatrixError("authoritative obligation coverage is invalid")
     obligation_expected = {
         "id", "category", "phase", "dependencies", "disposition",
         "acceptance_criteria", "dispatch_gate",
@@ -218,6 +277,20 @@ def _normalize_registry(value: object) -> tuple[list[dict], list[dict]]:
             raise MatrixError("authoritative obligation mapping is invalid")
         seen_obligations.add(row["id"])
         normalized_obligations.append(dict(row))
+    owner_requirements = [
+        {
+            "id": row["id"],
+            "lifecycle_state": row["lifecycle_state"],
+            "runtime_behavior": row["runtime_behavior"],
+            "native_evidence": row["native_evidence"],
+        }
+        for row in normalized
+    ]
+    if (
+        owner_ledger["requirements"] != owner_requirements
+        or owner_ledger["obligations"] != normalized_obligations
+    ):
+        raise MatrixError("candidate registry mismatches external owner ledger")
     return normalized, normalized_obligations
 
 
@@ -262,6 +335,7 @@ def _reference_bytes(repository: Path, evidence_root: Path, value: object, label
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("digest", "")))
     ):
         raise MatrixError(f"{label} reference is invalid")
+    evidence_root = Path(evidence_root).resolve()
     relative = PurePosixPath(value["path"])
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
         raise MatrixError(f"{label} reference is invalid")
@@ -304,6 +378,51 @@ def _unittest_counts(log: bytes) -> dict:
     }
 
 
+def _native_execution_profile(argv: object, selector: object) -> dict:
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(item, str) or not item for item in argv)
+        or not isinstance(selector, str)
+        or not re.fullmatch(r"test_[A-Za-z0-9_]+", selector)
+    ):
+        raise MatrixError("native execution is not selector-specific")
+    normalized = [item.replace("\\", "/") for item in argv]
+    targeted_engineering = (
+        len(normalized) == 3
+        and normalized[1].endswith(
+            ".agents/skills/engineering/tests/test_engineering.py"
+        )
+        and normalized[2].split(".")[-1] == selector
+    )
+    targeted_repository = (
+        len(normalized) == 4
+        and normalized[1:3] == ["-m", "unittest"]
+        and normalized[3].startswith("tests.test_repository.")
+        and normalized[3].split(".")[-1] == selector
+    )
+    if not targeted_engineering and not targeted_repository:
+        raise MatrixError("native execution is not selector-specific")
+    return {
+        "profile": "python-unittest-exact-selector-v1",
+        "evidence_class": "integration",
+        "interface": f"python-unittest-selector:{selector}",
+        "environment": "isolated_exact_git_contract_fixture",
+    }
+
+
+def _utc_instant(value: object) -> datetime:
+    if not _utc(value):
+        raise MatrixError("native evidence timestamp is invalid")
+    try:
+        instant = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise MatrixError("native evidence timestamp is invalid") from error
+    if instant.tzinfo is None:
+        raise MatrixError("native evidence timestamp is invalid")
+    return instant.astimezone(timezone.utc)
+
+
 def _native_command(
     repository: Path,
     artifact: dict,
@@ -320,14 +439,36 @@ def _native_command(
         meta = json.loads(meta_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise MatrixError("native execution meta is not exact UTF-8 JSON") from error
+    if isinstance(meta, dict) and (
+        "evidence_class" in meta or "requirement_ids" in meta
+    ):
+        raise MatrixError(
+            "self-declared native evidence is prohibited; selector-specific receipt required"
+        )
     expected = {
         "schema", "command_id", "executor", "artifact_before", "artifact_after",
         "role", "argv", "cwd", "started_at", "finished_at", "exit_code", "parser",
-        "counts", "evidence_class", "requirement_ids",
+        "counts", "selector",
     }
     counts = meta.get("counts") if isinstance(meta, dict) else None
-    ids = meta.get("requirement_ids") if isinstance(meta, dict) else None
     executor = meta.get("executor") if isinstance(meta, dict) else None
+    try:
+        profile = _native_execution_profile(
+            meta.get("argv") if isinstance(meta, dict) else None,
+            meta.get("selector") if isinstance(meta, dict) else None,
+        )
+    except MatrixError:
+        profile = None
+    try:
+        started = _utc_instant(meta.get("started_at") if isinstance(meta, dict) else None)
+        finished = _utc_instant(meta.get("finished_at") if isinstance(meta, dict) else None)
+        fresh = (
+            started <= finished
+            and finished <= datetime.now(timezone.utc) + timedelta(minutes=5)
+            and datetime.now(timezone.utc) - finished <= timedelta(days=30)
+        )
+    except MatrixError:
+        fresh = False
     if (
         not isinstance(meta, dict)
         or set(meta) != expected
@@ -345,16 +486,14 @@ def _native_command(
         != os.path.normcase(os.path.realpath(str(repository)))
         or not _utc(meta.get("started_at"))
         or not _utc(meta.get("finished_at"))
+        or not fresh
         or not isinstance(meta.get("exit_code"), int)
         or meta.get("parser") != "python-unittest-v1"
         or not isinstance(counts, dict)
         or set(counts) != {"run", "failures", "errors", "skipped"}
         or any(not isinstance(counts[name], int) or counts[name] < 0 for name in counts)
-        or meta.get("evidence_class") not in EVIDENCE_CLASSES
-        or not isinstance(ids, list)
-        or ids != sorted(set(ids))
-        or not set(ids) <= requirement_ids
-        or "independent_exact_artifact_acceptance" in ids
+        or profile is None
+        or counts.get("run") != 1
         or not isinstance(executor, dict)
         or set(executor) != {"role", "identity"}
         or executor.get("role") not in {"implementer", "native_test_runner"}
@@ -365,9 +504,35 @@ def _native_command(
         raise MatrixError("authenticated native execution evidence is invalid")
     return {
         **meta,
+        "actual_evidence_class": profile["evidence_class"],
+        "actual_interface": profile["interface"],
+        "actual_environment": profile["environment"],
+        "execution_profile": profile["profile"],
         "meta_digest": _digest(meta_bytes),
         "log_digest": _digest(log_bytes),
     }
+
+
+def _validate_command_set(commands: list[dict]) -> None:
+    by_selector: dict[str, list[dict]] = {}
+    for command in commands:
+        by_selector.setdefault(command["selector"], []).append(command)
+    for items in by_selector.values():
+        if len(items) == 1:
+            continue
+        outcomes = {
+            (
+                item["exit_code"] == 0
+                and item["counts"]["failures"] == 0
+                and item["counts"]["errors"] == 0
+            )
+            for item in items
+        }
+        if len(outcomes) > 1:
+            raise MatrixError(
+                "native execution pass/fail conflict is unreconciled for a requirement"
+            )
+        raise MatrixError("native execution evidence is ambiguous for a requirement")
 
 
 def _independent_audit(
@@ -375,11 +540,18 @@ def _independent_audit(
     artifact: dict,
     evidence_root: Path,
     reference: object,
+    expected_auditor: dict,
+    allowed_signers: bytes,
 ) -> dict:
-    if not isinstance(reference, dict) or set(reference) != {"audit_id", "meta", "report"}:
+    if not isinstance(reference, dict) or set(reference) != {
+        "audit_id", "meta", "report", "signature"
+    }:
         raise MatrixError("independent audit reference is invalid")
     meta_bytes = _reference_bytes(repository, evidence_root, reference["meta"], "audit meta")
     report_bytes = _reference_bytes(repository, evidence_root, reference["report"], "audit report")
+    signature_bytes = _reference_bytes(
+        repository, evidence_root, reference["signature"], "audit signature"
+    )
     try:
         meta = json.loads(meta_bytes.decode("utf-8"))
         report_bytes.decode("utf-8")
@@ -387,25 +559,74 @@ def _independent_audit(
         raise MatrixError("independent audit evidence is not exact UTF-8") from error
     expected = {"schema", "audit_id", "category", "auditor", "artifact", "decision", "issued_at", "report_digest"}
     auditor = meta.get("auditor") if isinstance(meta, dict) else None
+    try:
+        issued = _utc_instant(meta.get("issued_at") if isinstance(meta, dict) else None)
+        fresh = (
+            issued <= datetime.now(timezone.utc) + timedelta(minutes=5)
+            and datetime.now(timezone.utc) - issued <= timedelta(days=30)
+        )
+    except MatrixError:
+        fresh = False
     if (
         not isinstance(meta, dict)
         or set(meta) != expected
         or meta.get("schema") != INDEPENDENT_AUDIT_META_SCHEMA
         or meta.get("audit_id") != reference.get("audit_id")
-        or meta.get("category") not in {"semantic", "technical_security"}
+        or meta.get("category") != expected_auditor.get("category")
         or not isinstance(auditor, dict)
-        or set(auditor) != {"role", "principal_id", "identity"}
+        or set(auditor) != {"role", "principal_id", "signer_fingerprint", "identity"}
         or auditor.get("role") != "independent_auditor"
-        or not isinstance(auditor.get("principal_id"), str)
-        or not auditor["principal_id"]
+        or auditor.get("principal_id") != expected_auditor.get("principal_id")
+        or auditor.get("signer_fingerprint")
+        != expected_auditor.get("signer_fingerprint")
+        or auditor.get("signer_fingerprint")
+        != _allowed_signer_fingerprint(allowed_signers, auditor.get("principal_id", ""))
         or auditor.get("identity") != {"state": "unknown"}
         or meta.get("artifact") != artifact
         or meta.get("decision") != "accepted"
-        or not _utc(meta.get("issued_at"))
+        or not fresh
         or meta.get("report_digest") != _digest(report_bytes)
     ):
         raise MatrixError("independent exact-artifact audit evidence is invalid")
-    return {**meta, "meta_digest": _digest(meta_bytes)}
+    try:
+        signature = signature_bytes.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise MatrixError("independent audit signature is invalid") from error
+    if not signature.startswith("-----BEGIN SSH SIGNATURE-----\n") or len(signature) > 16384:
+        raise MatrixError("independent audit signature is invalid")
+    with tempfile.TemporaryDirectory(prefix="engineering-independent-audit-") as temporary:
+        temporary_path = Path(temporary)
+        signers_copy = temporary_path / "allowed-signers"
+        signature_copy = temporary_path / "audit.sig"
+        signers_copy.write_bytes(allowed_signers)
+        signature_copy.write_text(signature, encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen", "-Y", "verify", "-f", str(signers_copy),
+                    "-I", auditor["principal_id"],
+                    "-n", f"engineering-v226-{meta['category']}-audit",
+                    "-s", str(signature_copy),
+                ],
+                input=_canonical(
+                    {
+                        "schema": "engineering.independent-audit-claims.v1",
+                        "meta": meta,
+                    }
+                ),
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise MatrixError("independent audit signature verification is unavailable") from error
+    if verified.returncode != 0:
+        raise MatrixError("independent audit signature is invalid")
+    return {
+        **meta,
+        "meta_digest": _digest(meta_bytes),
+        "signature_digest": _digest(signature_bytes),
+    }
 
 
 def _native_incident(
@@ -476,6 +697,7 @@ def _host_execution_envelope(
     role: str,
     envelope_path: object,
     requirement_ids: set[str],
+    owner_baseline: dict,
 ) -> dict | None:
     if envelope_path is None:
         return None
@@ -484,6 +706,9 @@ def _host_execution_envelope(
     if not host.is_absolute() or ".." in host.parts:
         raise MatrixError("host envelope authentication is unavailable")
     key_path = host / ".agents" / "engineering" / "controller" / "attestation.key"
+    _reject_host_reparse_ancestors(key_path, host)
+    _verify_owner_private_path(key_path.parent, directory=True)
+    _verify_owner_private_path(key_path, directory=False)
     key_bytes = _external_bytes(repository, key_path, "host controller key")
     try:
         key = bytes.fromhex(key_bytes.decode("ascii").strip())
@@ -526,6 +751,7 @@ def _host_execution_envelope(
     command_ids = [item["command_id"] for item in commands]
     if len(command_ids) != len(set(command_ids)):
         raise MatrixError("native execution command IDs are duplicated")
+    _validate_command_set(commands)
     incidents = [
         _native_incident(repository, artifact, role, evidence_root, item)
         for item in envelope["incidents"]
@@ -533,13 +759,46 @@ def _host_execution_envelope(
     incident_ids = [item["incident_id"] for item in incidents]
     if len(incident_ids) != len(set(incident_ids)):
         raise MatrixError("native incident IDs are duplicated")
-    audits = [
-        _independent_audit(repository, artifact, evidence_root, item)
-        for item in envelope["audits"]
-    ]
+    auditor_contracts = {
+        item["category"]: item for item in owner_baseline["role_separation"]["auditors"]
+    }
+    audits = []
+    for item in envelope["audits"]:
+        category = item.get("category") if isinstance(item, dict) else None
+        if category is None and isinstance(item, dict):
+            meta_reference = item.get("meta")
+            if isinstance(meta_reference, dict):
+                try:
+                    meta_preview = json.loads(
+                        _reference_bytes(
+                            repository, evidence_root, meta_reference, "audit meta"
+                        ).decode("utf-8")
+                    )
+                    category = meta_preview.get("category")
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    category = None
+        expected_auditor = auditor_contracts.get(category)
+        if expected_auditor is None:
+            raise MatrixError("independent audit role is not externally authorized")
+        audits.append(
+            _independent_audit(
+                repository,
+                artifact,
+                evidence_root,
+                item,
+                expected_auditor,
+                owner_baseline["allowed_signers"],
+            )
+        )
     audit_ids = [item["audit_id"] for item in audits]
     if len(audit_ids) != len(set(audit_ids)):
         raise MatrixError("independent audit IDs are duplicated")
+    if len({item["category"] for item in audits}) != len(audits):
+        raise MatrixError("independent audit categories are duplicated")
+    if commands and audits:
+        last_command = max(_utc_instant(item["finished_at"]) for item in commands)
+        if any(_utc_instant(item["issued_at"]) < last_command for item in audits):
+            raise MatrixError("independent audit evidence is ill-ordered")
     return {
         "envelope_digest": _digest(envelope_bytes),
         "issuer": issuer,
@@ -550,8 +809,333 @@ def _host_execution_envelope(
 
 
 def _canonical_host_home() -> Path:
-    """Return the native host boundary; callers cannot substitute another key root."""
-    return Path.home().resolve()
+    try:
+        return _shared_canonical_host_home()
+    except HostBoundaryError as error:
+        raise MatrixError("canonical host boundary is unavailable") from error
+
+
+def _reject_host_reparse_ancestors(path: Path, boundary: Path | None = None) -> None:
+    try:
+        _shared_reject_reparse_ancestors(path, boundary)
+    except HostBoundaryError as error:
+        raise MatrixError(str(error)) from error
+
+
+def _verify_owner_private_path(path: Path, *, directory: bool) -> None:
+    try:
+        _shared_verify_owner_private(path, directory=directory)
+    except HostBoundaryError as error:
+        raise MatrixError(str(error)) from error
+
+
+def _owner_approved_ledger(repository: Path, role: str) -> dict:
+    """Resolve the one fixed external owner ledger; callers supply no path."""
+    if role not in {"internal", "public"}:
+        raise MatrixError("owner-approved baseline repository role is invalid")
+    home = _canonical_host_home()
+    directory = home / ".agents" / "engineering" / "bootstrap-authority"
+    ledger_path = directory / "v2.2.6-owner-approved-ledger.json"
+    approval_path = directory / "v2.2.6-owner-approved-ledger-approval.json"
+    trust = directory
+    anchor_path = directory / "bootstrap-trust-anchor.json"
+    allowed_path = directory / "allowed-signers"
+    for path in (
+        directory,
+        ledger_path,
+        approval_path,
+        trust,
+        anchor_path,
+        allowed_path,
+    ):
+        _reject_host_reparse_ancestors(path, directory)
+    if (
+        not ledger_path.is_file()
+        or not approval_path.is_file()
+        or not trust.is_dir()
+        or not anchor_path.is_file()
+        or not allowed_path.is_file()
+    ):
+        raise MatrixError("owner-approved baseline is unavailable")
+    for path in {directory, trust}:
+        _verify_owner_private_path(path, directory=True)
+    for path in (ledger_path, approval_path, anchor_path, allowed_path):
+        _verify_owner_private_path(path, directory=False)
+    try:
+        repository = repository.resolve(strict=True)
+        if directory.resolve().is_relative_to(repository):
+            raise MatrixError("owner-approved baseline is candidate-controlled")
+        ledger_bytes = ledger_path.read_bytes()
+        approval_bytes = approval_path.read_bytes()
+        anchor_bytes = anchor_path.read_bytes()
+        allowed = allowed_path.read_bytes()
+        ledger = json.loads(ledger_bytes.decode("utf-8"))
+        approval = json.loads(approval_bytes.decode("utf-8"))
+        anchor = json.loads(anchor_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MatrixError("owner-approved baseline is invalid") from error
+    if (
+        not isinstance(anchor, dict)
+        or set(anchor)
+        != {"schema", "anchor_id", "format_version", "signers_digest", "identity"}
+        or anchor.get("schema")
+        != "engineering.v2.2.6-bootstrap-trust-anchor.v1"
+        or not isinstance(anchor.get("anchor_id"), str)
+        or not anchor["anchor_id"]
+        or anchor.get("format_version") != 1
+        or anchor.get("signers_digest") != _digest(allowed)
+        or anchor.get("identity") != {"state": "unknown"}
+        or not allowed
+        or len(allowed) > 65536
+        or b"\x00" in allowed
+    ):
+        raise MatrixError("owner-approved baseline trust anchor is invalid")
+    if (
+        not isinstance(ledger, dict)
+        or set(ledger) != {"schema", "requirements", "obligations"}
+        or ledger.get("schema") != "engineering.v2.2.6-owner-approved-ledger.v1"
+        or not isinstance(ledger.get("requirements"), list)
+        or not isinstance(ledger.get("obligations"), list)
+    ):
+        raise MatrixError("owner-approved baseline ledger is invalid")
+    expected_approval = {"schema", "approver", "claims", "host_receipt", "signature"}
+    claims = approval.get("claims") if isinstance(approval, dict) else None
+    receipt = approval.get("host_receipt") if isinstance(approval, dict) else None
+    signature = approval.get("signature") if isinstance(approval, dict) else None
+    expected_claims = {
+        "baseline_id",
+        "authority_epoch",
+        "repository_ids",
+        "source_evidence",
+        "ledger_digest",
+        "role_separation",
+        "issued_at",
+        "expires_at",
+        "status",
+        "replay_policy",
+        "replay_nonce",
+    }
+    if (
+        not isinstance(approval, dict)
+        or set(approval) != expected_approval
+        or approval.get("schema")
+        != "engineering.v2.2.6-owner-baseline-approval.v1"
+        or not isinstance(claims, dict)
+        or set(claims) != expected_claims
+        or not isinstance(signature, str)
+        or not signature.startswith("-----BEGIN SSH SIGNATURE-----\n")
+        or len(signature) > 16384
+    ):
+        raise MatrixError("owner-approved baseline approval is invalid")
+    repository_ids = claims.get("repository_ids")
+    source = claims.get("source_evidence")
+    separation = claims.get("role_separation")
+    auditors = separation.get("auditors") if isinstance(separation, dict) else None
+    if (
+        not isinstance(claims.get("baseline_id"), str)
+        or not claims["baseline_id"]
+        or not isinstance(claims.get("authority_epoch"), str)
+        or not claims["authority_epoch"]
+        or not isinstance(claims.get("replay_nonce"), str)
+        or not claims["replay_nonce"]
+        or not _utc(claims.get("issued_at"))
+        or not _utc(claims.get("expires_at"))
+        or claims.get("status") != "active"
+        or claims.get("replay_policy") != "idempotent_same_digest_only"
+        or not isinstance(repository_ids, dict)
+        or set(repository_ids) != {"internal", "public"}
+        or any(
+            not re.fullmatch(r"sha256:[0-9a-f]{64}", str(repository_ids.get(name, "")))
+            for name in ("internal", "public")
+        )
+        or repository_ids.get(role) != _repository_identity(repository)
+        or claims.get("ledger_digest") != _digest(ledger_bytes)
+        or not isinstance(source, dict)
+        or set(source)
+        != {"schema", "kind", "automation_id", "path", "digest", "length", "version"}
+        or source.get("schema") != "engineering.owner-approved-bootstrap-source.v1"
+        or source.get("kind") != "codex_automation_prompt"
+        or not isinstance(source.get("automation_id"), str)
+        or not source["automation_id"]
+        or not isinstance(source.get("path"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source.get("digest", "")))
+        or not isinstance(source.get("length"), int)
+        or source["length"] < 1
+        or not isinstance(source.get("version"), str)
+        or not source["version"]
+        or not isinstance(separation, dict)
+        or set(separation)
+        != {
+            "owner_principal",
+            "architect_principal",
+            "implementer_principal",
+            "writer_principal",
+            "auditors",
+        }
+        or not isinstance(auditors, list)
+        or len(auditors) != 2
+    ):
+        raise MatrixError("owner-approved baseline claims are invalid")
+    issued_at = _utc_instant(claims["issued_at"])
+    expires_at = _utc_instant(claims["expires_at"])
+    now = datetime.now(timezone.utc)
+    if (
+        issued_at > now + timedelta(minutes=5)
+        or expires_at <= now
+        or expires_at <= issued_at
+        or expires_at - issued_at > timedelta(days=31)
+    ):
+        raise MatrixError("owner-approved baseline is expired or not current")
+    principal_fields = (
+        separation["owner_principal"],
+        separation["architect_principal"],
+        separation["implementer_principal"],
+        separation["writer_principal"],
+    )
+    if (
+        any(not isinstance(item, str) or not item for item in principal_fields)
+        or separation["owner_principal"] in principal_fields[1:]
+        or separation["architect_principal"]
+        in {separation["implementer_principal"], separation["writer_principal"]}
+    ):
+        raise MatrixError("owner-approved baseline role separation is invalid")
+    normalized_auditors = []
+    for auditor in auditors:
+        if (
+            not isinstance(auditor, dict)
+            or set(auditor) != {"category", "principal_id", "signer_fingerprint"}
+            or auditor.get("category") not in {"semantic", "technical_security"}
+            or not isinstance(auditor.get("principal_id"), str)
+            or not auditor["principal_id"]
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(auditor.get("signer_fingerprint", ""))
+            )
+            or auditor["principal_id"] in set(principal_fields)
+        ):
+            raise MatrixError("owner-approved baseline role separation is invalid")
+        expected_fingerprint = _allowed_signer_fingerprint(allowed, auditor["principal_id"])
+        if auditor["signer_fingerprint"] != expected_fingerprint:
+            raise MatrixError("owner-approved baseline auditor signer is mismatched")
+        normalized_auditors.append(auditor)
+    if (
+        {item["category"] for item in normalized_auditors}
+        != {"semantic", "technical_security"}
+        or len({item["principal_id"] for item in normalized_auditors}) != 2
+        or len({item["signer_fingerprint"] for item in normalized_auditors}) != 2
+    ):
+        raise MatrixError("owner-approved baseline role separation is invalid")
+    approver = approval.get("approver")
+    if approver != separation["owner_principal"]:
+        raise MatrixError("owner-approved baseline approver is invalid")
+    _allowed_signer_fingerprint(allowed, approver)
+    expected_receipt = {
+        "schema": "engineering.v2.2.6-owner-baseline-host-receipt.v1",
+        "receipt_id": receipt.get("receipt_id") if isinstance(receipt, dict) else None,
+        "authority_epoch": claims["authority_epoch"],
+        "contract": "engineering.v2.2.6-owner-approved-ledger.v1",
+        "identity": {"state": "unknown"},
+        "trust_anchor": anchor,
+    }
+    if (
+        not isinstance(receipt, dict)
+        or receipt != expected_receipt
+        or not isinstance(receipt.get("receipt_id"), str)
+        or not receipt["receipt_id"]
+    ):
+        raise MatrixError("owner-approved baseline host receipt is invalid")
+    source_path = Path(source["path"])
+    try:
+        if not source_path.is_absolute() or ".." in source_path.parts:
+            raise MatrixError("owner-approved source evidence is invalid")
+        _reject_host_reparse_ancestors(source_path)
+        resolved_source = source_path.resolve(strict=True)
+        if resolved_source.is_relative_to(repository):
+            raise MatrixError("owner-approved source evidence is candidate-controlled")
+        source_bytes = resolved_source.read_bytes()
+    except OSError as error:
+        raise MatrixError("owner-approved source evidence is unavailable") from error
+    if (
+        str(resolved_source) != source["path"]
+        or len(source_bytes) != source["length"]
+        or _digest(source_bytes) != source["digest"]
+    ):
+        raise MatrixError("owner-approved source evidence is mismatched")
+    material = _canonical(
+        {
+            "schema": "engineering.v2.2.6-owner-baseline-claims.v1",
+            "claims": claims,
+            "host_receipt": receipt,
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="engineering-owner-baseline-") as temporary:
+        temporary_path = Path(temporary)
+        signers_copy = temporary_path / "allowed-signers"
+        signature_copy = temporary_path / "approval.sig"
+        signers_copy.write_bytes(allowed)
+        signature_copy.write_text(signature, encoding="ascii")
+        try:
+            verified = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(signers_copy),
+                    "-I",
+                    approver,
+                    "-n",
+                    "engineering-v226-owner-baseline",
+                    "-s",
+                    str(signature_copy),
+                ],
+                input=material,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise MatrixError("owner-approved baseline verification is unavailable") from error
+    if verified.returncode != 0:
+        raise MatrixError("owner-approved baseline signature is invalid")
+    return {
+        "ledger": ledger,
+        "authority_epoch": claims["authority_epoch"],
+        "role_separation": separation,
+        "source_evidence": source,
+        "approval_digest": _digest(approval_bytes),
+        "trust_anchor_digest": _digest(anchor_bytes),
+        "allowed_signers": allowed,
+    }
+
+
+def _repository_identity(repository: Path) -> str:
+    roots = _git(repository, "rev-list", "--max-parents=0", "HEAD").splitlines()
+    if len(roots) != 1 or not re.fullmatch(r"[0-9a-f]{40}", roots[0]):
+        raise MatrixError("owner-approved baseline repository identity is unavailable")
+    return _digest(b"git-root\0" + roots[0].encode("ascii"))
+
+
+def _allowed_signer_fingerprint(allowed: bytes, principal: str) -> str:
+    try:
+        lines = allowed.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise MatrixError("owner-approved baseline trust anchor is invalid") from error
+    matches = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 3 or parts[0] != principal:
+            continue
+        if not re.fullmatch(r"ssh-[A-Za-z0-9@._+-]+", parts[1]) or not re.fullmatch(
+            r"[A-Za-z0-9+/=]+", parts[2]
+        ):
+            raise MatrixError("owner-approved baseline trust anchor is invalid")
+        matches.append(parts[1] + " " + parts[2])
+    if len(matches) != 1:
+        raise MatrixError("owner-approved baseline signer is unavailable or ambiguous")
+    return _digest(matches[0].encode("ascii"))
 
 
 def matrix_digest(report: dict) -> str:
@@ -566,9 +1150,10 @@ def generate_matrix(
     root = Path(root).resolve()
     artifact = _artifact(root, role)
     registry_bytes = _blob(root, artifact["commit"], "release/v2.2.6-requirements.json")
+    baseline = _owner_approved_ledger(root, role)
     try:
         requirements, obligations = _normalize_registry(
-            json.loads(registry_bytes.decode("utf-8"))
+            json.loads(registry_bytes.decode("utf-8")), baseline["ledger"]
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise MatrixError("authoritative requirement registry is invalid") from error
@@ -577,7 +1162,8 @@ def generate_matrix(
         artifact,
         role,
         execution_envelope,
-        set(V226_REQUIRED_REQUIREMENTS),
+        {row["id"] for row in requirements},
+        baseline,
     )
     rows = []
     unknowns = []
@@ -599,7 +1185,7 @@ def generate_matrix(
         matching = [] if receipt is None else [
             command
             for command in receipt["commands"]
-            if requirement["id"] in command["requirement_ids"]
+            if command["selector"] == negative["selector"]
             and command["exit_code"] == 0
             and command["counts"]["failures"] == 0
             and command["counts"]["errors"] == 0
@@ -618,8 +1204,12 @@ def generate_matrix(
             satisfying = [
                 command
                 for command in matching
-                if EVIDENCE_CLASSES.index(command["evidence_class"])
+                if EVIDENCE_CLASSES.index(command["actual_evidence_class"])
                 >= EVIDENCE_CLASSES.index(minimum)
+                and command["actual_interface"]
+                == requirement["native_evidence"]["interface"]
+                and command["actual_environment"]
+                == requirement["native_evidence"]["environment"]
             ]
         evidence_state = "satisfied" if satisfying else "unknown"
         if not satisfying:
@@ -656,9 +1246,25 @@ def generate_matrix(
         "schema": MATRIX_SCHEMA,
         "artifact": artifact,
         "requirements_digest": _digest(registry_bytes),
+        "owner_baseline": {
+            "authority_epoch": baseline["authority_epoch"],
+            "source_evidence": baseline["source_evidence"],
+            "approval_digest": baseline["approval_digest"],
+            "trust_anchor_digest": baseline["trust_anchor_digest"],
+        },
         "execution_receipt_digest": receipt["envelope_digest"] if receipt else None,
         "rows": rows,
-        "obligations": obligations,
+        "obligations": [
+            {
+                **obligation,
+                "evidence_state": (
+                    "source_contract_only"
+                    if obligation["phase"] == "inherited"
+                    else "unbound_postactivation"
+                ),
+            }
+            for obligation in obligations
+        ],
         "unknowns": sorted(unknowns),
         "proxy_rejections": sorted(proxy_rejections),
         "gates": gates,

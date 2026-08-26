@@ -26,6 +26,16 @@ import uuid
 import webbrowser
 from urllib.parse import quote, unquote
 
+_SCRIPT_DIRECTORY = str(Path(__file__).resolve().parent)
+sys.path.insert(0, _SCRIPT_DIRECTORY)
+try:
+    from engineering_host_boundary import (
+        HostBoundaryError,
+        canonical_host_home as _shared_canonical_host_home,
+    )
+finally:
+    sys.path.remove(_SCRIPT_DIRECTORY)
+
 
 GRAPHIFY_REPOSITORY = "https://github.com/safishamsi/graphify"
 GRAPHIFY_TAG = "v0.9.5"
@@ -320,6 +330,13 @@ class EngineeringError(Exception):
 TraceabilityError = EngineeringError
 
 
+def _canonical_host_home() -> Path:
+    try:
+        return _shared_canonical_host_home()
+    except HostBoundaryError as error:
+        raise EngineeringError("Engineering canonical host home is unavailable.") from error
+
+
 @dataclass(frozen=True)
 class ProjectIdentity:
     root: Path
@@ -460,7 +477,7 @@ def _host_trust_anchor(value: object) -> dict:
 
 
 def _host_authority_dir() -> Path:
-    path = _engineering_user_home() / ".agents" / "engineering" / "host-authority"
+    path = _canonical_host_home() / ".agents" / "engineering" / "host-authority"
     _reject_reparse_ancestors(path)
     return path
 
@@ -4882,6 +4899,7 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
 
 
 def _start_worker(command: list[str]) -> subprocess.Popen:
+    command = [command[0], "-B", *command[1:]]
     return subprocess.Popen(
         command,
         stdout=subprocess.PIPE,

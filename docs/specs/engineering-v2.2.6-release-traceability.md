@@ -1,10 +1,13 @@
 # Engineering v2.2.6 exact release traceability
 
 This specification is the shared, population-free source for the generated
-v2.2.6 release matrix. `release/v2.2.6-requirements.json` is authoritative for
-the complete requirement identifiers and their executable mappings. The matrix
-generator reads exact Git objects, names the commit and tree, and fails closed
-when a mapping, referenced blob, test selector, or required evidence is absent.
+v2.2.6 release matrix. The complete OWNER_APPROVED ledger is a signed,
+owner-private host record outside candidate Git. The candidate registry supplies
+the executable mapping and must equal the owner ledger's complete requirement,
+behavior, evidence, obligation, dependency, and disposition projection. The
+matrix generator reads exact Git objects, names the commit and tree, and fails
+closed when the external ledger, mapping, referenced blob, test selector, or
+required evidence is absent or changed.
 
 ## Complete generic obligation DAG
 
@@ -33,22 +36,55 @@ this shared ledger.
 Release evidence is resolved only from an HMAC-authenticated native-host
 envelope stored outside candidate Git and verified with the canonical host
 controller key. Each command reference resolves exact UTF-8 metadata and log
-bytes and binds argv, working directory, executor role and typed Unknown
+bytes and binds exact argv, working directory, executor role and typed Unknown
 identity, role-specific pre/post commit and tree, UTC timestamps, exit status,
-parsed test counts, evidence class, and allowed requirement identifiers. Any
-unresolved file, changed digest, signature mismatch, arbitrary identifier,
-wrong role, or artifact drift fails closed.
+parsed test counts, selector-derived interface, environment, and evidence class.
+Caller-declared requirement identifiers or evidence promotion are prohibited.
+Duplicate, conflicting, stale, or ill-ordered commands fail closed, as does any
+unresolved file, changed digest, wrong role, or artifact drift.
 
 Product unit or integration commands cannot satisfy independent exact-artifact
-acceptance. That row requires two distinct authenticated receipts for the same
-artifact: one semantic audit and one technical-security audit, each with an
-external report digest and an accepted decision. Until fresh audits exist, the
-row and artifact-acceptance gate remain Unknown.
+acceptance. That row requires two distinct externally signed receipts for the
+same artifact: one semantic audit and one technical-security audit. Their
+principals and public-key fingerprints come from the signed owner baseline and
+are separated from owner, architect, implementer, and writer. Until both fresh
+reports exist after exact execution, the row and artifact-acceptance gate remain
+Unknown.
 
 ## External owner authority
 
 Engineering validates host-owned approval and intent receipts. Candidate Git
 cannot create owner approval, signer authority, exceptions, or audit identity.
+The bootstrap source is a digest-bound durable host automation record and is
+explicitly not an INTENT_BOUND receipt before activation. A root-issued signed
+host receipt binds its exact source digest/version, repository identities,
+authority epoch, complete owner ledger, and separated roles. Governing host
+paths use the OS-native account profile, not caller HOME, USERPROFILE, or
+ENGINEERING_USER_HOME, and require owner-private non-reparse trust material.
+
+## External consumer authority and non-impersonation
+
+Decision Studio acceptance remains an external owner receipt. Engineering may
+verify its exact repository, epoch, contract, environment, and evidence but may
+not create, replace, or impersonate that authority. The named direct-consumer
+CTAO correction is a separate accepted slice before broader local-consumer
+or frontend release work. Both remain unbound post-activation obligations in
+this source candidate rather than claims of implemented product behavior.
+
+## Graph execution truth obligations
+
+Post-activation graph proof has separate fail-closed outcomes for false-edge
+rejection, measured Amdahl-aware serial/parallel semantics, a fresh verifier,
+critical-path derivation from the admitted dependency graph, and one writer for
+every mutable resource across the full graph. These rows remain
+`unbound_postactivation` until native real-outcome receipts exist.
+
+## Adjacent orchestrator comparison gate
+
+LangGraph and Langfuse are not installed or activated by this release. Any later
+proposal must first bind a factual comparison from current authoritative sources
+and an exact source/runtime dependency scan. Langfuse remains deferred and an
+adjacent dependency cannot be inferred from a generic design or unit test.
 
 ## Predecessor and survival completeness
 

@@ -8,6 +8,7 @@
     ".agents/skills/engineering/scripts/engineering",
     ".agents/skills/engineering/scripts/engineering.cmd",
     ".agents/skills/engineering/scripts/engineering.py",
+    ".agents/skills/engineering/scripts/engineering_host_boundary.py",
     ".agents/skills/engineering/tests/scenarios.json",
     ".agents/skills/engineering/tests/test_engineering.py",
     ".github/workflows/security.yml",
@@ -35,6 +36,7 @@
     "tools/check_audience.py",
     "tools/check_sensitive.py",
     "tools/export_public.py",
+    "tools/v226_owner_baseline.py",
     "tools/v226_release_matrix.py"
   ]
 }

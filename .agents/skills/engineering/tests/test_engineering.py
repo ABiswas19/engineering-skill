@@ -2856,11 +2856,37 @@ class Task3ContractTests(unittest.TestCase):
         ):
             module._start_worker([sys.executable, "-c", "import graphify"])
 
-        self.assertEqual([[sys.executable, "-c", "import graphify"]], [item[0] for item in captured])
+        self.assertEqual(
+            [[sys.executable, "-B", "-c", "import graphify"]],
+            [item[0] for item in captured],
+        )
         self.assertEqual(runtime, captured[0][1])
         for name in forbidden:
             with self.subTest(name=name):
                 self.assertNotIn(name, captured[0][1])
+
+    def test_incremental_outer_worker_cannot_write_python_bytecode(self):
+        """A worker cannot mutate its source checkout through import caches."""
+        module = self.module()
+        runtime, _ = self.adversarial_graphify_environment()
+        source = Path(self.temporary_directory.name) / "worker-import"
+        source.mkdir()
+        (source / "worker_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+        cwd_before = Path.cwd()
+        try:
+            os.chdir(source)
+            with patch.dict(os.environ, runtime, clear=True):
+                process = module._start_worker(
+                    [sys.executable, "-c", "import worker_probe"]
+                )
+                stdout, stderr = process.communicate(timeout=30)
+        finally:
+            os.chdir(cwd_before)
+
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        self.assertEqual(0, process.returncode)
+        self.assertFalse((source / "__pycache__").exists())
 
     def test_incremental_outer_worker_cannot_import_graphify_from_ambient_pythonpath(self):
         """The strict worker environment applies before the child resolves Graphify."""
@@ -12880,6 +12906,11 @@ class Task10ContractTests(unittest.TestCase):
         )
         self.private_reader.start()
         self.addCleanup(self.private_reader.stop)
+        self.canonical_host_home = patch.object(
+            engineering, "_canonical_host_home", return_value=self.home
+        )
+        self.canonical_host_home.start()
+        self.addCleanup(self.canonical_host_home.stop)
 
     def module(self):
         if engineering is None:
@@ -14409,6 +14440,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         first_anchor, _ = module._host_owned_trust_anchor()
         restarted = load_engineering()
         with (
+            patch.object(restarted, "_canonical_host_home", return_value=self.home),
             patch.object(restarted, "_verify_owner_private", return_value=None),
             patch.object(restarted, "_enforce_owner_private", side_effect=synthetic_owner_private),
         ):
@@ -14500,6 +14532,149 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 attacker_binding,
                 attacker_approval,
             )
+
+    def test_caller_home_override_cannot_redirect_shared_postactivation_trust(self):
+        """Caller environment cannot redirect every approval gate to attacker trust."""
+        module = self.module()
+        attacker_home = Path(self.temporary_directory.name) / "attacker-home"
+        attacker_authority = attacker_home / ".agents" / "engineering" / "host-authority"
+        attacker_authority.mkdir(parents=True)
+        attacker_key = Path(self.temporary_directory.name) / "attacker-redirect-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_allowed = (
+            "attacker-host "
+            + attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+            + "\n"
+        ).encode("ascii")
+        attacker_anchor = {
+            "schema": module.HOST_TRUST_ANCHOR_SCHEMA,
+            "anchor_id": "host-anchor-attacker-redirect",
+            "format_version": 1,
+            "signers_digest": "sha256:"
+            + hashlib.sha256(attacker_allowed).hexdigest(),
+            "identity": {"state": "unknown"},
+        }
+        (attacker_authority / "allowed-signers").write_bytes(attacker_allowed)
+        (attacker_authority / "host-trust-anchor.json").write_text(
+            json.dumps(attacker_anchor), encoding="utf-8"
+        )
+        binding = self.owner_intent_binding(intent_id="intent-host-redirect")
+        normalized = module._owner_intent_binding(self.root, binding)
+        receipt = self.host_receipt(
+            contract=module.OWNER_INTENT_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
+            anchor=attacker_anchor,
+        )
+        approval = self.sign_host_approval(
+            schema=module.HOST_OWNER_INTENT_APPROVAL_SCHEMA,
+            claims_schema="engineering.host-owner-intent-claims.v3",
+            claims=normalized,
+            namespace="engineering-owner-intent",
+            contract=module.OWNER_INTENT_SCHEMA,
+            authority_epoch=normalized["authority_epoch"],
+            signer=attacker_key,
+            approver="attacker-host",
+            receipt=receipt,
+        )
+
+        with (
+            patch.object(module, "_canonical_host_home", return_value=self.home, create=True),
+            patch.dict(
+                os.environ,
+                {
+                    "ENGINEERING_USER_HOME": str(attacker_home),
+                    "HOME": str(attacker_home),
+                    "USERPROFILE": str(attacker_home),
+                },
+                clear=False,
+            ),
+            self.assertRaisesRegex(
+                module.EngineeringError, "host receipt|host.*anchor|signature"
+            ),
+        ):
+            module.bind_owner_intent(self.root, binding, approval)
+
+    def test_caller_home_override_cannot_mint_outcome_acceptance_or_release_token(self):
+        """Outcome and release gates retain the same OS-bound external trust root."""
+        module = self.module()
+        intent = self.bound_native_owner_intent()
+        survival = module._outcome_survival_v2(
+            self.outcome_survival_v2(intent), intent
+        )
+        completion, completion_digest, acceptance = self.outcome_acceptance(
+            intent, survival
+        )
+
+        attacker_home = Path(self.temporary_directory.name) / "attacker-audit-home"
+        attacker_authority = (
+            attacker_home / ".agents" / "engineering" / "host-authority"
+        )
+        attacker_authority.mkdir(parents=True)
+        attacker_key = Path(self.temporary_directory.name) / "attacker-audit-redirect-key"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker_key)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_allowed = (
+            "attacker-auditor "
+            + attacker_key.with_suffix(".pub").read_text(encoding="ascii").strip()
+            + "\n"
+        ).encode("ascii")
+        attacker_anchor = {
+            "schema": module.HOST_TRUST_ANCHOR_SCHEMA,
+            "anchor_id": "host-anchor-attacker-audit-redirect",
+            "format_version": 1,
+            "signers_digest": "sha256:"
+            + hashlib.sha256(attacker_allowed).hexdigest(),
+            "identity": {"state": "unknown"},
+        }
+        (attacker_authority / "allowed-signers").write_bytes(attacker_allowed)
+        (attacker_authority / "host-trust-anchor.json").write_text(
+            json.dumps(attacker_anchor), encoding="utf-8"
+        )
+        acceptance["roles"]["auditor_id"] = "attacker-auditor"
+        claims = module._outcome_audit_claims(acceptance)
+        receipt = self.host_receipt(
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            anchor=attacker_anchor,
+        )
+        acceptance["audit_attestation"] = self.sign_host_approval(
+            schema=module.INDEPENDENT_OUTCOME_AUDIT_SCHEMA,
+            claims_schema="engineering.independent-outcome-audit-claims.v3",
+            claims=claims,
+            namespace="engineering-independent-audit",
+            contract=module.OUTCOME_ACCEPTANCE_SCHEMA,
+            authority_epoch=intent["authority_epoch"],
+            signer=attacker_key,
+            approver="attacker-auditor",
+            receipt=receipt,
+        )
+
+        with (
+            patch.object(module, "_terminal_completion", return_value=(completion, completion_digest)),
+            patch.dict(
+                os.environ,
+                {
+                    "ENGINEERING_USER_HOME": str(attacker_home),
+                    "HOME": str(attacker_home),
+                    "USERPROFILE": str(attacker_home),
+                },
+                clear=False,
+            ),
+            self.assertRaisesRegex(
+                module.EngineeringError, "host receipt|host.*anchor|signature"
+            ),
+        ):
+            module.record_outcome_acceptance(
+                self.root, completion["run_id"], acceptance
+            )
+        self.assertFalse(module._release_token_path(self.root).exists())
 
     def test_traceability_attestation_cannot_use_candidate_controlled_signers(self):
         """New traceability proof uses the same immutable external signer anchor."""
