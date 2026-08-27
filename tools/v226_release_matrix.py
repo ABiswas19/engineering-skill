@@ -282,15 +282,7 @@ def _normalize_registry(
             raise MatrixError("authoritative obligation mapping is invalid")
         seen_obligations.add(row["id"])
         normalized_obligations.append(dict(row))
-    owner_requirements = [
-        {
-            "id": row["id"],
-            "lifecycle_state": row["lifecycle_state"],
-            "runtime_behavior": row["runtime_behavior"],
-            "native_evidence": row["native_evidence"],
-        }
-        for row in normalized
-    ]
+    owner_requirements = normalized
     if (
         owner_ledger["requirements"] != owner_requirements
         or owner_ledger["obligations"] != normalized_obligations

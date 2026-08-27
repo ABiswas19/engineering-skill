@@ -61,7 +61,9 @@ host receipt binds its exact source digest/version, repository identities,
 authority epoch, complete owner ledger, and separated roles. The v2 ledger is
 independently supplied by that host authority: every `OWNER_APPROVED` source
 row contains an exact source excerpt and digest plus the candidate requirement
-and obligation IDs it governs. Each candidate ID must be mapped exactly once,
+and obligation IDs it governs. The ledger also binds each complete normalized
+requirement row, so candidate design, contract, runtime, test, or evidence
+remapping cannot survive under the same owner ledger. Each candidate ID must be mapped exactly once,
 and the excerpt must occur exactly once in the resolved owner source. Candidate
 registry projection, omission, duplicate mapping, or source conflict fails
 closed. Governing host

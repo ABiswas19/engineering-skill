@@ -15,7 +15,10 @@ record but cannot mint it.
 
 The host record uses `engineering.v2.2.6-owner-approved-ledger.v2` with exactly
 four top-level fields: `schema`, `source_requirements`, `requirements`, and
-`obligations`. Every source requirement has exactly:
+`obligations`. `requirements` contains the complete normalized candidate rows,
+including their design, contract, runtime, negative-test, and native-evidence
+fields; changing any one of those fields under an unchanged host ledger fails
+closed. Every source requirement has exactly:
 
 ```json
 {

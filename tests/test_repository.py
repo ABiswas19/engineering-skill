@@ -72,12 +72,7 @@ class RepositoryContractTests(unittest.TestCase):
                 }
             ],
             "requirements": [
-                {
-                    "id": row["id"],
-                    "lifecycle_state": row["lifecycle_state"],
-                    "runtime_behavior": row["runtime_behavior"],
-                    "native_evidence": row["native_evidence"],
-                }
+                json.loads(json.dumps(row))
                 for row in registry["requirements"]
             ],
             "obligations": registry["obligations"],
@@ -411,6 +406,10 @@ class RepositoryContractTests(unittest.TestCase):
         omitted["requirements"] = omitted["requirements"][:-1]
         with self.assertRaisesRegex(module.MatrixError, "external owner ledger"):
             module._normalize_registry(omitted, owner_ledger)
+        remapped = json.loads(json.dumps(registry))
+        remapped["requirements"][0]["design"]["section"] = "Candidate-controlled remap"
+        with self.assertRaisesRegex(module.MatrixError, "external owner ledger"):
+            module._normalize_registry(remapped, owner_ledger)
 
     def test_v226_owner_baseline_is_fixed_host_private_and_fail_closed(self) -> None:
         """The candidate cannot supply a path when the native owner ledger is absent."""
