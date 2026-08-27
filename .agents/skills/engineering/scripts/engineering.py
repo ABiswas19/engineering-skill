@@ -95,7 +95,8 @@ OUTCOME_EQUIVALENCE_ATTESTATION_SCHEMA = "engineering.outcome-equivalence-attest
 OUTCOME_ACCEPTANCE_SCHEMA = "engineering.outcome-acceptance.v1"
 OUTCOME_ACCEPTANCE_LEDGER_SCHEMA = "engineering.outcome-acceptances.v1"
 INDEPENDENT_OUTCOME_AUDIT_SCHEMA = "engineering.independent-outcome-audit.v3"
-OWNER_INTENT_IMPORT_SCHEMA = "engineering.owner-intent-import.v1"
+LEGACY_OWNER_INTENT_IMPORT_SCHEMA = "engineering.owner-intent-import.v1"
+OWNER_INTENT_IMPORT_SCHEMA = "engineering.owner-intent-import.v2"
 OWNER_INTENT_IMPORT_LEDGER_SCHEMA = "engineering.owner-intent-imports.v1"
 POST_ACTIVATION_IMPORT_SCOPES = {"accepted_owner_outcomes", "product_releases"}
 LEGACY_RELEASE_TOKEN_SCHEMA = "engineering.release-token.v1"
@@ -11866,6 +11867,7 @@ def _owner_intent_import(
     root: Path, value: object, *, allow_historical_intent: bool = False
 ) -> dict:
     """Validate an exact host-recorded completeness import after activation."""
+    legacy = isinstance(value, dict) and value.get("schema") == LEGACY_OWNER_INTENT_IMPORT_SCHEMA
     expected = {
         "schema",
         "import_id",
@@ -11876,10 +11878,14 @@ def _owner_intent_import(
         "outcome_ids",
         "coverage_scopes",
     }
+    if not legacy:
+        expected |= {"outcome_mappings", "outcome_mapping_digest"}
     if (
         not isinstance(value, dict)
         or set(value) != expected
-        or value.get("schema") != OWNER_INTENT_IMPORT_SCHEMA
+        or value.get("schema")
+        not in {OWNER_INTENT_IMPORT_SCHEMA, LEGACY_OWNER_INTENT_IMPORT_SCHEMA}
+        or (legacy and not allow_historical_intent)
         or value.get("repository_id") != _project_contribution_digest(root)
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("owner_intent_digest", "")))
         or not isinstance(value.get("outcome_ids"), list)
@@ -11917,8 +11923,8 @@ def _owner_intent_import(
         or outcome_ids != expected_outcomes
     ):
         raise EngineeringError("Engineering owner intent import is incomplete or mismatched.")
-    return {
-        "schema": OWNER_INTENT_IMPORT_SCHEMA,
+    normalized = {
+        "schema": value["schema"],
         "import_id": import_id,
         "repository_id": intent["repository_id"],
         "authority_epoch": intent["authority_epoch"],
@@ -11927,6 +11933,100 @@ def _owner_intent_import(
         "outcome_ids": expected_outcomes,
         "coverage_scopes": sorted(POST_ACTIVATION_IMPORT_SCOPES),
     }
+    if legacy:
+        return normalized
+    mappings = value.get("outcome_mappings")
+    if (
+        not isinstance(mappings, list)
+        or not mappings
+        or value.get("outcome_mapping_digest") != _json_digest(mappings)
+    ):
+        raise EngineeringError("Engineering owner intent import outcome mapping is invalid.")
+    normalized_mappings = []
+    mapped_ids: set[str] = set()
+    mapping_expected = {
+        "outcome_id",
+        "lifecycle_state",
+        "design",
+        "contract",
+        "runtime_behavior",
+        "negative_test",
+        "required_evidence",
+        "exact_artifact",
+    }
+    current_commit = _identity_git(root, "rev-parse", "HEAD")
+    current_tree = _identity_git(root, "rev-parse", "HEAD^{tree}")
+    for mapping in mappings:
+        if not isinstance(mapping, dict) or set(mapping) != mapping_expected:
+            raise EngineeringError("Engineering owner intent import outcome mapping is invalid.")
+        outcome_id = mapping.get("outcome_id")
+        design = mapping.get("design")
+        contract = mapping.get("contract")
+        negative_test = mapping.get("negative_test")
+        evidence = mapping.get("required_evidence")
+        artifact = mapping.get("exact_artifact")
+        runtime_behavior = mapping.get("runtime_behavior")
+        path_fields = (
+            (design, {"path", "section"}),
+            (contract, {"path", "interface"}),
+            (negative_test, {"path", "selector"}),
+        )
+        if (
+            not isinstance(outcome_id, str)
+            or outcome_id not in expected_outcomes
+            or outcome_id in mapped_ids
+            or mapping.get("lifecycle_state") != "DESIGN_MAPPED"
+            or any(
+                not isinstance(item, dict)
+                or set(item) != names
+                or any(
+                    not isinstance(item[name], str)
+                    or not item[name].strip()
+                    or item[name].strip().lower() == "unknown"
+                    for name in names
+                )
+                for item, names in path_fields
+            )
+            or any(
+                PurePosixPath(item["path"]).is_absolute()
+                or ".." in PurePosixPath(item["path"]).parts
+                for item, _ in path_fields
+            )
+            or not isinstance(runtime_behavior, str)
+            or not runtime_behavior.strip()
+            or runtime_behavior.strip().lower() == "unknown"
+            or not isinstance(evidence, dict)
+            or set(evidence) != {"class", "interface", "environment"}
+            or evidence.get("class") not in {"end_to_end", "real_outcome"}
+            or any(
+                not isinstance(evidence.get(name), str)
+                or not evidence[name].strip()
+                or evidence[name].strip().lower() in {"unknown", "proxy"}
+                for name in ("interface", "environment")
+            )
+            or not isinstance(artifact, dict)
+            or set(artifact) != {"repository_id", "commit", "tree", "digest"}
+            or artifact.get("repository_id") != intent["repository_id"]
+            or artifact.get("commit") != current_commit
+            or artifact.get("tree") != current_tree
+            or artifact.get("digest")
+            != _json_digest(
+                {
+                    "repository_id": artifact.get("repository_id"),
+                    "commit": artifact.get("commit"),
+                    "tree": artifact.get("tree"),
+                }
+            )
+        ):
+            raise EngineeringError("Engineering owner intent import outcome mapping is invalid.")
+        mapped_ids.add(outcome_id)
+        normalized_mappings.append(dict(mapping))
+    normalized_mappings.sort(key=lambda item: item["outcome_id"])
+    if sorted(mapped_ids) != expected_outcomes or mappings != normalized_mappings:
+        raise EngineeringError("Engineering owner intent import outcome mapping is incomplete.")
+    normalized["outcome_mappings"] = normalized_mappings
+    normalized["outcome_mapping_digest"] = _json_digest(normalized_mappings)
+    return normalized
 
 
 def _owner_intent_import_signature(key: bytes, record: dict) -> str:
@@ -12007,7 +12107,8 @@ def _active_owner_intent_import(root: Path, intent: dict) -> dict | None:
     matches = [
         record
         for record in _load_owner_intent_imports(root)["imports"]
-        if record["import"]["owner_intent_id"] == intent["intent_id"]
+        if record["import"].get("schema") == OWNER_INTENT_IMPORT_SCHEMA
+        and record["import"]["owner_intent_id"] == intent["intent_id"]
         and record["import"]["owner_intent_digest"] == intent["owner_intent_digest"]
     ]
     if len(matches) > 1:
@@ -12022,8 +12123,8 @@ def import_owner_intent(root: Path, imported: object, approval: object) -> dict:
     approval_reference, approval_anchor = _verify_host_owned_signature(
         project_root,
         approval,
-        approval_schema="engineering.host-owner-intent-import-approval.v1",
-        claims_schema="engineering.host-owner-intent-import-claims.v1",
+        approval_schema="engineering.host-owner-intent-import-approval.v2",
+        claims_schema="engineering.host-owner-intent-import-claims.v2",
         claims=normalized,
         namespace="engineering-owner-intent-import",
         label="Engineering owner intent import host approval",
@@ -12084,6 +12185,7 @@ def dependent_dispatch_status(root: Path, scope: str) -> dict:
         "owner_intent_id": intent["intent_id"],
         "owner_intent_digest": intent["owner_intent_digest"],
         "import_digest": imported["import_digest"],
+        "outcome_mapping_digest": imported["import"]["outcome_mapping_digest"],
         "dispatch_performed": False,
         "native_approval_required": True,
     }

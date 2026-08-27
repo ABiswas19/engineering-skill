@@ -21,21 +21,7 @@ def _registry(root: Path, role: str) -> tuple[dict, dict]:
     artifact = MATRIX._artifact(root, role)
     raw = MATRIX._blob(root, artifact["commit"], "release/v2.2.6-requirements.json")
     value = json.loads(raw.decode("utf-8"))
-    ledger = {
-        "schema": "engineering.v2.2.6-owner-approved-ledger.v1",
-        "requirements": [
-            {
-                "id": row["id"],
-                "lifecycle_state": row["lifecycle_state"],
-                "runtime_behavior": row["runtime_behavior"],
-                "native_evidence": row["native_evidence"],
-            }
-            for row in value["requirements"]
-        ],
-        "obligations": value["obligations"],
-    }
-    MATRIX._normalize_registry(value, ledger)
-    return artifact, ledger
+    return artifact, value
 
 
 def _authority_material() -> tuple[Path, dict, bytes, bytes]:
@@ -61,23 +47,32 @@ def _authority_material() -> tuple[Path, dict, bytes, bytes]:
     return directory, anchor, allowed, ledger_bytes
 
 
-def render_ledger(internal_root: Path, public_root: Path) -> dict:
+def render_ledger(
+    internal_root: Path, public_root: Path, owner_ledger: Path, source: Path
+) -> dict:
     _, internal = _registry(internal_root, "internal")
     _, public = _registry(public_root, "public")
-    if internal != public:
-        raise MATRIX.MatrixError("paired owner ledger projection is mismatched")
-    return internal
+    ledger_path = MATRIX._external_path(internal_root, owner_ledger, "owner ledger")
+    if ledger_path.resolve().is_relative_to(public_root.resolve()):
+        raise MATRIX.MatrixError("owner ledger path must be outside candidate Git")
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MATRIX.MatrixError("external owner ledger is unavailable or invalid") from error
+    MATRIX._normalize_registry(internal, ledger)
+    MATRIX._normalize_registry(public, ledger)
+    source_path = MATRIX._external_path(internal_root, source, "owner source")
+    if source_path.resolve().is_relative_to(public_root.resolve()):
+        raise MATRIX.MatrixError("owner source path must be outside candidate Git")
+    MATRIX._validate_owner_source_projection(ledger, source_path.read_bytes())
+    return ledger
 
 
 def render_material(arguments: argparse.Namespace) -> dict:
-    internal_artifact, internal_ledger = _registry(arguments.internal_root, "internal")
-    public_artifact, public_ledger = _registry(arguments.public_root, "public")
-    if internal_ledger != public_ledger:
-        raise MATRIX.MatrixError("paired owner ledger projection is mismatched")
+    internal_artifact, internal_registry = _registry(arguments.internal_root, "internal")
+    public_artifact, public_registry = _registry(arguments.public_root, "public")
     _, anchor, allowed, ledger_bytes = _authority_material()
     retained_ledger = json.loads(ledger_bytes.decode("utf-8"))
-    if retained_ledger != internal_ledger:
-        raise MATRIX.MatrixError("host owner ledger does not match exact paired artifacts")
     source_path = Path(arguments.source)
     MATRIX._reject_host_reparse_ancestors(source_path)
     source_path = source_path.resolve(strict=True)
@@ -85,6 +80,9 @@ def render_material(arguments: argparse.Namespace) -> dict:
         if source_path.is_relative_to(root):
             raise MATRIX.MatrixError("owner bootstrap source is candidate-controlled")
     source_bytes = source_path.read_bytes()
+    MATRIX._normalize_registry(internal_registry, retained_ledger)
+    MATRIX._normalize_registry(public_registry, retained_ledger)
+    MATRIX._validate_owner_source_projection(retained_ledger, source_bytes)
     role_separation = {
         "owner_principal": arguments.owner_principal,
         "architect_principal": arguments.architect_principal,
@@ -132,7 +130,7 @@ def render_material(arguments: argparse.Namespace) -> dict:
         "schema": "engineering.v2.2.6-owner-baseline-host-receipt.v1",
         "receipt_id": arguments.receipt_id,
         "authority_epoch": arguments.authority_epoch,
-        "contract": "engineering.v2.2.6-owner-approved-ledger.v1",
+        "contract": "engineering.v2.2.6-owner-approved-ledger.v2",
         "identity": {"state": "unknown"},
         "trust_anchor": anchor,
     }
@@ -188,6 +186,8 @@ def main() -> int:
     ledger = commands.add_parser("ledger")
     ledger.add_argument("--internal-root", type=Path, required=True)
     ledger.add_argument("--public-root", type=Path, required=True)
+    ledger.add_argument("--owner-ledger", type=Path, required=True)
+    ledger.add_argument("--source", type=Path, required=True)
     material = commands.add_parser("material")
     material.add_argument("--internal-root", type=Path, required=True)
     material.add_argument("--public-root", type=Path, required=True)
@@ -205,7 +205,12 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         if arguments.command == "ledger":
-            value = render_ledger(arguments.internal_root, arguments.public_root)
+            value = render_ledger(
+                arguments.internal_root,
+                arguments.public_root,
+                arguments.owner_ledger,
+                arguments.source,
+            )
         elif arguments.command == "material":
             value = render_material(arguments)
         else:

@@ -232,6 +232,27 @@ not a graph exploration application: `trace`, `impact`, `why-code`, `why-test`,
 and `compare` provide relationship paths and evidence detail. There is no hosted
 UI or enterprise graph service.
 
+## Native observability and limits
+
+Engineering's native observability is deterministic, project-local evidence
+about the engineering lifecycle. It is not a runtime telemetry backend. It has
+no persistent dashboard and no token or cost collection unless a separately
+approved external provider supplies those capabilities. Static HTML is a
+projection, not the canonical store; exact Git objects, Graphify checkpoints,
+Engineering overlays, and retained host receipts remain the evidence sources.
+
+| Capability | Owning module | Evidence source | Storage/projection | Interface | Privacy boundary | Support state | Known limitation |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Commit-bound code graph and deterministic overlay | Graphify runner and Engineering overlay compiler | Exact Git commit/tree, pinned Graphify checkpoint, reviewed overlay entries | Git-common private checkpoints; local map projection | `checkpoint`, `map`, `compare` | Project-local; no graph upload | Supported | Describes static project evidence, not live runtime telemetry |
+| Requirement, decision, code, test, and evidence paths | Engineering traceability reducer | Checkpoint nodes plus provenance-checked overlay edges | Local checkpoint and bounded query result | `trace`, `coverage`, `impact`, `why-code`, `why-test` | Queries remain local and redact rather than infer missing evidence | Supported | Missing, stale, conflicting, or ambiguous links remain Unknown |
+| Checkpoint, provenance, and integrity status | Engineering controller | Exact Git objects, checkpoint catalogues, integrity digests, completion receipts | Owner-private controller records and project-local checkpoint catalogue | `status`, `prepare`, `complete` | Receipts are local/private and contain bounded facts | Supported | A green check or completion receipt is evidence only, not live acceptance |
+| Scope, outcome survival, acceptance, and release-gate evidence | Engineering authority and outcome controller | External owner intent, host receipts, independent audit evidence, exact-artifact tokens | Owner-private host/controller ledgers; sanitized report projection | `intent-status`, `outcome-accept`, `release-gate` | Populated owner outcomes and signer material stay outside candidate Git | Supported with external authority | Engineering validates evidence but cannot mint owner approval or perform native delivery |
+
+This evidence surface does not grant owner, merge, install, deployment, or
+product authority. LangGraph and Langfuse are adjacent tools with different
+runtime and telemetry purposes; neither is installed, required, or truthfully
+represented as an Engineering capability by this matrix.
+
 ## Workflow integrations
 
 Engineering also supports governed delivery without making orchestration the

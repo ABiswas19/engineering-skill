@@ -49,6 +49,7 @@ V226_REQUIRED_REQUIREMENTS = (
     "decision_studio_external_authority",
     "exact_release_install_binding",
     "external_owner_authority",
+    "external_owner_source_projection",
     "git_object_byte_identity",
     "graph_execution_semantics",
     "graph_one_writer_enforcement",
@@ -63,8 +64,10 @@ V226_REQUIRED_REQUIREMENTS = (
     "noncircular_bootstrap",
     "outcome_survival_baseline",
     "postactivation_all_outcomes_binding",
+    "per_outcome_dispatch_mapping",
     "predecessor_disposition",
     "public_sanitized_parity",
+    "readme_native_observability_truth",
     "refreshed_intent_impact",
     "transactional_install_preimages",
     "typed_evidence_hierarchy",
@@ -179,9 +182,11 @@ def _normalize_registry(
     ids = [row.get("id") for row in rows if isinstance(row, dict)]
     if (
         not isinstance(owner_ledger, dict)
-        or set(owner_ledger) != {"schema", "requirements", "obligations"}
+        or set(owner_ledger)
+        != {"schema", "source_requirements", "requirements", "obligations"}
         or owner_ledger.get("schema")
-        != "engineering.v2.2.6-owner-approved-ledger.v1"
+        != "engineering.v2.2.6-owner-approved-ledger.v2"
+        or not isinstance(owner_ledger.get("source_requirements"), list)
         or not isinstance(owner_ledger.get("requirements"), list)
         or not isinstance(owner_ledger.get("obligations"), list)
     ):
@@ -291,7 +296,85 @@ def _normalize_registry(
         or owner_ledger["obligations"] != normalized_obligations
     ):
         raise MatrixError("candidate registry mismatches external owner ledger")
+    _validate_owner_source_projection(owner_ledger)
     return normalized, normalized_obligations
+
+
+def _validate_owner_source_projection(
+    owner_ledger: object, source_bytes: bytes | None = None
+) -> list[dict]:
+    """Validate the independently authored mapping from owner source to registry."""
+    if (
+        not isinstance(owner_ledger, dict)
+        or owner_ledger.get("schema")
+        != "engineering.v2.2.6-owner-approved-ledger.v2"
+        or not isinstance(owner_ledger.get("requirements"), list)
+        or not isinstance(owner_ledger.get("obligations"), list)
+        or not isinstance(owner_ledger.get("source_requirements"), list)
+        or not owner_ledger["source_requirements"]
+    ):
+        raise MatrixError("external owner source projection is invalid")
+    requirement_ids = [
+        row.get("id") for row in owner_ledger["requirements"] if isinstance(row, dict)
+    ]
+    obligation_ids = [
+        row.get("id") for row in owner_ledger["obligations"] if isinstance(row, dict)
+    ]
+    if (
+        len(requirement_ids) != len(owner_ledger["requirements"])
+        or len(obligation_ids) != len(owner_ledger["obligations"])
+        or any(not isinstance(item, str) or not item for item in requirement_ids + obligation_ids)
+    ):
+        raise MatrixError("external owner source projection is invalid")
+    normalized = []
+    mapped_requirements: list[str] = []
+    mapped_obligations: list[str] = []
+    source_ids: set[str] = set()
+    expected = {
+        "source_requirement_id",
+        "lifecycle_state",
+        "source_excerpt",
+        "statement_digest",
+        "requirement_ids",
+        "obligation_ids",
+    }
+    for row in owner_ledger["source_requirements"]:
+        if (
+            not isinstance(row, dict)
+            or set(row) != expected
+            or not isinstance(row.get("source_requirement_id"), str)
+            or not row["source_requirement_id"]
+            or row["source_requirement_id"] in source_ids
+            or row.get("lifecycle_state") != "OWNER_APPROVED"
+            or not isinstance(row.get("source_excerpt"), str)
+            or not row["source_excerpt"].strip()
+            or not isinstance(row.get("requirement_ids"), list)
+            or not isinstance(row.get("obligation_ids"), list)
+            or not row["requirement_ids"]
+            or not row["obligation_ids"]
+            or len(row["requirement_ids"]) != len(set(row["requirement_ids"]))
+            or len(row["obligation_ids"]) != len(set(row["obligation_ids"]))
+            or any(not isinstance(item, str) or not item for item in row["requirement_ids"])
+            or any(not isinstance(item, str) or not item for item in row["obligation_ids"])
+        ):
+            raise MatrixError("external owner source projection is invalid")
+        excerpt_bytes = row["source_excerpt"].encode("utf-8")
+        if row.get("statement_digest") != _digest(excerpt_bytes):
+            raise MatrixError("external owner source projection is invalid")
+        if source_bytes is not None and source_bytes.count(excerpt_bytes) != 1:
+            raise MatrixError("external owner source projection is mismatched")
+        source_ids.add(row["source_requirement_id"])
+        mapped_requirements.extend(row["requirement_ids"])
+        mapped_obligations.extend(row["obligation_ids"])
+        normalized.append(dict(row))
+    if (
+        sorted(mapped_requirements) != sorted(requirement_ids)
+        or len(mapped_requirements) != len(set(mapped_requirements))
+        or sorted(mapped_obligations) != sorted(obligation_ids)
+        or len(mapped_obligations) != len(set(mapped_obligations))
+    ):
+        raise MatrixError("external owner source projection is incomplete or conflicting")
+    return normalized
 
 
 def _normalize_requirements(value: object) -> list[dict]:
@@ -892,8 +975,10 @@ def _owner_approved_ledger(repository: Path, role: str) -> dict:
         raise MatrixError("owner-approved baseline trust anchor is invalid")
     if (
         not isinstance(ledger, dict)
-        or set(ledger) != {"schema", "requirements", "obligations"}
-        or ledger.get("schema") != "engineering.v2.2.6-owner-approved-ledger.v1"
+        or set(ledger)
+        != {"schema", "source_requirements", "requirements", "obligations"}
+        or ledger.get("schema") != "engineering.v2.2.6-owner-approved-ledger.v2"
+        or not isinstance(ledger.get("source_requirements"), list)
         or not isinstance(ledger.get("requirements"), list)
         or not isinstance(ledger.get("obligations"), list)
     ):
@@ -1032,7 +1117,7 @@ def _owner_approved_ledger(repository: Path, role: str) -> dict:
         "schema": "engineering.v2.2.6-owner-baseline-host-receipt.v1",
         "receipt_id": receipt.get("receipt_id") if isinstance(receipt, dict) else None,
         "authority_epoch": claims["authority_epoch"],
-        "contract": "engineering.v2.2.6-owner-approved-ledger.v1",
+        "contract": "engineering.v2.2.6-owner-approved-ledger.v2",
         "identity": {"state": "unknown"},
         "trust_anchor": anchor,
     }
@@ -1060,6 +1145,7 @@ def _owner_approved_ledger(repository: Path, role: str) -> dict:
         or _digest(source_bytes) != source["digest"]
     ):
         raise MatrixError("owner-approved source evidence is mismatched")
+    _validate_owner_source_projection(ledger, source_bytes)
     material = _canonical(
         {
             "schema": "engineering.v2.2.6-owner-baseline-claims.v1",

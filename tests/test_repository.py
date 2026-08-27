@@ -51,27 +51,42 @@ class RepositoryContractTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# Public contribution route\n", encoding="utf-8")
 
-    def candidate_owner_baseline(self) -> dict:
-        """Explicit test-only projection; production resolves a signed host ledger."""
+    def candidate_owner_ledger(self, source_excerpt: str = "owner approved package") -> dict:
+        """Explicit test-only external projection; production never derives this."""
         registry = json.loads(
             (ROOT / "release" / "v2.2.6-requirements.json").read_text(
                 encoding="utf-8"
             )
         )
         return {
-            "ledger": {
-                "schema": "engineering.v2.2.6-owner-approved-ledger.v1",
-                "requirements": [
-                    {
-                        "id": row["id"],
-                        "lifecycle_state": row["lifecycle_state"],
-                        "runtime_behavior": row["runtime_behavior"],
-                        "native_evidence": row["native_evidence"],
-                    }
-                    for row in registry["requirements"]
-                ],
-                "obligations": registry["obligations"],
-            },
+            "schema": "engineering.v2.2.6-owner-approved-ledger.v2",
+            "source_requirements": [
+                {
+                    "source_requirement_id": "OWNER-V226-PACKAGE",
+                    "lifecycle_state": "OWNER_APPROVED",
+                    "source_excerpt": source_excerpt,
+                    "statement_digest": "sha256:"
+                    + hashlib.sha256(source_excerpt.encode("utf-8")).hexdigest(),
+                    "requirement_ids": [row["id"] for row in registry["requirements"]],
+                    "obligation_ids": [row["id"] for row in registry["obligations"]],
+                }
+            ],
+            "requirements": [
+                {
+                    "id": row["id"],
+                    "lifecycle_state": row["lifecycle_state"],
+                    "runtime_behavior": row["runtime_behavior"],
+                    "native_evidence": row["native_evidence"],
+                }
+                for row in registry["requirements"]
+            ],
+            "obligations": registry["obligations"],
+        }
+
+    def candidate_owner_baseline(self) -> dict:
+        """Explicit test-only projection; production resolves a signed host ledger."""
+        return {
+            "ledger": self.candidate_owner_ledger(),
             "authority_epoch": "test-only-owner-baseline-epoch",
             "role_separation": {
                 "owner_principal": "owner-test",
@@ -350,7 +365,9 @@ class RepositoryContractTests(unittest.TestCase):
                 accepted = module.generate_matrix(
                     ROOT, role, write_envelope(accepted_payload)
                 )
-            self.assertTrue(accepted["gates"]["artifact_acceptance_ready"])
+            self.assertTrue(
+                accepted["gates"]["artifact_acceptance_ready"], accepted["unknowns"]
+            )
             self.assertFalse(accepted["gates"]["post_activation_ready"])
 
             unsigned = json.loads(envelope.read_text(encoding="utf-8"))
@@ -388,19 +405,7 @@ class RepositoryContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        owner_ledger = {
-            "schema": "engineering.v2.2.6-owner-approved-ledger.v1",
-            "requirements": [
-                {
-                    "id": row["id"],
-                    "lifecycle_state": row["lifecycle_state"],
-                    "runtime_behavior": row["runtime_behavior"],
-                    "native_evidence": row["native_evidence"],
-                }
-                for row in registry["requirements"]
-            ],
-            "obligations": registry["obligations"],
-        }
+        owner_ledger = self.candidate_owner_ledger()
         module._normalize_registry(registry, owner_ledger)
         omitted = json.loads(json.dumps(registry))
         omitted["requirements"] = omitted["requirements"][:-1]
@@ -447,9 +452,9 @@ class RepositoryContractTests(unittest.TestCase):
             with self.assertRaisesRegex(module.MatrixError, "owner-private"):
                 module._verify_owner_private_path(weak, directory=False)
 
-    def test_v226_owner_baseline_cli_renders_exact_pair_without_writing_authority(self) -> None:
+    def test_v226_owner_baseline_cli_only_validates_external_owner_projection(self) -> None:
         tool = ROOT / "tools" / "v226_owner_baseline.py"
-        result = subprocess.run(
+        missing = subprocess.run(
             [
                 "python", str(tool), "ledger",
                 "--internal-root", str(ROOT),
@@ -460,15 +465,89 @@ class RepositoryContractTests(unittest.TestCase):
             timeout=30,
             check=False,
         )
+        self.assertNotEqual(0, missing.returncode, missing.stdout + missing.stderr)
+        with tempfile.TemporaryDirectory() as temporary:
+            external = Path(temporary) / "owner-ledger.json"
+            source_path = Path(temporary) / "owner-source.toml"
+            source_path.write_text(
+                "prompt = 'owner approved package'\n", encoding="utf-8"
+            )
+            external.write_text(
+                json.dumps(self.candidate_owner_ledger(), sort_keys=True),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "python", str(tool), "ledger",
+                    "--internal-root", str(ROOT),
+                    "--public-root", str(ROOT),
+                    "--owner-ledger", str(external),
+                    "--source", str(source_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         ledger = json.loads(result.stdout)
-        self.assertEqual("engineering.v2.2.6-owner-approved-ledger.v1", ledger["schema"])
-        self.assertEqual(
-            len(self.candidate_owner_baseline()["ledger"]["requirements"]),
-            len(ledger["requirements"]),
-        )
+        self.assertEqual("engineering.v2.2.6-owner-approved-ledger.v2", ledger["schema"])
         source = tool.read_text(encoding="utf-8")
         self.assertNotIn("v2.2.6-owner-approved-ledger.json\").write", source)
+
+    def test_v226_owner_source_projection_is_exact_external_and_complete(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_owner_source_projection", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_owner_ledger("owner approved package")
+        module._validate_owner_source_projection(
+            ledger, b"prompt = 'owner approved package'\n"
+        )
+        missing = json.loads(json.dumps(ledger))
+        missing["source_requirements"][0]["requirement_ids"].pop()
+        with self.assertRaisesRegex(module.MatrixError, "source projection"):
+            module._validate_owner_source_projection(
+                missing, b"prompt = 'owner approved package'\n"
+            )
+        conflict = json.loads(json.dumps(ledger))
+        conflict["source_requirements"].append(
+            json.loads(json.dumps(conflict["source_requirements"][0]))
+        )
+        conflict["source_requirements"][1]["source_requirement_id"] = "OWNER-V226-CONFLICT"
+        with self.assertRaisesRegex(module.MatrixError, "source projection"):
+            module._validate_owner_source_projection(
+                conflict, b"prompt = 'owner approved package'\n"
+            )
+        changed = b"prompt = 'candidate changed package'\n"
+        with self.assertRaisesRegex(module.MatrixError, "source projection"):
+            module._validate_owner_source_projection(ledger, changed)
+
+    def test_readme_native_observability_is_truthful_and_precedes_comparisons(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        section = "## Native observability and limits"
+        self.assertIn(section, readme)
+        comparison_positions = [
+            readme.index(name) for name in ("LangGraph", "Langfuse") if name in readme
+        ]
+        self.assertTrue(comparison_positions)
+        self.assertLess(readme.index(section), min(comparison_positions))
+        self.assertIn(
+            "| Capability | Owning module | Evidence source | Storage/projection | Interface | Privacy boundary | Support state | Known limitation |",
+            readme,
+        )
+        normalized = " ".join(readme.lower().split())
+        for boundary in (
+            "not a runtime telemetry backend",
+            "no persistent dashboard",
+            "no token or cost collection",
+            "static html is a projection, not the canonical store",
+            "does not grant owner, merge, install, deployment, or product authority",
+        ):
+            with self.subTest(boundary=boundary):
+                self.assertIn(boundary, normalized)
 
     def test_v226_owner_baseline_binds_source_repo_epoch_and_role_separation(self) -> None:
         """Signed external ledger is exact; changed durable authority fails closed."""
@@ -488,19 +567,7 @@ class RepositoryContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        ledger = {
-            "schema": "engineering.v2.2.6-owner-approved-ledger.v1",
-            "requirements": [
-                {
-                    "id": row["id"],
-                    "lifecycle_state": row["lifecycle_state"],
-                    "runtime_behavior": row["runtime_behavior"],
-                    "native_evidence": row["native_evidence"],
-                }
-                for row in registry["requirements"]
-            ],
-            "obligations": registry["obligations"],
-        }
+        ledger = self.candidate_owner_ledger("owner approved package")
         root_commit = subprocess.run(
             ["git", "-C", str(ROOT), "rev-list", "--max-parents=0", "HEAD"],
             check=True,
@@ -601,7 +668,7 @@ class RepositoryContractTests(unittest.TestCase):
                 "schema": "engineering.v2.2.6-owner-baseline-host-receipt.v1",
                 "receipt_id": "owner-baseline-host-receipt-fixture",
                 "authority_epoch": claims["authority_epoch"],
-                "contract": "engineering.v2.2.6-owner-approved-ledger.v1",
+                "contract": "engineering.v2.2.6-owner-approved-ledger.v2",
                 "identity": {"state": "unknown"},
                 "trust_anchor": anchor,
             }

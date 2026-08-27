@@ -478,11 +478,18 @@ Immediately after activation, the native/root host must import the recorded
 owner-intent completeness before any downstream product-release or accepted
 owner-outcome dispatch. `engineering intent-import <root> --import-file
 <path|-> --approval-file <path|->` retains only an exact, host-signed
-`engineering.owner-intent-import.v1` covering the active intent's repository,
+`engineering.owner-intent-import.v2` covering the active intent's repository,
 epoch, ID, digest, every outcome ID, and both `accepted_owner_outcomes` and
-`product_releases` scopes. `engineering dependent-dispatch-status <root>
---scope <...>` is read-only and non-dispatching; it fails closed before that
-import and never itself grants a native action.
+`product_releases` scopes. It also contains exactly one `DESIGN_MAPPED` row per
+active outcome. Each row binds a design path and section, schema/API path and
+interface, concrete runtime behavior, negative-test path and selector, required
+native or served evidence class/interface/environment, and exact repository,
+commit, tree, and artifact digest. Missing, duplicate, broad-scope-only,
+Unknown, proxy-only, stale, or wrong-artifact mappings fail closed. Historical
+v1 imports remain readable but cannot admit a new dependent dispatch.
+`engineering dependent-dispatch-status <root> --scope <...>` is read-only and
+non-dispatching; it revalidates the complete mapping digest, fails closed before
+that import, and never itself grants a native action.
 
 For v2 handoffs, `engineering approve-scope <root> --decision-id <id>
 --handoff-file <path|-> --owner-intent-id <intent-id>` requires that exact

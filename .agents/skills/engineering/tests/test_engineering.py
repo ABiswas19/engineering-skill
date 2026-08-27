@@ -13969,8 +13969,48 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         )
 
     def owner_intent_import(self, intent):
+        module = self.module()
+        artifact = {
+            "repository_id": intent["repository_id"],
+            "commit": subprocess.run(
+                ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "tree": subprocess.run(
+                ["git", "-C", str(self.root), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+        }
+        artifact["digest"] = module._json_digest(artifact)
+        mappings = [
+            {
+                "outcome_id": item["id"],
+                "lifecycle_state": "DESIGN_MAPPED",
+                "design": {"path": "docs/spec.md", "section": "Outcome design"},
+                "contract": {
+                    "path": "schema/outcome.json",
+                    "interface": "native outcome interface",
+                },
+                "runtime_behavior": "The later lane remains blocked until its exact acceptance evidence is current.",
+                "negative_test": {
+                    "path": "tests/test_outcome.py",
+                    "selector": "test_missing_evidence_blocks",
+                },
+                "required_evidence": {
+                    "class": "real_outcome",
+                    "interface": "native_harness",
+                    "environment": "candidate",
+                },
+                "exact_artifact": artifact,
+            }
+            for item in intent["outcomes"]
+        ]
         return {
-            "schema": "engineering.owner-intent-import.v1",
+            "schema": "engineering.owner-intent-import.v2",
             "import_id": "intent-import-native-graph",
             "repository_id": intent["repository_id"],
             "authority_epoch": intent["authority_epoch"],
@@ -13978,17 +14018,19 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             "owner_intent_digest": intent["owner_intent_digest"],
             "outcome_ids": sorted(item["id"] for item in intent["outcomes"]),
             "coverage_scopes": ["accepted_owner_outcomes", "product_releases"],
+            "outcome_mappings": mappings,
+            "outcome_mapping_digest": module._json_digest(mappings),
         }
 
     def owner_intent_import_approval(self, imported):
         module = self.module()
         receipt = self.host_receipt(
-            contract="engineering.owner-intent-import.v1",
+            contract="engineering.owner-intent-import.v2",
             authority_epoch=imported["authority_epoch"],
         )
         material = module._canonical_json(
             {
-                "schema": "engineering.host-owner-intent-import-claims.v1",
+                "schema": "engineering.host-owner-intent-import-claims.v2",
                 "claims": imported,
                 "host_receipt": receipt,
             }
@@ -14010,7 +14052,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             capture_output=True,
         )
         return {
-            "schema": "engineering.host-owner-intent-import-approval.v1",
+            "schema": "engineering.host-owner-intent-import-approval.v2",
             "approver": "synthetic-host",
             "claims": imported,
             "host_receipt": receipt,
@@ -14559,6 +14601,47 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             with self.subTest(scope=scope):
                 admitted = module.dependent_dispatch_status(self.root, scope)
                 self.assertEqual("admitted", admitted["state"])
+                self.assertEqual(imported["outcome_mapping_digest"], admitted["outcome_mapping_digest"])
+
+    def test_postactivation_import_requires_complete_per_outcome_design_evidence_mapping(self):
+        """IDs and broad scopes never substitute for row-level downstream proof."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        intent = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        complete = self.owner_intent_import(intent)
+        cases = []
+        missing = json.loads(json.dumps(complete))
+        missing["outcome_mappings"] = []
+        missing["outcome_mapping_digest"] = module._json_digest([])
+        cases.append(("missing", missing))
+        unknown = json.loads(json.dumps(complete))
+        unknown["outcome_mappings"][0]["runtime_behavior"] = "Unknown"
+        unknown["outcome_mapping_digest"] = module._json_digest(unknown["outcome_mappings"])
+        cases.append(("unknown", unknown))
+        proxy = json.loads(json.dumps(complete))
+        proxy["outcome_mappings"][0]["required_evidence"]["class"] = "proxy"
+        proxy["outcome_mapping_digest"] = module._json_digest(proxy["outcome_mappings"])
+        cases.append(("proxy", proxy))
+        wrong_artifact = json.loads(json.dumps(complete))
+        wrong_artifact["outcome_mappings"][0]["exact_artifact"]["commit"] = "f" * 40
+        wrong_artifact["outcome_mapping_digest"] = module._json_digest(
+            wrong_artifact["outcome_mappings"]
+        )
+        cases.append(("wrong artifact", wrong_artifact))
+        broad_only = {key: value for key, value in complete.items() if key not in {
+            "outcome_mappings", "outcome_mapping_digest"
+        }}
+        broad_only["schema"] = "engineering.owner-intent-import.v1"
+        cases.append(("broad scope", broad_only))
+        for label, value in cases:
+            with self.subTest(case=label), self.assertRaisesRegex(
+                module.EngineeringError, "mapping|post-activation|import"
+            ):
+                module.import_owner_intent(
+                    self.root, value, self.owner_intent_import_approval(value)
+                )
 
     def test_candidate_cannot_replace_host_owned_trust_anchor(self):
         """A candidate-local signer edit cannot replace the private host anchor."""
@@ -15896,7 +15979,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
             patch.object(
                 module,
                 "import_owner_intent",
-                return_value={"schema": "engineering.owner-intent-import.v1"},
+                return_value={"schema": "engineering.owner-intent-import.v2"},
             ) as imported,
             patch.object(
                 sys,
@@ -15918,7 +16001,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         self.assertEqual({}, imported.call_args.args[1])
         self.assertEqual({}, imported.call_args.args[2])
         self.assertEqual(
-            "engineering.owner-intent-import.v1", json.loads(output.getvalue())["schema"]
+            "engineering.owner-intent-import.v2", json.loads(output.getvalue())["schema"]
         )
 
         output = io.StringIO()
