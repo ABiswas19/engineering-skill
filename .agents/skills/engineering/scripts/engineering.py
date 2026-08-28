@@ -9847,7 +9847,11 @@ $ErrorActionPreference = 'Stop'
 $enforce = $enforceFlag -eq '1'
 $directory = $directoryFlag -eq '1'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$acl = Get-Acl -LiteralPath $path
+$acl = if ($directory) {
+    [System.IO.DirectoryInfo]::new($path).GetAccessControl()
+} else {
+    [System.IO.FileInfo]::new($path).GetAccessControl()
+}
 $ownerSid = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate(
     [System.Security.Principal.SecurityIdentifier]
 ).Value
@@ -9894,7 +9898,11 @@ if ($enforce -and -not $alreadyPrivate) {
         [System.IO.FileInfo]::new($path).SetAccessControl($acl)
     }
 }
-$verified = Get-Acl -LiteralPath $path
+$verified = if ($directory) {
+    [System.IO.DirectoryInfo]::new($path).GetAccessControl()
+} else {
+    [System.IO.FileInfo]::new($path).GetAccessControl()
+}
 $entries = @($verified.Access | ForEach-Object {
     $entrySid = $_.IdentityReference.Translate(
         [System.Security.Principal.SecurityIdentifier]

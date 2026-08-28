@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -577,6 +578,16 @@ class RepositoryContractTests(unittest.TestCase):
             str(executable.parent / "Modules"), environment["PSModulePath"]
         )
         self.assertNotIn("codex-runtimes", environment["PSModulePath"].casefold())
+        controller = ROOT / ".agents" / "skills" / "engineering" / "scripts" / "engineering.py"
+        controller_spec = importlib.util.spec_from_file_location(
+            "engineering_v226_controller_acl", controller
+        )
+        controller_module = importlib.util.module_from_spec(controller_spec)
+        sys.modules[controller_spec.name] = controller_module
+        controller_spec.loader.exec_module(controller_module)
+        self.assertIn("[System.IO.DirectoryInfo]", controller_module._WINDOWS_PRIVATE_ACL)
+        self.assertIn("[System.IO.FileInfo]", controller_module._WINDOWS_PRIVATE_ACL)
+        self.assertNotIn("Get-Acl", controller_module._WINDOWS_PRIVATE_ACL)
 
     def test_v226_owner_baseline_cli_only_validates_external_owner_projection(self) -> None:
         tool = ROOT / "tools" / "v226_owner_baseline.py"
