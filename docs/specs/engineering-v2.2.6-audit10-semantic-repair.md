@@ -47,6 +47,125 @@ python tools/v226_owner_baseline.py ledger \
 The command cannot create or replace the host ledger, source, trust anchor,
 signer material, approval, installation, or activation.
 
+### Native decision-source receipts
+
+When approval is recorded in a native Codex session rather than an automation
+prompt, the signed source evidence uses
+`engineering.owner-approved-bootstrap-source.v2` with kind
+`codex_native_decision_receipt`. Its owner-private source is a canonical
+`engineering.owner-approved-native-decision-source.v1` receipt outside
+candidate Git. The receipt binds the immutable native JSONL file by absolute
+path, byte length, and SHA-256 digest; it separately binds the proposal and
+approval message IDs, turn IDs, UTC timestamps, one-based line numbers,
+raw-line digests, roles, exact excerpts, excerpt digests, and half-open UTF-8
+byte spans within the native message text.
+
+```json
+{
+  "schema": "engineering.owner-approved-native-decision-source.v1",
+  "decision_id": "<stable-host-decision-id>",
+  "lifecycle_state": "OWNER_APPROVED",
+  "native_source": {
+    "schema": "engineering.native-codex-session-jsonl.v1",
+    "kind": "codex_session_jsonl",
+    "path": "<absolute-owner-private-path>",
+    "digest": "sha256:<exact-file-digest>",
+    "length": 1
+  },
+  "proposal": {
+    "line_number": 1,
+    "message_id": "<native-message-id>",
+    "turn_id": "<native-turn-id>",
+    "timestamp": "<UTC-instant>",
+    "role": "assistant",
+    "excerpt": "<exact-proposal-excerpt>",
+    "excerpt_digest": "sha256:<exact-excerpt-digest>",
+    "excerpt_utf8_span": {"start": 0, "end": 1},
+    "raw_line_digest": "sha256:<JSONL-line-digest-without-terminator>"
+  },
+  "approval": {
+    "line_number": 2,
+    "message_id": "<native-message-id>",
+    "turn_id": "<native-turn-id>",
+    "timestamp": "<UTC-instant>",
+    "role": "user",
+    "excerpt": "<exact-approval-excerpt>",
+    "excerpt_digest": "sha256:<exact-excerpt-digest>",
+    "excerpt_utf8_span": {"start": 0, "end": 1},
+    "raw_line_digest": "sha256:<JSONL-line-digest-without-terminator>"
+  },
+  "safeguards": [
+    {
+      "source_requirement_id": "<stable-id>",
+      "lifecycle_state": "OWNER_APPROVED",
+      "source_excerpt": "<exact-proposal-safeguard-excerpt>",
+      "statement_digest": "sha256:<exact-excerpt-digest>",
+      "requirement_ids": ["<candidate-requirement-id>"],
+      "obligation_ids": ["<candidate-obligation-id>"],
+      "proposal_excerpt_utf8_span": {"start": 0, "end": 1}
+    }
+  ]
+}
+```
+
+The receipt contains exactly nine safeguard mappings for this approval. Each
+mapping binds one stable source requirement ID and its exact proposal-text
+span to the complete ledger requirement and obligation IDs. The mappings must
+equal the ledger projection in order and content, with every candidate ID
+covered exactly once. Missing, duplicated, reordered, candidate-controlled,
+non-canonical, reparse-relocated, ACL-weak, changed, ill-ordered, or
+digest-mismatched source evidence fails closed. The owner-baseline signature
+binds the receipt digest and source kind; rendering or validating the receipt
+does not mint owner authority.
+
+Root prepares the generic receipt from an owner-private manifest and native
+session with:
+
+```text
+python tools/v226_owner_baseline.py decision-source \
+  --manifest <owner-private-decision-manifest.json> \
+  --session <immutable-native-session.jsonl> \
+  --owner-ledger <owner-private-v2-ledger.json> \
+  --repository <exact-candidate-root>
+```
+
+The canonical output is then supplied to `material` with
+`--source-kind codex_native_decision_receipt`, `--source-id` equal to the
+receipt decision ID, and a version. Only the native owner signer may sign that
+material under the `engineering-v226-owner-baseline` namespace. Populated
+message content, IDs, paths, hashes, and mappings remain host-private and are
+never committed to either repository.
+
+```text
+python tools/v226_owner_baseline.py material \
+  --internal-root <exact-internal-root> \
+  --public-root <exact-public-root> \
+  --source <owner-private-native-decision-receipt.json> \
+  --source-kind codex_native_decision_receipt \
+  --source-id <stable-host-decision-id> \
+  --source-version 1 \
+  --authority-epoch <fresh-epoch> --baseline-id <fresh-baseline-id> \
+  --receipt-id <fresh-receipt-id> --owner-principal <owner-principal> \
+  --architect-principal <architect-principal> \
+  --implementer-principal <implementer-principal> \
+  --writer-principal <writer-principal> \
+  --semantic-principal <semantic-auditor-principal> \
+  --technical-principal <technical-auditor-principal> \
+  --issued-at <UTC-instant> --expires-at <UTC-instant> \
+  --replay-nonce <fresh-nonce>
+```
+
+Root writes the canonical material bytes exactly, then uses the native owner
+key without exposing it to Engineering:
+
+```text
+ssh-keygen -Y sign -f <owner-private-signing-key> \
+  -n engineering-v226-owner-baseline <canonical-material.json>
+python tools/v226_owner_baseline.py approval \
+  --material <canonical-material.json> \
+  --signature <canonical-material.json.sig>
+```
+
 ## 2. Native observability truthfulness
 
 The README describes Engineering's native observability before comparisons to
@@ -83,7 +202,7 @@ bound immediately after v2.2.6 activation.
 
 | Owner requirement | Design section | Contract | Runtime rule | Negative proof | Acceptance proof |
 | --- | --- | --- | --- | --- | --- |
-| Genuine external owner source | 1 | Host ledger source projection | Verify source bytes and signed mappings before registry comparison | Candidate omission/conflict/unresolved excerpt rejects | Host-issued record resolves and matches exact registry |
+| Genuine external owner source | 1 | Host ledger source projection and native decision-source receipt | Verify exact source-kind bytes, proposal/approval records, and signed mappings before registry comparison | Candidate omission/conflict, wrong source kind, altered native record/span, or unresolved receipt rejects | Host-issued record resolves and matches exact registry |
 | Truthful native observability | 2 | README disclosure and capability matrix | Documentation gate blocks missing, late, or overstated claims | Missing matrix/negative boundary/order rejects | Repository test proves exact section and claims |
 | Per-outcome dispatch completeness | 3 | Post-activation import outcome maps | Revalidate every active outcome before dependent dispatch | IDs/scopes-only, incomplete, Unknown, proxy, wrong artifact reject | Complete signed maps admit idempotently |
 

@@ -78,6 +78,115 @@ class RepositoryContractTests(unittest.TestCase):
             "obligations": registry["obligations"],
         }
 
+    def candidate_native_owner_ledger(self) -> dict:
+        ledger = self.candidate_owner_ledger()
+        requirement_ids = [row["id"] for row in ledger["requirements"]]
+        obligation_ids = [row["id"] for row in ledger["obligations"]]
+        rows = []
+        for index in range(9):
+            excerpt = f"safeguard-{index + 1}"
+            rows.append(
+                {
+                    "source_requirement_id": f"OWNER-SAFEGUARD-{index + 1}",
+                    "lifecycle_state": "OWNER_APPROVED",
+                    "source_excerpt": excerpt,
+                    "statement_digest": "sha256:"
+                    + hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+                    "requirement_ids": requirement_ids[index::9],
+                    "obligation_ids": obligation_ids[index::9],
+                }
+            )
+        ledger["source_requirements"] = rows
+        return ledger
+
+    def write_native_decision_source(
+        self, directory: Path, ledger: dict
+    ) -> tuple[Path, dict]:
+        proposal_text = "Recommendation: approve " + "; ".join(
+            row["source_excerpt"] for row in ledger["source_requirements"]
+        )
+        approval_text = "2.2.6 approved"
+        proposal = {
+            "timestamp": "2026-08-28T01:09:08.125Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "proposal-message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": proposal_text}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "proposal-turn"
+                },
+            },
+        }
+        approval = {
+            "timestamp": "2026-08-28T08:13:20.109Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "approval-message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": approval_text}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "approval-turn"
+                },
+            },
+        }
+        raw_lines = [
+            json.dumps(proposal, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            json.dumps(approval, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+        ]
+        session = directory / "native-session.jsonl"
+        session.write_bytes(b"\n".join(raw_lines) + b"\n")
+
+        def record(line_number: int, value: dict, text: str, excerpt: str) -> dict:
+            encoded = text.encode("utf-8")
+            excerpt_bytes = excerpt.encode("utf-8")
+            start = encoded.index(excerpt_bytes)
+            return {
+                "line_number": line_number,
+                "message_id": value["payload"]["id"],
+                "turn_id": value["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"],
+                "timestamp": value["timestamp"],
+                "role": value["payload"]["role"],
+                "excerpt": excerpt,
+                "excerpt_digest": "sha256:" + hashlib.sha256(excerpt_bytes).hexdigest(),
+                "excerpt_utf8_span": {"start": start, "end": start + len(excerpt_bytes)},
+                "raw_line_digest": "sha256:" + hashlib.sha256(raw_lines[line_number - 1]).hexdigest(),
+            }
+
+        safeguards = []
+        for row in ledger["source_requirements"]:
+            excerpt = row["source_excerpt"]
+            excerpt_bytes = excerpt.encode("utf-8")
+            proposal_bytes = proposal_text.encode("utf-8")
+            start = proposal_bytes.index(excerpt_bytes)
+            safeguards.append(
+                {
+                    **json.loads(json.dumps(row)),
+                    "proposal_excerpt_utf8_span": {
+                        "start": start,
+                        "end": start + len(excerpt_bytes),
+                    },
+                }
+            )
+        receipt = {
+            "schema": "engineering.owner-approved-native-decision-source.v1",
+            "decision_id": "native-decision-fixture",
+            "lifecycle_state": "OWNER_APPROVED",
+            "native_source": {
+                "schema": "engineering.native-codex-session-jsonl.v1",
+                "kind": "codex_session_jsonl",
+                "path": str(session.resolve()),
+                "digest": "sha256:" + hashlib.sha256(session.read_bytes()).hexdigest(),
+                "length": session.stat().st_size,
+            },
+            "proposal": record(1, proposal, proposal_text, proposal_text),
+            "approval": record(2, approval, approval_text, approval_text),
+            "safeguards": safeguards,
+        }
+        return session, receipt
+
     def candidate_owner_baseline(self) -> dict:
         """Explicit test-only projection; production resolves a signed host ledger."""
         return {
@@ -523,6 +632,265 @@ class RepositoryContractTests(unittest.TestCase):
         changed = b"prompt = 'candidate changed package'\n"
         with self.assertRaisesRegex(module.MatrixError, "source projection"):
             module._validate_owner_source_projection(ledger, changed)
+
+    def test_v226_native_decision_source_binds_exact_approval_pair_and_nine_safeguards(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_decision_source", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, receipt = self.write_native_decision_source(directory, ledger)
+            receipt_path = directory / "decision-source.json"
+            receipt_path.write_bytes(module._canonical(receipt))
+            with patch.object(module, "_verify_owner_private_path", return_value=None):
+                resolved = module._validate_native_decision_source_receipt(
+                    receipt_path, ledger, ROOT
+                )
+        self.assertEqual("native-decision-fixture", resolved["decision_id"])
+        self.assertEqual(
+            [row["source_requirement_id"] for row in ledger["source_requirements"]],
+            [row["source_requirement_id"] for row in resolved["safeguards"]],
+        )
+
+    def test_v226_native_decision_source_rejects_changed_native_evidence(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_decision_negative", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        mutations = {
+            "wrong proposal line": lambda value: value["proposal"].update(line_number=2),
+            "wrong approval message": lambda value: value["approval"].update(message_id="forged"),
+            "wrong approval turn": lambda value: value["approval"].update(turn_id="forged"),
+            "wrong approval timestamp": lambda value: value["approval"].update(timestamp="2026-08-28T00:00:00Z"),
+            "wrong approval digest": lambda value: value["approval"].update(raw_line_digest="sha256:" + "0" * 64),
+            "wrong approval excerpt": lambda value: value["approval"].update(excerpt="approved"),
+            "wrong approval span": lambda value: value["approval"].update(excerpt_utf8_span={"start": 1, "end": 5}),
+            "wrong safeguard mapping": lambda value: value["safeguards"][0]["requirement_ids"].append("fabricated"),
+            "missing safeguard": lambda value: value["safeguards"].pop(),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, original = self.write_native_decision_source(directory, ledger)
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    receipt = json.loads(json.dumps(original))
+                    mutate(receipt)
+                    receipt_path = directory / f"{label.replace(' ', '-')}.json"
+                    receipt_path.write_bytes(module._canonical(receipt))
+                    with (
+                        patch.object(module, "_verify_owner_private_path", return_value=None),
+                        self.assertRaisesRegex(module.MatrixError, "native decision source"),
+                    ):
+                        module._validate_native_decision_source_receipt(
+                            receipt_path, ledger, ROOT
+                        )
+
+    def test_v226_native_decision_source_rejects_session_or_candidate_control(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_decision_boundary", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            session, receipt = self.write_native_decision_source(directory, ledger)
+            receipt_path = directory / "decision-source.json"
+            receipt_path.write_bytes(module._canonical(receipt))
+            session.write_bytes(session.read_bytes() + b"{}\n")
+            with (
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+                self.assertRaisesRegex(module.MatrixError, "native decision source"),
+            ):
+                module._validate_native_decision_source_receipt(receipt_path, ledger, ROOT)
+            with self.assertRaisesRegex(module.MatrixError, "candidate-controlled"):
+                module._validate_native_decision_source_receipt(
+                    ROOT / "release" / "v2.2.6-requirements.json", ledger, ROOT
+                )
+
+    def test_v226_owner_baseline_cli_renders_generic_native_decision_receipt(self) -> None:
+        tool = ROOT / "tools" / "v226_owner_baseline.py"
+        tool_spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_decision_cli", tool
+        )
+        tool_module = importlib.util.module_from_spec(tool_spec)
+        tool_spec.loader.exec_module(tool_module)
+        matrix_spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_decision_cli_matrix",
+            ROOT / "tools" / "v226_release_matrix.py",
+        )
+        matrix = importlib.util.module_from_spec(matrix_spec)
+        matrix_spec.loader.exec_module(matrix)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            session, receipt = self.write_native_decision_source(directory, ledger)
+            manifest = directory / "decision-manifest.json"
+            manifest.write_bytes(matrix._canonical(receipt))
+            ledger_path = directory / "owner-ledger.json"
+            ledger_path.write_bytes(matrix._canonical(ledger))
+            with patch.object(
+                tool_module.MATRIX, "_verify_owner_private_path", return_value=None
+            ):
+                rendered = tool_module.render_decision_source(
+                    manifest, session, ledger_path, ROOT
+                )
+        self.assertEqual(receipt, rendered)
+        help_result = subprocess.run(
+            ["python", str(tool), "decision-source", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(0, help_result.returncode, help_result.stdout + help_result.stderr)
+        self.assertIn("--manifest", help_result.stdout)
+
+    def test_v226_owner_ledger_resolves_native_decision_receipt_not_automation_prose(self) -> None:
+        tool = ROOT / "tools" / "v226_owner_baseline.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_ledger", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, receipt = self.write_native_decision_source(directory, ledger)
+            receipt_path = directory / "decision-source.json"
+            receipt_path.write_bytes(module.MATRIX._canonical(receipt))
+            ledger_path = directory / "owner-ledger.json"
+            ledger_path.write_bytes(module.MATRIX._canonical(ledger))
+            with patch.object(
+                module.MATRIX, "_verify_owner_private_path", return_value=None
+            ):
+                resolved = module.render_ledger(
+                    ROOT, ROOT, ledger_path, receipt_path
+                )
+            self.assertEqual(ledger, resolved)
+            automation = directory / "automation.toml"
+            automation.write_text(
+                "prompt = '" + ledger["source_requirements"][0]["source_excerpt"] + "'\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                module.MATRIX.MatrixError, "source projection"
+            ):
+                module.render_ledger(ROOT, ROOT, ledger_path, automation)
+
+    def test_v226_native_source_evidence_kind_is_exact_and_fail_closed(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_source_evidence", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, receipt = self.write_native_decision_source(directory, ledger)
+            receipt_path = directory / "decision-source.json"
+            receipt_path.write_bytes(module._canonical(receipt))
+            source = {
+                "schema": "engineering.owner-approved-bootstrap-source.v2",
+                "kind": "codex_native_decision_receipt",
+                "source_id": receipt["decision_id"],
+                "path": str(receipt_path.resolve()),
+                "digest": "sha256:" + hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "length": receipt_path.stat().st_size,
+                "version": "1",
+            }
+            with patch.object(module, "_verify_owner_private_path", return_value=None):
+                resolved = module._resolve_owner_source_evidence(source, ledger, ROOT)
+                self.assertEqual(receipt["decision_id"], resolved["decision_id"])
+                for field, changed in (
+                    ("kind", "codex_automation_prompt"),
+                    ("source_id", "forged-decision"),
+                    ("digest", "sha256:" + "0" * 64),
+                ):
+                    invalid = json.loads(json.dumps(source))
+                    invalid[field] = changed
+                    with self.subTest(field=field), self.assertRaisesRegex(
+                        module.MatrixError, "source evidence"
+                    ):
+                        module._resolve_owner_source_evidence(invalid, ledger, ROOT)
+
+    def test_v226_owner_material_binds_native_decision_receipt_kind(self) -> None:
+        tool = ROOT / "tools" / "v226_owner_baseline.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_material", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, receipt = self.write_native_decision_source(directory, ledger)
+            receipt_path = directory / "decision-source.json"
+            receipt_path.write_bytes(module.MATRIX._canonical(receipt))
+            expected_source = {
+                "schema": "engineering.owner-approved-bootstrap-source.v2",
+                "kind": "codex_native_decision_receipt",
+                "source_id": "native-decision-fixture",
+                "path": str(receipt_path.resolve()),
+                "digest": "sha256:" + hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "length": receipt_path.stat().st_size,
+                "version": "1",
+            }
+            arguments = type(
+                "Arguments",
+                (),
+                {
+                    "internal_root": ROOT,
+                    "public_root": ROOT,
+                    "source": receipt_path,
+                    "source_kind": "codex_native_decision_receipt",
+                    "source_id": receipt["decision_id"],
+                    "source_version": "1",
+                    "automation_id": None,
+                    "authority_epoch": "native-decision-epoch",
+                    "baseline_id": "native-decision-baseline",
+                    "receipt_id": "native-decision-host-receipt",
+                    "owner_principal": "owner",
+                    "architect_principal": "architect",
+                    "implementer_principal": "writer",
+                    "writer_principal": "writer",
+                    "semantic_principal": "semantic",
+                    "technical_principal": "technical",
+                    "issued_at": "2026-08-28T08:20:00Z",
+                    "expires_at": "2026-09-27T08:20:00Z",
+                    "replay_nonce": "native-decision-replay",
+                },
+            )()
+            allowed = (
+                b"semantic ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFfdNG34nGjtyEKfE2G6nuJhd3X1rcMiKotL82Wjvyl3\n"
+                b"technical ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAtAh1BVCQLTLNfAVPXryxzSjKHtlA+m8FLkSWBnx5j\n"
+            )
+            anchor = {
+                "schema": "engineering.v2.2.6-bootstrap-trust-anchor.v1",
+                "anchor_id": "fixture",
+                "format_version": 1,
+                "signers_digest": "sha256:" + hashlib.sha256(allowed).hexdigest(),
+                "identity": {"state": "unknown"},
+            }
+            with (
+                patch.object(module.MATRIX, "_verify_owner_private_path", return_value=None),
+                patch.object(
+                    module,
+                    "_authority_material",
+                    return_value=(directory, anchor, allowed, module.MATRIX._canonical(ledger)),
+                ),
+            ):
+                material = module.render_material(arguments)
+        self.assertEqual(expected_source, material["claims"]["source_evidence"])
 
     def test_readme_native_observability_is_truthful_and_precedes_comparisons(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

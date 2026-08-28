@@ -50,10 +50,10 @@
       "id": "external_owner_source_projection",
       "lifecycle_state": "implemented",
       "design": {"path": "docs/specs/engineering-v2.2.6-audit10-semantic-repair.md", "section": "External owner-source semantics"},
-      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "_validate_owner_source_projection"},
-      "runtime_behavior": "Require an independently authored, host-signed source excerpt and complete requirement/obligation mapping; candidate registry projection, omission, or conflict fails closed.",
-      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_owner_source_projection_is_exact_external_and_complete"},
-      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v226_owner_source_projection_is_exact_external_and_complete", "environment": "isolated_exact_git_contract_fixture"}
+      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "_validate_native_decision_source_receipt"},
+      "runtime_behavior": "Require a host-signed exact source kind and complete requirement/obligation mapping; a native decision receipt binds immutable proposal and approval records plus exactly nine safeguard mappings. Candidate projection, omission, substitution, or conflict fails closed.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_native_decision_source_rejects_changed_native_evidence"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v226_native_decision_source_rejects_changed_native_evidence", "environment": "isolated_exact_git_contract_fixture"}
     },
     {
       "id": "git_object_byte_identity",

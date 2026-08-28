@@ -64,8 +64,44 @@ def render_ledger(
     source_path = MATRIX._external_path(internal_root, source, "owner source")
     if source_path.resolve().is_relative_to(public_root.resolve()):
         raise MATRIX.MatrixError("owner source path must be outside candidate Git")
-    MATRIX._validate_owner_source_projection(ledger, source_path.read_bytes())
+    source_bytes = source_path.read_bytes()
+    try:
+        source_value = json.loads(source_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        source_value = None
+    if (
+        isinstance(source_value, dict)
+        and source_value.get("schema")
+        == "engineering.owner-approved-native-decision-source.v1"
+    ):
+        MATRIX._validate_native_decision_source_receipt(
+            source_path, ledger, internal_root
+        )
+    else:
+        MATRIX._validate_owner_source_projection(ledger, source_bytes)
     return ledger
+
+
+def render_decision_source(
+    manifest_path: Path, session_path: Path, ledger_path: Path, repository: Path
+) -> dict:
+    """Validate and canonicalize a root-authored native decision receipt."""
+    manifest_path = MATRIX._external_path(repository, manifest_path, "decision manifest")
+    ledger_path = MATRIX._external_path(repository, ledger_path, "owner ledger")
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MATRIX.MatrixError("native decision source or owner ledger is invalid") from error
+    if MATRIX._canonical(manifest) != manifest_bytes:
+        raise MATRIX.MatrixError("native decision source is not canonical UTF-8")
+    source = manifest.get("native_source") if isinstance(manifest, dict) else None
+    resolved_session = Path(session_path).resolve(strict=True)
+    if not isinstance(source, dict) or source.get("path") != str(resolved_session):
+        raise MATRIX.MatrixError("native decision source session is mismatched")
+    MATRIX._validate_native_decision_source_receipt(manifest_path, ledger, repository)
+    return manifest
 
 
 def render_material(arguments: argparse.Namespace) -> dict:
@@ -82,7 +118,49 @@ def render_material(arguments: argparse.Namespace) -> dict:
     source_bytes = source_path.read_bytes()
     MATRIX._normalize_registry(internal_registry, retained_ledger)
     MATRIX._normalize_registry(public_registry, retained_ledger)
-    MATRIX._validate_owner_source_projection(retained_ledger, source_bytes)
+    try:
+        source_value = json.loads(source_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        source_value = None
+    requested_kind = arguments.source_kind
+    is_native = (
+        isinstance(source_value, dict)
+        and source_value.get("schema")
+        == "engineering.owner-approved-native-decision-source.v1"
+    )
+    if requested_kind == "codex_native_decision_receipt" and not is_native:
+        raise MATRIX.MatrixError("native decision source is invalid")
+    if requested_kind == "codex_automation_prompt" and is_native:
+        raise MATRIX.MatrixError("owner source kind is mismatched")
+    if is_native:
+        MATRIX._validate_native_decision_source_receipt(
+            source_path, retained_ledger, arguments.internal_root
+        )
+        source_id = arguments.source_id or source_value["decision_id"]
+        if source_id != source_value["decision_id"]:
+            raise MATRIX.MatrixError("native decision source is mismatched")
+        source_evidence = {
+            "schema": "engineering.owner-approved-bootstrap-source.v2",
+            "kind": "codex_native_decision_receipt",
+            "source_id": source_id,
+            "path": str(source_path),
+            "digest": MATRIX._digest(source_bytes),
+            "length": len(source_bytes),
+            "version": arguments.source_version,
+        }
+    else:
+        if not arguments.automation_id:
+            raise MATRIX.MatrixError("owner automation source identity is unavailable")
+        MATRIX._validate_owner_source_projection(retained_ledger, source_bytes)
+        source_evidence = {
+            "schema": "engineering.owner-approved-bootstrap-source.v1",
+            "kind": "codex_automation_prompt",
+            "automation_id": arguments.automation_id,
+            "path": str(source_path),
+            "digest": MATRIX._digest(source_bytes),
+            "length": len(source_bytes),
+            "version": arguments.source_version,
+        }
     role_separation = {
         "owner_principal": arguments.owner_principal,
         "architect_principal": arguments.architect_principal,
@@ -109,15 +187,7 @@ def render_material(arguments: argparse.Namespace) -> dict:
             "internal": MATRIX._repository_identity(arguments.internal_root),
             "public": MATRIX._repository_identity(arguments.public_root),
         },
-        "source_evidence": {
-            "schema": "engineering.owner-approved-bootstrap-source.v1",
-            "kind": "codex_automation_prompt",
-            "automation_id": arguments.automation_id,
-            "path": str(source_path),
-            "digest": MATRIX._digest(source_bytes),
-            "length": len(source_bytes),
-            "version": arguments.source_version,
-        },
+        "source_evidence": source_evidence,
         "ledger_digest": MATRIX._digest(ledger_bytes),
         "role_separation": role_separation,
         "issued_at": arguments.issued_at,
@@ -188,12 +258,24 @@ def main() -> int:
     ledger.add_argument("--public-root", type=Path, required=True)
     ledger.add_argument("--owner-ledger", type=Path, required=True)
     ledger.add_argument("--source", type=Path, required=True)
+    decision_source = commands.add_parser("decision-source")
+    decision_source.add_argument("--manifest", type=Path, required=True)
+    decision_source.add_argument("--session", type=Path, required=True)
+    decision_source.add_argument("--owner-ledger", type=Path, required=True)
+    decision_source.add_argument("--repository", type=Path, required=True)
     material = commands.add_parser("material")
     material.add_argument("--internal-root", type=Path, required=True)
     material.add_argument("--public-root", type=Path, required=True)
     material.add_argument("--source", type=Path, required=True)
+    material.add_argument(
+        "--source-kind",
+        choices=("auto", "codex_automation_prompt", "codex_native_decision_receipt"),
+        default="auto",
+    )
+    material.add_argument("--source-id")
+    material.add_argument("--automation-id")
     for name in (
-        "source-version", "automation-id", "authority-epoch", "baseline-id",
+        "source-version", "authority-epoch", "baseline-id",
         "receipt-id", "owner-principal", "architect-principal",
         "implementer-principal", "writer-principal", "semantic-principal",
         "technical-principal", "issued-at", "expires-at", "replay-nonce",
@@ -210,6 +292,13 @@ def main() -> int:
                 arguments.public_root,
                 arguments.owner_ledger,
                 arguments.source,
+            )
+        elif arguments.command == "decision-source":
+            value = render_decision_source(
+                arguments.manifest,
+                arguments.session,
+                arguments.owner_ledger,
+                arguments.repository,
             )
         elif arguments.command == "material":
             value = render_material(arguments)

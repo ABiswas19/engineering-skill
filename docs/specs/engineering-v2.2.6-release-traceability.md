@@ -55,18 +55,22 @@ Unknown.
 
 Engineering validates host-owned approval and intent receipts. Candidate Git
 cannot create owner approval, signer authority, exceptions, or audit identity.
-The bootstrap source is a digest-bound durable host automation record and is
-explicitly not an INTENT_BOUND receipt before activation. A root-issued signed
-host receipt binds its exact source digest/version, repository identities,
-authority epoch, complete owner ledger, and separated roles. The v2 ledger is
+The bootstrap source is a digest-bound durable host record and is explicitly
+not an INTENT_BOUND receipt before activation. It may be an automation prompt
+or a canonical native decision-source receipt whose immutable proposal and
+approval records and nine safeguard mappings are verified exactly. A
+root-issued signed host receipt binds the exact source kind, digest/version,
+repository identities, authority epoch, complete owner ledger, and separated
+roles. The v2 ledger is
 independently supplied by that host authority: every `OWNER_APPROVED` source
 row contains an exact source excerpt and digest plus the candidate requirement
 and obligation IDs it governs. The ledger also binds each complete normalized
 requirement row, so candidate design, contract, runtime, test, or evidence
 remapping cannot survive under the same owner ledger. Each candidate ID must be mapped exactly once,
-and the excerpt must occur exactly once in the resolved owner source. Candidate
-registry projection, omission, duplicate mapping, or source conflict fails
-closed. Governing host
+and the excerpt must resolve uniquely in the source contract. For native
+decisions, every row must equal the receipt mapping and its proposal-text UTF-8
+span. Candidate registry projection, omission, duplicate mapping, source-kind
+substitution, changed native record, or source conflict fails closed. Governing host
 paths use the OS-native account profile, not caller HOME, USERPROFILE, or
 ENGINEERING_USER_HOME, and require owner-private non-reparse trust material.
 

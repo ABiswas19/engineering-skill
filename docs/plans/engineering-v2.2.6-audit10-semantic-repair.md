@@ -36,3 +36,10 @@ The pair cannot freeze until the external owner-source record is host-issued
 outside candidate Git, every active later outcome has complete row-level
 dispatch evidence, all audit9 findings are reconciled, and all exact-artifact
 gates pass. Public metadata assurance remains delivery-only Unknown.
+
+For a native approval, the external record is an owner-private canonical
+decision-source receipt rather than projected automation prose. It binds the
+immutable proposal and approval records and exactly nine safeguard mappings;
+the owner-baseline signature binds the receipt digest and source kind.
+Candidate Git carries only the generic contract and synthetic fixtures. Root
+authors and signs populated authority after the repaired exact pair is fixed.

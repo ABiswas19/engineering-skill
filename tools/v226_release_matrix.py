@@ -369,6 +369,297 @@ def _validate_owner_source_projection(
     return normalized
 
 
+def _native_message_text(value: object, expected_role: str) -> tuple[dict, str]:
+    if not isinstance(value, dict) or value.get("type") != "response_item":
+        raise MatrixError("native decision source is invalid")
+    payload = value.get("payload")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "message"
+        or payload.get("role") != expected_role
+        or not isinstance(payload.get("id"), str)
+        or not payload["id"]
+        or not isinstance(payload.get("content"), list)
+        or len(payload["content"]) != 1
+    ):
+        raise MatrixError("native decision source is invalid")
+    content = payload["content"][0]
+    expected_content = "output_text" if expected_role == "assistant" else "input_text"
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if (
+        not isinstance(content, dict)
+        or content.get("type") != expected_content
+        or not isinstance(content.get("text"), str)
+        or not isinstance(metadata, dict)
+        or not isinstance(metadata.get("turn_id"), str)
+        or not metadata["turn_id"]
+    ):
+        raise MatrixError("native decision source is invalid")
+    return payload, content["text"]
+
+
+def _native_source_line(source_path: Path, line_number: int) -> bytes:
+    if not isinstance(line_number, int) or isinstance(line_number, bool) or line_number < 1:
+        raise MatrixError("native decision source is invalid")
+    with source_path.open("rb") as source:
+        for current, line in enumerate(source, 1):
+            if current == line_number:
+                if line.endswith(b"\n"):
+                    line = line[:-1]
+                if line.endswith(b"\r"):
+                    line = line[:-1]
+                return line
+    raise MatrixError("native decision source is invalid")
+
+
+def _validate_native_record(
+    record: object, source_path: Path, expected_role: str
+) -> tuple[dict, str]:
+    expected = {
+        "line_number",
+        "message_id",
+        "turn_id",
+        "timestamp",
+        "role",
+        "excerpt",
+        "excerpt_digest",
+        "excerpt_utf8_span",
+        "raw_line_digest",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != expected
+        or record.get("role") != expected_role
+        or not isinstance(record.get("message_id"), str)
+        or not record["message_id"]
+        or not isinstance(record.get("turn_id"), str)
+        or not record["turn_id"]
+        or not isinstance(record.get("timestamp"), str)
+        or not _utc(record["timestamp"])
+        or not isinstance(record.get("excerpt"), str)
+        or not record["excerpt"].strip()
+    ):
+        raise MatrixError("native decision source is invalid")
+    raw = _native_source_line(source_path, record["line_number"])
+    if record.get("raw_line_digest") != _digest(raw):
+        raise MatrixError("native decision source is mismatched")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MatrixError("native decision source is invalid") from error
+    payload, text = _native_message_text(value, expected_role)
+    metadata = payload["internal_chat_message_metadata_passthrough"]
+    if (
+        value.get("timestamp") != record["timestamp"]
+        or payload["id"] != record["message_id"]
+        or metadata["turn_id"] != record["turn_id"]
+    ):
+        raise MatrixError("native decision source is mismatched")
+    excerpt_bytes = record["excerpt"].encode("utf-8")
+    span = record.get("excerpt_utf8_span")
+    text_bytes = text.encode("utf-8")
+    if (
+        record.get("excerpt_digest") != _digest(excerpt_bytes)
+        or not isinstance(span, dict)
+        or set(span) != {"start", "end"}
+        or not isinstance(span.get("start"), int)
+        or isinstance(span.get("start"), bool)
+        or not isinstance(span.get("end"), int)
+        or isinstance(span.get("end"), bool)
+        or span["start"] < 0
+        or span["end"] <= span["start"]
+        or span["end"] > len(text_bytes)
+        or text_bytes[span["start"] : span["end"]] != excerpt_bytes
+    ):
+        raise MatrixError("native decision source is mismatched")
+    return value, text
+
+
+def _validate_native_decision_source_receipt(
+    receipt_path: Path, owner_ledger: object, repository: Path
+) -> dict:
+    """Resolve one host-owned native proposal/approval receipt exactly."""
+    receipt_path = Path(receipt_path)
+    repository = repository.resolve(strict=True)
+    try:
+        if not receipt_path.is_absolute() or ".." in receipt_path.parts:
+            raise MatrixError("native decision source path is invalid")
+        _reject_host_reparse_ancestors(receipt_path)
+        receipt_path = receipt_path.resolve(strict=True)
+        if receipt_path.is_relative_to(repository):
+            raise MatrixError("native decision source is candidate-controlled")
+        _verify_owner_private_path(receipt_path, directory=False)
+        receipt_bytes = receipt_path.read_bytes()
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MatrixError("native decision source is unavailable") from error
+    if _canonical(receipt) != receipt_bytes:
+        raise MatrixError("native decision source is not canonical UTF-8")
+    expected = {
+        "schema",
+        "decision_id",
+        "lifecycle_state",
+        "native_source",
+        "proposal",
+        "approval",
+        "safeguards",
+    }
+    source = receipt.get("native_source") if isinstance(receipt, dict) else None
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != expected
+        or receipt.get("schema")
+        != "engineering.owner-approved-native-decision-source.v1"
+        or not isinstance(receipt.get("decision_id"), str)
+        or not receipt["decision_id"]
+        or receipt.get("lifecycle_state") != "OWNER_APPROVED"
+        or not isinstance(source, dict)
+        or set(source) != {"schema", "kind", "path", "digest", "length"}
+        or source.get("schema") != "engineering.native-codex-session-jsonl.v1"
+        or source.get("kind") != "codex_session_jsonl"
+        or not isinstance(source.get("path"), str)
+        or not isinstance(source.get("length"), int)
+        or source["length"] < 1
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source.get("digest", "")))
+        or not isinstance(receipt.get("safeguards"), list)
+        or len(receipt["safeguards"]) != 9
+    ):
+        raise MatrixError("native decision source is invalid")
+    source_path = Path(source["path"])
+    try:
+        if not source_path.is_absolute() or ".." in source_path.parts:
+            raise MatrixError("native decision source is invalid")
+        _reject_host_reparse_ancestors(source_path)
+        source_path = source_path.resolve(strict=True)
+        if source_path.is_relative_to(repository):
+            raise MatrixError("native decision source is candidate-controlled")
+        _verify_owner_private_path(source_path, directory=False)
+        source_bytes = source_path.read_bytes()
+    except OSError as error:
+        raise MatrixError("native decision source is unavailable") from error
+    if (
+        str(source_path) != source["path"]
+        or len(source_bytes) != source["length"]
+        or _digest(source_bytes) != source["digest"]
+    ):
+        raise MatrixError("native decision source is mismatched")
+    _, proposal_text = _validate_native_record(
+        receipt["proposal"], source_path, "assistant"
+    )
+    _validate_native_record(receipt["approval"], source_path, "user")
+    if (
+        receipt["proposal"]["line_number"] >= receipt["approval"]["line_number"]
+        or _utc_instant(receipt["proposal"]["timestamp"])
+        >= _utc_instant(receipt["approval"]["timestamp"])
+    ):
+        raise MatrixError("native decision source is ill-ordered")
+    ledger_rows = _validate_owner_source_projection(owner_ledger)
+    normalized_safeguards = []
+    for safeguard in receipt["safeguards"]:
+        if not isinstance(safeguard, dict):
+            raise MatrixError("native decision source is invalid")
+        span = safeguard.get("proposal_excerpt_utf8_span")
+        row = {name: value for name, value in safeguard.items() if name != "proposal_excerpt_utf8_span"}
+        excerpt = row.get("source_excerpt")
+        excerpt_bytes = excerpt.encode("utf-8") if isinstance(excerpt, str) else b""
+        proposal_bytes = proposal_text.encode("utf-8")
+        if (
+            set(safeguard) != {
+                "source_requirement_id", "lifecycle_state", "source_excerpt",
+                "statement_digest", "requirement_ids", "obligation_ids",
+                "proposal_excerpt_utf8_span",
+            }
+            or not isinstance(span, dict)
+            or set(span) != {"start", "end"}
+            or not isinstance(span.get("start"), int)
+            or isinstance(span.get("start"), bool)
+            or not isinstance(span.get("end"), int)
+            or isinstance(span.get("end"), bool)
+            or span["start"] < 0
+            or span["end"] <= span["start"]
+            or span["end"] > len(proposal_bytes)
+            or proposal_bytes[span["start"] : span["end"]] != excerpt_bytes
+        ):
+            raise MatrixError("native decision source safeguard is mismatched")
+        normalized_safeguards.append(row)
+    if normalized_safeguards != ledger_rows:
+        raise MatrixError("native decision source safeguard mapping is mismatched")
+    return receipt
+
+
+def _resolve_owner_source_evidence(
+    source: object, owner_ledger: object, repository: Path
+) -> dict:
+    """Resolve the signed source kind without accepting caller path substitution."""
+    if not isinstance(source, dict):
+        raise MatrixError("owner-approved source evidence is invalid")
+    common = {"schema", "kind", "path", "digest", "length", "version"}
+    if source.get("schema") == "engineering.owner-approved-bootstrap-source.v1":
+        expected = common | {"automation_id"}
+        if (
+            set(source) != expected
+            or source.get("kind") != "codex_automation_prompt"
+            or not isinstance(source.get("automation_id"), str)
+            or not source["automation_id"]
+        ):
+            raise MatrixError("owner-approved source evidence is invalid")
+        native = False
+    elif source.get("schema") == "engineering.owner-approved-bootstrap-source.v2":
+        expected = common | {"source_id"}
+        if (
+            set(source) != expected
+            or source.get("kind") != "codex_native_decision_receipt"
+            or not isinstance(source.get("source_id"), str)
+            or not source["source_id"]
+        ):
+            raise MatrixError("owner-approved source evidence is invalid")
+        native = True
+    else:
+        raise MatrixError("owner-approved source evidence is invalid")
+    if (
+        not isinstance(source.get("path"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source.get("digest", "")))
+        or not isinstance(source.get("length"), int)
+        or isinstance(source.get("length"), bool)
+        or source["length"] < 1
+        or not isinstance(source.get("version"), str)
+        or not source["version"]
+    ):
+        raise MatrixError("owner-approved source evidence is invalid")
+    repository = repository.resolve(strict=True)
+    source_path = Path(source["path"])
+    try:
+        if not source_path.is_absolute() or ".." in source_path.parts:
+            raise MatrixError("owner-approved source evidence is invalid")
+        _reject_host_reparse_ancestors(source_path)
+        source_path = source_path.resolve(strict=True)
+        if source_path.is_relative_to(repository):
+            raise MatrixError("owner-approved source evidence is candidate-controlled")
+        _verify_owner_private_path(source_path, directory=False)
+        source_bytes = source_path.read_bytes()
+    except OSError as error:
+        raise MatrixError("owner-approved source evidence is unavailable") from error
+    if (
+        str(source_path) != source["path"]
+        or len(source_bytes) != source["length"]
+        or _digest(source_bytes) != source["digest"]
+    ):
+        raise MatrixError("owner-approved source evidence is mismatched")
+    if native:
+        receipt = _validate_native_decision_source_receipt(
+            source_path, owner_ledger, repository
+        )
+        if receipt["decision_id"] != source["source_id"]:
+            raise MatrixError("owner-approved source evidence is mismatched")
+        return receipt
+    _validate_owner_source_projection(owner_ledger, source_bytes)
+    return {
+        "schema": source["schema"],
+        "kind": source["kind"],
+        "automation_id": source["automation_id"],
+    }
+
+
 def _normalize_requirements(value: object) -> list[dict]:
     """Compatibility helper retained for callers that only consume matrix rows."""
     return _normalize_registry(value)[0]
@@ -1028,18 +1319,6 @@ def _owner_approved_ledger(repository: Path, role: str) -> dict:
         or repository_ids.get(role) != _repository_identity(repository)
         or claims.get("ledger_digest") != _digest(ledger_bytes)
         or not isinstance(source, dict)
-        or set(source)
-        != {"schema", "kind", "automation_id", "path", "digest", "length", "version"}
-        or source.get("schema") != "engineering.owner-approved-bootstrap-source.v1"
-        or source.get("kind") != "codex_automation_prompt"
-        or not isinstance(source.get("automation_id"), str)
-        or not source["automation_id"]
-        or not isinstance(source.get("path"), str)
-        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source.get("digest", "")))
-        or not isinstance(source.get("length"), int)
-        or source["length"] < 1
-        or not isinstance(source.get("version"), str)
-        or not source["version"]
         or not isinstance(separation, dict)
         or set(separation)
         != {
@@ -1120,24 +1399,7 @@ def _owner_approved_ledger(repository: Path, role: str) -> dict:
         or not receipt["receipt_id"]
     ):
         raise MatrixError("owner-approved baseline host receipt is invalid")
-    source_path = Path(source["path"])
-    try:
-        if not source_path.is_absolute() or ".." in source_path.parts:
-            raise MatrixError("owner-approved source evidence is invalid")
-        _reject_host_reparse_ancestors(source_path)
-        resolved_source = source_path.resolve(strict=True)
-        if resolved_source.is_relative_to(repository):
-            raise MatrixError("owner-approved source evidence is candidate-controlled")
-        source_bytes = resolved_source.read_bytes()
-    except OSError as error:
-        raise MatrixError("owner-approved source evidence is unavailable") from error
-    if (
-        str(resolved_source) != source["path"]
-        or len(source_bytes) != source["length"]
-        or _digest(source_bytes) != source["digest"]
-    ):
-        raise MatrixError("owner-approved source evidence is mismatched")
-    _validate_owner_source_projection(ledger, source_bytes)
+    _resolve_owner_source_evidence(source, ledger, repository)
     material = _canonical(
         {
             "schema": "engineering.v2.2.6-owner-baseline-claims.v1",
