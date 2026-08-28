@@ -475,6 +475,25 @@ def _validate_native_record(
     return value, text
 
 
+def _native_owner_request(text: str) -> str:
+    """Remove only Codex's typed ambient-context wrapper from a user request."""
+    request = text.strip()
+    if request.startswith('<in-app-browser-context source="ambient-ui-state">'):
+        ambient = re.match(
+            r'\A<in-app-browser-context source="ambient-ui-state">\s*.*?\s*'
+            r"</in-app-browser-context>\s*",
+            request,
+            flags=re.DOTALL,
+        )
+        if ambient is None:
+            raise MatrixError("native decision source is not affirmatively linked")
+        request = request[ambient.end() :].strip()
+    heading = "## My request:"
+    if request.startswith(heading):
+        request = request[len(heading) :].strip()
+    return request
+
+
 def _validate_native_decision_source_receipt(
     receipt_path: Path, owner_ledger: object, repository: Path
 ) -> dict:
@@ -546,13 +565,38 @@ def _validate_native_decision_source_receipt(
     _, proposal_text = _validate_native_record(
         receipt["proposal"], source_path, "assistant"
     )
-    _validate_native_record(receipt["approval"], source_path, "user")
+    _, approval_text = _validate_native_record(
+        receipt["approval"], source_path, "user"
+    )
     if (
         receipt["proposal"]["line_number"] >= receipt["approval"]["line_number"]
         or _utc_instant(receipt["proposal"]["timestamp"])
         >= _utc_instant(receipt["approval"]["timestamp"])
     ):
         raise MatrixError("native decision source is ill-ordered")
+    decision_id = receipt["decision_id"]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,127}", decision_id):
+        raise MatrixError("native decision source is not affirmatively linked")
+    token = rf"(?<![A-Za-z0-9._-]){re.escape(decision_id)}(?![A-Za-z0-9._-])"
+    proposal_link = re.search(
+        rf"(?i)(?:recommendation:\s*)?approve\s+{token}", proposal_text
+    ) or re.search(
+        r"(?i)\brecommendation:\s+(?:explicitly\s+)?approve\b", proposal_text
+    )
+    approval = _native_owner_request(approval_text)
+    if (
+        proposal_link is None
+        or receipt["approval"]["excerpt"] != approval
+        or approval.casefold()
+        not in {
+            f"{decision_id} approved".casefold(),
+            f"approve {decision_id}".casefold(),
+            f"approved {decision_id}".casefold(),
+            f"yes, approve {decision_id}".casefold(),
+            f"yes: approve {decision_id}".casefold(),
+        }
+    ):
+        raise MatrixError("native decision source is not affirmatively linked")
     ledger_rows = _validate_owner_source_projection(owner_ledger)
     normalized_safeguards = []
     for safeguard in receipt["safeguards"]:
@@ -671,13 +715,7 @@ def _external_path(repository: Path, value: object, label: str) -> Path:
     path = Path(value)
     if not path.is_absolute() or ".." in path.parts:
         raise MatrixError(f"{label} path is invalid")
-    current = path
-    while True:
-        if current.exists() and current.is_symlink():
-            raise MatrixError(f"{label} path is invalid")
-        if current.parent == current:
-            break
-        current = current.parent
+    _reject_host_reparse_ancestors(path)
     resolved = path.resolve()
     try:
         resolved.relative_to(repository.resolve())
@@ -701,11 +739,13 @@ def _reference_bytes(repository: Path, evidence_root: Path, value: object, label
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("digest", "")))
     ):
         raise MatrixError(f"{label} reference is invalid")
-    evidence_root = Path(evidence_root).resolve()
+    evidence_root = _external_path(repository, evidence_root, "host evidence root")
     relative = PurePosixPath(value["path"])
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
         raise MatrixError(f"{label} reference is invalid")
-    path = (evidence_root / Path(*relative.parts)).resolve()
+    path = _external_path(
+        repository, evidence_root / Path(*relative.parts), label
+    )
     try:
         path.relative_to(evidence_root)
     except ValueError as error:

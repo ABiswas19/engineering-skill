@@ -100,7 +100,11 @@ _WINDOWS_ACL_QUERY = r"""
 param([Parameter(Mandatory=$true)][string]$path)
 $ErrorActionPreference = 'Stop'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$acl = Get-Acl -LiteralPath $path
+$acl = if ([System.IO.Directory]::Exists($path)) {
+    [System.IO.DirectoryInfo]::new($path).GetAccessControl()
+} else {
+    [System.IO.FileInfo]::new($path).GetAccessControl()
+}
 $ownerSid = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate(
     [System.Security.Principal.SecurityIdentifier]
 ).Value
@@ -142,6 +146,12 @@ def _native_powershell() -> Path:
     return executable
 
 
+def _native_powershell_environment(executable: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["PSModulePath"] = str(executable.parent / "Modules")
+    return environment
+
+
 def verify_owner_private(path: Path, *, directory: bool) -> None:
     path = Path(path)
     reject_reparse_ancestors(path)
@@ -156,9 +166,10 @@ def verify_owner_private(path: Path, *, directory: bool) -> None:
             raise HostBoundaryError("host path is not owner-private")
         return
     try:
+        executable = _native_powershell()
         result = subprocess.run(
             [
-                str(_native_powershell()),
+                str(executable),
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
@@ -167,6 +178,7 @@ def verify_owner_private(path: Path, *, directory: bool) -> None:
             ],
             capture_output=True,
             text=True,
+            env=_native_powershell_environment(executable),
             timeout=30,
             check=False,
         )

@@ -118,6 +118,23 @@ digest-mismatched source evidence fails closed. The owner-baseline signature
 binds the receipt digest and source kind; rendering or validating the receipt
 does not mint owner authority.
 
+The stable decision ID is also a semantic join key, not merely metadata. The
+proposal must explicitly recommend approval, either naming that exact ID or
+binding the complete nine exact safeguard spans; the later owner message must
+consist of one unambiguous affirmative approval of the same ID. The validator
+may discard only Codex's typed `ambient-ui-state` block and
+the `My request` transport heading before comparing the complete owner request
+to the signed approval excerpt. A denial, question, unrelated follow-up,
+changed decision ID, scope change, or approval excerpt that hides other request
+text fails closed even when every byte span and digest is internally
+consistent.
+
+Every host-supplied release-matrix input, including the evidence root,
+execution envelope, referenced logs and metadata, audit reports, native
+decision receipt, and native session, crosses the shared OS-bound host-path
+validator before resolution or reading. A symlink, Windows junction, mount
+point, or other reparse ancestor therefore cannot redirect trusted evidence.
+
 Root prepares the generic receipt from an owner-private manifest and native
 session with:
 

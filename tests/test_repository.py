@@ -102,10 +102,11 @@ class RepositoryContractTests(unittest.TestCase):
     def write_native_decision_source(
         self, directory: Path, ledger: dict
     ) -> tuple[Path, dict]:
-        proposal_text = "Recommendation: approve " + "; ".join(
+        decision_id = "native-decision-fixture"
+        proposal_text = f"Recommendation: approve {decision_id}; " + "; ".join(
             row["source_excerpt"] for row in ledger["source_requirements"]
         )
-        approval_text = "2.2.6 approved"
+        approval_text = f"{decision_id} approved"
         proposal = {
             "timestamp": "2026-08-28T01:09:08.125Z",
             "type": "response_item",
@@ -172,7 +173,7 @@ class RepositoryContractTests(unittest.TestCase):
             )
         receipt = {
             "schema": "engineering.owner-approved-native-decision-source.v1",
-            "decision_id": "native-decision-fixture",
+            "decision_id": decision_id,
             "lifecycle_state": "OWNER_APPROVED",
             "native_source": {
                 "schema": "engineering.native-codex-session-jsonl.v1",
@@ -560,6 +561,23 @@ class RepositoryContractTests(unittest.TestCase):
             with self.assertRaisesRegex(module.MatrixError, "owner-private"):
                 module._verify_owner_private_path(weak, directory=False)
 
+    def test_v226_host_boundary_loads_native_acl_module_without_profile_state(self) -> None:
+        script = ROOT / ".agents" / "skills" / "engineering" / "scripts" / "engineering_host_boundary.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_host_boundary_acl", script
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertIn("[System.IO.DirectoryInfo]", module._WINDOWS_ACL_QUERY)
+        self.assertIn("[System.IO.FileInfo]", module._WINDOWS_ACL_QUERY)
+        self.assertNotIn("Get-Acl", module._WINDOWS_ACL_QUERY)
+        executable = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        environment = module._native_powershell_environment(executable)
+        self.assertEqual(
+            str(executable.parent / "Modules"), environment["PSModulePath"]
+        )
+        self.assertNotIn("codex-runtimes", environment["PSModulePath"].casefold())
+
     def test_v226_owner_baseline_cli_only_validates_external_owner_projection(self) -> None:
         tool = ROOT / "tools" / "v226_owner_baseline.py"
         missing = subprocess.run(
@@ -691,6 +709,155 @@ class RepositoryContractTests(unittest.TestCase):
                         module._validate_native_decision_source_receipt(
                             receipt_path, ledger, ROOT
                         )
+
+    def test_v226_native_decision_source_requires_exact_affirmative_linkage(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_decision_semantics", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        decisions = (
+            "No, do not approve native-decision-fixture.",
+            "Maybe native-decision-fixture approved?",
+            "Thanks for the update about native-decision-fixture.",
+            "different-decision approved",
+            "native-decision-fixture approved, but use a changed scope",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            session, original = self.write_native_decision_source(directory, ledger)
+            for index, decision in enumerate(decisions):
+                with self.subTest(decision=decision):
+                    receipt = json.loads(json.dumps(original))
+                    lines = session.read_bytes().splitlines()
+                    approval = json.loads(lines[1].decode("utf-8"))
+                    approval["payload"]["content"][0]["text"] = decision
+                    lines[1] = json.dumps(
+                        approval, separators=(",", ":"), ensure_ascii=False
+                    ).encode("utf-8")
+                    session.write_bytes(b"\n".join(lines) + b"\n")
+                    source_bytes = session.read_bytes()
+                    receipt["native_source"]["digest"] = module._digest(source_bytes)
+                    receipt["native_source"]["length"] = len(source_bytes)
+                    excerpt = decision.encode("utf-8")
+                    receipt["approval"].update(
+                        excerpt=decision,
+                        excerpt_digest=module._digest(excerpt),
+                        excerpt_utf8_span={"start": 0, "end": len(excerpt)},
+                        raw_line_digest=module._digest(lines[1]),
+                    )
+                    receipt_path = directory / f"semantic-{index}.json"
+                    receipt_path.write_bytes(module._canonical(receipt))
+                    with (
+                        patch.object(module, "_verify_owner_private_path", return_value=None),
+                        self.assertRaisesRegex(module.MatrixError, "affirmative|linked"),
+                    ):
+                        module._validate_native_decision_source_receipt(
+                            receipt_path, ledger, ROOT
+                        )
+
+    def test_v226_native_decision_source_accepts_host_ambient_context_outside_request(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_decision_ambient", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            session, receipt = self.write_native_decision_source(directory, ledger)
+            lines = session.read_bytes().splitlines()
+            proposal = json.loads(lines[0].decode("utf-8"))
+            proposal_text = (
+                "Recommendation: explicitly approve the nine missing Engineering "
+                "release safeguards—"
+                + "; ".join(
+                    row["source_excerpt"] for row in ledger["source_requirements"]
+                )
+            )
+            proposal["payload"]["content"][0]["text"] = proposal_text
+            lines[0] = json.dumps(
+                proposal, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            approval = json.loads(lines[1].decode("utf-8"))
+            decision = receipt["approval"]["excerpt"]
+            approval_text = (
+                '<in-app-browser-context source="ambient-ui-state">\n'
+                "Ambient product state; not part of the user request.\n"
+                "</in-app-browser-context>\n\n"
+                "## My request:\n"
+                f"{decision}\n"
+            )
+            approval["payload"]["content"][0]["text"] = approval_text
+            lines[1] = json.dumps(
+                approval, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            session.write_bytes(b"\n".join(lines) + b"\n")
+            source_bytes = session.read_bytes()
+            receipt["native_source"].update(
+                digest=module._digest(source_bytes), length=len(source_bytes)
+            )
+            proposal_bytes = proposal_text.encode("utf-8")
+            receipt["proposal"].update(
+                excerpt=proposal_text,
+                excerpt_digest=module._digest(proposal_bytes),
+                excerpt_utf8_span={"start": 0, "end": len(proposal_bytes)},
+                raw_line_digest=module._digest(lines[0]),
+            )
+            for row in receipt["safeguards"]:
+                excerpt_bytes = row["source_excerpt"].encode("utf-8")
+                start = proposal_bytes.index(excerpt_bytes)
+                row["proposal_excerpt_utf8_span"] = {
+                    "start": start,
+                    "end": start + len(excerpt_bytes),
+                }
+            excerpt = decision.encode("utf-8")
+            start = approval_text.encode("utf-8").index(excerpt)
+            receipt["approval"].update(
+                excerpt_digest=module._digest(excerpt),
+                excerpt_utf8_span={"start": start, "end": start + len(excerpt)},
+                raw_line_digest=module._digest(lines[1]),
+            )
+            receipt_path = directory / "ambient-decision.json"
+            receipt_path.write_bytes(module._canonical(receipt))
+            with patch.object(module, "_verify_owner_private_path", return_value=None):
+                resolved = module._validate_native_decision_source_receipt(
+                    receipt_path, ledger, ROOT
+                )
+        self.assertEqual("native-decision-fixture", resolved["decision_id"])
+
+    def test_v226_external_evidence_paths_use_shared_reparse_boundary(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_external_reparse", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_root = Path(temporary).resolve() / "junction-evidence-root"
+            evidence_root.mkdir()
+            child = evidence_root / "meta.json"
+            child.write_bytes(b"{}")
+
+            def reject_root(path: Path, boundary: Path | None = None) -> None:
+                if Path(path) == evidence_root:
+                    raise module.HostBoundaryError("junction/reparse boundary")
+
+            with (
+                patch.object(
+                    module, "_shared_reject_reparse_ancestors", side_effect=reject_root
+                ),
+                self.assertRaisesRegex(module.MatrixError, "junction/reparse"),
+            ):
+                module._reference_bytes(
+                    ROOT,
+                    evidence_root,
+                    {"path": "meta.json", "digest": module._digest(b"{}")},
+                    "native meta",
+                )
 
     def test_v226_native_decision_source_rejects_session_or_candidate_control(self) -> None:
         tool = ROOT / "tools" / "v226_release_matrix.py"
