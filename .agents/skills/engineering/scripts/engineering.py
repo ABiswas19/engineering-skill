@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,8 @@ try:
     from engineering_host_boundary import (
         HostBoundaryError,
         canonical_host_home as _shared_canonical_host_home,
+        native_powershell as _shared_native_powershell,
+        native_powershell_environment as _shared_native_powershell_environment,
     )
 finally:
     sys.path.remove(_SCRIPT_DIRECTORY)
@@ -9931,9 +9934,16 @@ $result = @{
 
 def _windows_owner_private(path: Path, *, enforce: bool) -> None:
     directory = path.is_dir()
+    try:
+        executable = _shared_native_powershell()
+        environment = _shared_native_powershell_environment(executable)
+    except (HostBoundaryError, OSError) as error:
+        raise EngineeringError(
+            "Engineering controller owner-private ACL verification failed."
+        ) from error
     result = subprocess.run(
         [
-            "powershell.exe",
+            str(executable),
             "-NoProfile",
             "-NonInteractive",
             "-Command",
@@ -9944,6 +9954,7 @@ def _windows_owner_private(path: Path, *, enforce: bool) -> None:
         ],
         capture_output=True,
         text=True,
+        env=environment,
         timeout=30,
         check=False,
     )
@@ -11871,6 +11882,65 @@ def _retained_owner_intent(root: Path, intent_id: str, intent_digest: str) -> di
     return dict(matches[0])
 
 
+def _owner_mapping_reference(
+    root: Path, commit: str, reference: dict, *, kind: str
+) -> None:
+    """Resolve one semantic mapping reference from the exact committed artifact."""
+    path = reference["path"]
+    try:
+        content = _git_blob_bytes(root, commit, path)
+        text = content.decode("utf-8")
+    except (EngineeringError, UnicodeDecodeError) as error:
+        raise EngineeringError(
+            "Engineering owner intent import mapping reference is unavailable."
+        ) from error
+    if kind == "design":
+        section = reference["section"].strip()
+        if not any(
+            re.fullmatch(rf"#{{1,6}}\s+{re.escape(section)}\s*", line.strip())
+            for line in text.splitlines()
+        ):
+            raise EngineeringError(
+                "Engineering owner intent import mapping design reference is invalid."
+            )
+        return
+    if kind == "contract":
+        interface = reference["interface"].strip()
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise EngineeringError(
+                "Engineering owner intent import mapping contract reference is invalid."
+            ) from error
+
+        def contains(value: object) -> bool:
+            if isinstance(value, dict):
+                return any(contains(item) for item in value.values())
+            if isinstance(value, list):
+                return any(contains(item) for item in value)
+            return value == interface
+
+        if not contains(document):
+            raise EngineeringError(
+                "Engineering owner intent import mapping contract reference is invalid."
+            )
+        return
+    selector = reference["selector"].strip().split(".")[-1]
+    try:
+        parsed = ast.parse(text, filename=path)
+    except SyntaxError as error:
+        raise EngineeringError(
+            "Engineering owner intent import mapping test reference is invalid."
+        ) from error
+    if not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == selector
+        for node in ast.walk(parsed)
+    ):
+        raise EngineeringError(
+            "Engineering owner intent import mapping test reference is invalid."
+        )
+
+
 def _owner_intent_import(
     root: Path, value: object, *, allow_historical_intent: bool = False
 ) -> dict:
@@ -11954,6 +12024,7 @@ def _owner_intent_import(
     mapped_ids: set[str] = set()
     mapping_expected = {
         "outcome_id",
+        "outcome_statement_digest",
         "lifecycle_state",
         "design",
         "contract",
@@ -11964,6 +12035,7 @@ def _owner_intent_import(
     }
     current_commit = _identity_git(root, "rev-parse", "HEAD")
     current_tree = _identity_git(root, "rev-parse", "HEAD^{tree}")
+    outcomes_by_id = {item["id"]: item for item in intent["outcomes"]}
     for mapping in mappings:
         if not isinstance(mapping, dict) or set(mapping) != mapping_expected:
             raise EngineeringError("Engineering owner intent import outcome mapping is invalid.")
@@ -11974,6 +12046,7 @@ def _owner_intent_import(
         evidence = mapping.get("required_evidence")
         artifact = mapping.get("exact_artifact")
         runtime_behavior = mapping.get("runtime_behavior")
+        outcome = outcomes_by_id.get(outcome_id)
         path_fields = (
             (design, {"path", "section"}),
             (contract, {"path", "interface"}),
@@ -11983,6 +12056,8 @@ def _owner_intent_import(
             not isinstance(outcome_id, str)
             or outcome_id not in expected_outcomes
             or outcome_id in mapped_ids
+            or not isinstance(outcome, dict)
+            or mapping.get("outcome_statement_digest") != outcome.get("statement_digest")
             or mapping.get("lifecycle_state") != "DESIGN_MAPPED"
             or any(
                 not isinstance(item, dict)
@@ -12006,6 +12081,7 @@ def _owner_intent_import(
             or not isinstance(evidence, dict)
             or set(evidence) != {"class", "interface", "environment"}
             or evidence.get("class") not in {"end_to_end", "real_outcome"}
+            or evidence not in outcome.get("required_evidence", [])
             or any(
                 not isinstance(evidence.get(name), str)
                 or not evidence[name].strip()
@@ -12027,6 +12103,9 @@ def _owner_intent_import(
             )
         ):
             raise EngineeringError("Engineering owner intent import outcome mapping is invalid.")
+        _owner_mapping_reference(root, current_commit, design, kind="design")
+        _owner_mapping_reference(root, current_commit, contract, kind="contract")
+        _owner_mapping_reference(root, current_commit, negative_test, kind="test")
         mapped_ids.add(outcome_id)
         normalized_mappings.append(dict(mapping))
     normalized_mappings.sort(key=lambda item: item["outcome_id"])

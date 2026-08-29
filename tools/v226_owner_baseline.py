@@ -72,7 +72,7 @@ def render_ledger(
     if (
         isinstance(source_value, dict)
         and source_value.get("schema")
-        == "engineering.owner-approved-native-decision-source.v1"
+        == "engineering.owner-approved-native-decision-source.v2"
     ):
         MATRIX._validate_native_decision_source_receipt(
             source_path, ledger, internal_root
@@ -126,7 +126,7 @@ def render_material(arguments: argparse.Namespace) -> dict:
     is_native = (
         isinstance(source_value, dict)
         and source_value.get("schema")
-        == "engineering.owner-approved-native-decision-source.v1"
+        == "engineering.owner-approved-native-decision-source.v2"
     )
     if requested_kind == "codex_native_decision_receipt" and not is_native:
         raise MATRIX.MatrixError("native decision source is invalid")

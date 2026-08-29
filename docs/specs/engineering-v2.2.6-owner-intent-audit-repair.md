@@ -132,7 +132,7 @@ repository, epoch, digest, all outcome IDs, and both required coverage scopes:
 compact private receipt separately from the owner-intent ledger.
 
 `dependent-dispatch-status` is a read-only gate. It cannot dispatch anything;
-it only fails closed until a complete import exists. The v0.6.1 and frontend
+it only fails closed until a complete import exists. The successor release and frontend
 lanes must use that generic product-release/accepted-owner-outcome gate after
 their separately authorized work begins. This preserves the capability to
 enforce the owner decision without changing those lanes now.

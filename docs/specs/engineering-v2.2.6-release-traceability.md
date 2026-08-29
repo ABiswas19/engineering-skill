@@ -26,7 +26,7 @@ identity; measurement; first-pass incidents; false-acceptance prevention;
 graph engineering; README truth; and explicit Langfuse deferment. After the
 separate v2.2.6 activation boundary it also covers the completeness import,
 all-owner-outcome release enforcement, real Codex and Claude harness proof,
-v0.6.1, CTAO, governed direct consumers, Decision Studio, headless product work,
+successor runtime, capability API, governed direct consumers, external consumers, unified product work,
 remaining plugin-independent frontend work, and the full consumer release gate.
 No populated outcome, private heartbeat content, or owner identity is stored in
 this shared ledger.
@@ -76,10 +76,10 @@ ENGINEERING_USER_HOME, and require owner-private non-reparse trust material.
 
 ## External consumer authority and non-impersonation
 
-Decision Studio acceptance remains an external owner receipt. Engineering may
+External-consumer acceptance remains an external owner receipt. Engineering may
 verify its exact repository, epoch, contract, environment, and evidence but may
 not create, replace, or impersonate that authority. The named direct-consumer
-CTAO correction is a separate accepted slice before broader local-consumer
+Named consumer-contract correction is a separate accepted slice before broader consumer
 or frontend release work. Both remain unbound post-activation obligations in
 this source candidate rather than claims of implemented product behavior.
 
@@ -135,7 +135,7 @@ live at a host-owned private boundary outside candidate Git and survive restart.
 
 Immediately after activation, every recorded approved outcome category,
 including product releases and other accepted owner outcomes, must be imported,
-bound, and completeness-checked before v0.6.1, frontend, plugin, headless, or
+bound, and completeness-checked before successor-runtime, frontend, plugin, unified-product, or
 other downstream implementation dispatch. Every active outcome has one signed
 `DESIGN_MAPPED` row binding its design section, schema/API interface, runtime
 behavior, negative test, required native or served evidence contract, and

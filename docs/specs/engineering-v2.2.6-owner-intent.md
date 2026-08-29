@@ -114,7 +114,7 @@ After activation, `intent-bind` and `intent-import` bind the recorded
 `OWNER_APPROVED` baseline and prove coverage for both `accepted_owner_outcomes`
 and `product_releases`. A read-only dependent-dispatch gate fails closed until
 that import is complete. That contract applies to every accepted owner outcome
-and every product release; later v0.6.1 and frontend work must consume it when
+and every product release; later successor-runtime and frontend work must consume it when
 separately authorized, without this Engineering repair dispatching or changing
 them.
 

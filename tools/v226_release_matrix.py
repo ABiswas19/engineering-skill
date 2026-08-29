@@ -46,7 +46,7 @@ V226_REQUIRED_REQUIREMENTS = (
     "adjacent_tool_comparison_gate",
     "authenticated_execution_envelopes",
     "deterministic_release_matrix",
-    "decision_studio_external_authority",
+    "external_consumer_authority",
     "exact_release_install_binding",
     "external_owner_authority",
     "external_owner_source_projection",
@@ -59,7 +59,7 @@ V226_REQUIRED_REQUIREMENTS = (
     "independent_exact_artifact_acceptance",
     "intent_digest_continuity",
     "model_routing_disclosure",
-    "manage_kaka_consumer_correction",
+    "named_consumer_contract_correction",
     "native_harness_real_outcome_gate",
     "noncircular_bootstrap",
     "outcome_survival_baseline",
@@ -102,16 +102,74 @@ V226_REQUIRED_OBLIGATIONS = (
     "all_owner_outcome_release_enforcement",
     "native_codex_claude_harness_proof",
     "adjacent_orchestrator_comparison",
-    "v061_runtime_delivery",
-    "ctao_observability_api",
-    "manage_kaka_consumer_correction",
-    "kaka_consumer_integration",
-    "decision_studio_external_receipt",
-    "decision_studio_consumer_integration",
-    "headless_unified_product",
+    "successor_runtime_delivery",
+    "capability_observability_api",
+    "named_consumer_contract_correction",
+    "primary_consumer_integration",
+    "external_consumer_owner_receipt",
+    "external_consumer_integration",
+    "unified_product",
     "remaining_plugin_independent_frontend",
     "full_consumer_release_gate",
 )
+OWNER_LEDGER_FIELDS = {
+    "schema",
+    "source_requirements",
+    "pending_requirements",
+    "pending_obligations",
+    "requirements",
+    "obligations",
+}
+OWNER_SOURCE_SUPPORT = {
+    "OWNER-V226-AUTHENTICATED-RUN-RECEIPTS": {
+        "excerpt": "authenticated run receipts",
+        "requirements": {"authenticated_execution_envelopes"},
+        "obligations": {"first_pass_incident_preservation"},
+    },
+    "OWNER-V226-EXACT-SOURCE-INSTALL": {
+        "excerpt": "exact source/install",
+        "requirements": {"exact_release_install_binding"},
+        "obligations": set(),
+    },
+    "OWNER-V226-GIT-OBJECT-BINDING": {
+        "excerpt": "Git-object binding",
+        "requirements": {"git_object_byte_identity"},
+        "obligations": set(),
+    },
+    "OWNER-V226-INDEPENDENT-EQUIVALENCE": {
+        "excerpt": "independent equivalence review",
+        "requirements": {"independent_equivalence"},
+        "obligations": set(),
+    },
+    "OWNER-V226-MODEL-ROUTING-DISCLOSURE": {
+        "excerpt": "full model-routing disclosure",
+        "requirements": {"model_routing_disclosure"},
+        "obligations": set(),
+    },
+    "OWNER-V226-TRANSACTIONAL-PREIMAGES": {
+        "excerpt": "transactional preimage checks",
+        "requirements": {"transactional_install_preimages"},
+        "obligations": set(),
+    },
+    "OWNER-V226-PREVIEW-FIRST-SETUP": {
+        "excerpt": "preview-first setup",
+        "requirements": set(),
+        "obligations": {"project_setup_preview_authority"},
+    },
+    "OWNER-V226-BOUNDED-VERIFIED-MAINTENANCE": {
+        "excerpt": "bounded verified maintenance",
+        "requirements": set(),
+        "obligations": {"bounded_maintenance"},
+    },
+    "OWNER-V226-EXTERNAL-CONSUMER": {
+        "excerpt": None,
+        "requirements": {"external_consumer_authority"},
+        "obligations": {
+            "external_consumer_owner_receipt",
+            "external_consumer_integration",
+        },
+    },
+}
 
 
 def _canonical(value: object) -> bytes:
@@ -182,11 +240,12 @@ def _normalize_registry(
     ids = [row.get("id") for row in rows if isinstance(row, dict)]
     if (
         not isinstance(owner_ledger, dict)
-        or set(owner_ledger)
-        != {"schema", "source_requirements", "requirements", "obligations"}
+        or set(owner_ledger) != OWNER_LEDGER_FIELDS
         or owner_ledger.get("schema")
         != "engineering.v2.2.6-owner-approved-ledger.v2"
         or not isinstance(owner_ledger.get("source_requirements"), list)
+        or not isinstance(owner_ledger.get("pending_requirements"), list)
+        or not isinstance(owner_ledger.get("pending_obligations"), list)
         or not isinstance(owner_ledger.get("requirements"), list)
         or not isinstance(owner_ledger.get("obligations"), list)
     ):
@@ -304,6 +363,8 @@ def _validate_owner_source_projection(
         or not isinstance(owner_ledger.get("obligations"), list)
         or not isinstance(owner_ledger.get("source_requirements"), list)
         or not owner_ledger["source_requirements"]
+        or not isinstance(owner_ledger.get("pending_requirements"), list)
+        or not isinstance(owner_ledger.get("pending_obligations"), list)
     ):
         raise MatrixError("external owner source projection is invalid")
     requirement_ids = [
@@ -342,8 +403,6 @@ def _validate_owner_source_projection(
             or not row["source_excerpt"].strip()
             or not isinstance(row.get("requirement_ids"), list)
             or not isinstance(row.get("obligation_ids"), list)
-            or not row["requirement_ids"]
-            or not row["obligation_ids"]
             or len(row["requirement_ids"]) != len(set(row["requirement_ids"]))
             or len(row["obligation_ids"]) != len(set(row["obligation_ids"]))
             or any(not isinstance(item, str) or not item for item in row["requirement_ids"])
@@ -351,19 +410,52 @@ def _validate_owner_source_projection(
         ):
             raise MatrixError("external owner source projection is invalid")
         excerpt_bytes = row["source_excerpt"].encode("utf-8")
+        support = OWNER_SOURCE_SUPPORT.get(row["source_requirement_id"])
         if row.get("statement_digest") != _digest(excerpt_bytes):
             raise MatrixError("external owner source projection is invalid")
+        if support is None:
+            if row["requirement_ids"] or row["obligation_ids"]:
+                raise MatrixError("external owner source projection is semantically invalid")
+        elif (
+            (support["excerpt"] is not None and row["source_excerpt"] != support["excerpt"])
+            or not set(row["requirement_ids"]).issubset(support["requirements"])
+            or not set(row["obligation_ids"]).issubset(support["obligations"])
+        ):
+            raise MatrixError("external owner source projection is semantically invalid")
         if source_bytes is not None and source_bytes.count(excerpt_bytes) != 1:
             raise MatrixError("external owner source projection is mismatched")
         source_ids.add(row["source_requirement_id"])
         mapped_requirements.extend(row["requirement_ids"])
         mapped_obligations.extend(row["obligation_ids"])
         normalized.append(dict(row))
+    def pending_ids(rows: object) -> list[str]:
+        if not isinstance(rows, list):
+            raise MatrixError("external owner source projection pending state is invalid")
+        values = []
+        for item in rows:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"id", "state", "reason"}
+                or not isinstance(item.get("id"), str)
+                or item.get("state") != "pending"
+                or not isinstance(item.get("reason"), str)
+                or not item["reason"].strip()
+            ):
+                raise MatrixError("external owner source projection pending state is invalid")
+            values.append(item["id"])
+        return values
+
+    pending_requirements = pending_ids(owner_ledger["pending_requirements"])
+    pending_obligations = pending_ids(owner_ledger["pending_obligations"])
     if (
-        sorted(mapped_requirements) != sorted(requirement_ids)
-        or len(mapped_requirements) != len(set(mapped_requirements))
-        or sorted(mapped_obligations) != sorted(obligation_ids)
+        len(mapped_requirements) != len(set(mapped_requirements))
         or len(mapped_obligations) != len(set(mapped_obligations))
+        or len(pending_requirements) != len(set(pending_requirements))
+        or len(pending_obligations) != len(set(pending_obligations))
+        or set(mapped_requirements) & set(pending_requirements)
+        or set(mapped_obligations) & set(pending_obligations)
+        or sorted(mapped_requirements + pending_requirements) != sorted(requirement_ids)
+        or sorted(mapped_obligations + pending_obligations) != sorted(obligation_ids)
     ):
         raise MatrixError("external owner source projection is incomplete or conflicting")
     return normalized
@@ -521,6 +613,7 @@ def _validate_native_decision_source_receipt(
         "native_source",
         "proposal",
         "approval",
+        "proposal_binding",
         "safeguards",
     }
     source = receipt.get("native_source") if isinstance(receipt, dict) else None
@@ -528,7 +621,7 @@ def _validate_native_decision_source_receipt(
         not isinstance(receipt, dict)
         or set(receipt) != expected
         or receipt.get("schema")
-        != "engineering.owner-approved-native-decision-source.v1"
+        != "engineering.owner-approved-native-decision-source.v2"
         or not isinstance(receipt.get("decision_id"), str)
         or not receipt["decision_id"]
         or receipt.get("lifecycle_state") != "OWNER_APPROVED"
@@ -577,16 +670,40 @@ def _validate_native_decision_source_receipt(
     decision_id = receipt["decision_id"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,127}", decision_id):
         raise MatrixError("native decision source is not affirmatively linked")
-    token = rf"(?<![A-Za-z0-9._-]){re.escape(decision_id)}(?![A-Za-z0-9._-])"
-    proposal_link = re.search(
-        rf"(?i)(?:recommendation:\s*)?approve\s+{token}", proposal_text
-    ) or re.search(
-        r"(?i)\brecommendation:\s+(?:explicitly\s+)?approve\b", proposal_text
+    binding = receipt.get("proposal_binding")
+    ledger_rows = _validate_owner_source_projection(owner_ledger)
+    binding_expected = {
+        "decision_id",
+        "proposal_line_number",
+        "proposal_message_id",
+        "proposal_turn_id",
+        "safeguard_projection_digest",
+    }
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != binding_expected
+        or binding.get("decision_id") != decision_id
+        or binding.get("proposal_line_number")
+        != receipt["proposal"]["line_number"]
+        or binding.get("proposal_message_id")
+        != receipt["proposal"]["message_id"]
+        or binding.get("proposal_turn_id") != receipt["proposal"]["turn_id"]
+        or binding.get("safeguard_projection_digest")
+        != _digest(_canonical(ledger_rows))
+    ):
+        raise MatrixError("native decision source is not affirmatively linked")
+    proposal_candidates = re.findall(
+        r"(?i)\brecommendation:\s+(?:explicitly\s+)?approve(?:\s+"
+        r"([A-Za-z0-9][A-Za-z0-9._-]{2,127}))?",
+        proposal_text,
     )
+    if len(proposal_candidates) != 1 or (
+        proposal_candidates[0] and proposal_candidates[0] != decision_id
+    ):
+        raise MatrixError("native decision source is not affirmatively linked")
     approval = _native_owner_request(approval_text)
     if (
-        proposal_link is None
-        or receipt["approval"]["excerpt"] != approval
+        receipt["approval"]["excerpt"] != approval
         or approval.casefold()
         not in {
             f"{decision_id} approved".casefold(),
@@ -597,7 +714,6 @@ def _validate_native_decision_source_receipt(
         }
     ):
         raise MatrixError("native decision source is not affirmatively linked")
-    ledger_rows = _validate_owner_source_projection(owner_ledger)
     normalized_safeguards = []
     for safeguard in receipt["safeguards"]:
         if not isinstance(safeguard, dict):
@@ -1298,10 +1414,11 @@ def _owner_approved_ledger(repository: Path, role: str) -> dict:
         raise MatrixError("owner-approved baseline trust anchor is invalid")
     if (
         not isinstance(ledger, dict)
-        or set(ledger)
-        != {"schema", "source_requirements", "requirements", "obligations"}
+        or set(ledger) != OWNER_LEDGER_FIELDS
         or ledger.get("schema") != "engineering.v2.2.6-owner-approved-ledger.v2"
         or not isinstance(ledger.get("source_requirements"), list)
+        or not isinstance(ledger.get("pending_requirements"), list)
+        or not isinstance(ledger.get("pending_obligations"), list)
         or not isinstance(ledger.get("requirements"), list)
         or not isinstance(ledger.get("obligations"), list)
     ):

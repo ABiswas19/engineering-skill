@@ -119,7 +119,7 @@ Return an admission fact only when the latest import covers `accepted_owner_outc
 
 - [x] **Step 3: Run import tests to verify green**
 
-Run: `python .agents/skills/engineering/tests/test_engineering.py Task11OwnerIntentContractTests.test_postactivation_import_is_required_before_v061_or_frontend_dispatch Task11OwnerIntentContractTests.test_postactivation_import_and_dependent_status_cli_dispatch_exact_inputs`
+Run: `python .agents/skills/engineering/tests/test_engineering.py Task11OwnerIntentContractTests.test_postactivation_import_is_required_before_successor_or_frontend_dispatch Task11OwnerIntentContractTests.test_postactivation_import_and_dependent_status_cli_dispatch_exact_inputs`
 
 Expected: PASS, including both pre-import rejection and post-import read-only admission.
 

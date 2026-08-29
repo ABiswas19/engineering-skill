@@ -248,7 +248,7 @@ class SkillShapeTests(unittest.TestCase):
             )
         )
         self.assertRegex(distributable, r"requested.{0,40}actual.{0,40}fallback")
-        for forbidden in ("Luna Max", "Terra High", "Decision Studio", "top_level_project_task", "root_task"):
+        for forbidden in ("Luna Max", "Terra High", "Populated Consumer", "top_level_project_task", "root_task"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, distributable)
 
@@ -8715,7 +8715,16 @@ class Task7ContractTests(unittest.TestCase):
         ):
             self.real_owner_private(target)
         self.assertEqual(1, run.call_count)
-        self.assertEqual("powershell.exe", run.call_args.args[0][0])
+        executable = Path(run.call_args.args[0][0])
+        self.assertTrue(executable.is_absolute())
+        self.assertEqual("powershell.exe", executable.name.casefold())
+        self.assertEqual(
+            str(executable.parent / "Modules"),
+            run.call_args.kwargs["env"]["PSModulePath"],
+        )
+        self.assertNotIn("PATH", {
+            key.upper(): value for key, value in run.call_args.kwargs["env"].items()
+        })
         self.assertEqual(str(target), run.call_args.args[0][-3])
         self.assertEqual("1", run.call_args.args[0][-2])
         self.assertEqual("0", run.call_args.args[0][-1])
@@ -12926,6 +12935,21 @@ class Task10ContractTests(unittest.TestCase):
             encoding="ascii",
         )
         (self.root / "README.md").write_text("# Authority fixture\n", encoding="utf-8")
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "spec.md").write_text(
+            "# Outcome design\n\nThe downstream lane remains blocked until exact evidence is current.\n",
+            encoding="utf-8",
+        )
+        (self.root / "schema").mkdir()
+        (self.root / "schema" / "outcome.json").write_text(
+            json.dumps({"interfaces": [{"id": "native outcome interface"}]}),
+            encoding="utf-8",
+        )
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_outcome.py").write_text(
+            "def test_missing_evidence_blocks():\n    pass\n",
+            encoding="utf-8",
+        )
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
         subprocess.run(
             ["git", "-C", str(self.root), "commit", "-m", "initial"],
@@ -13989,6 +14013,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
         mappings = [
             {
                 "outcome_id": item["id"],
+                "outcome_statement_digest": item["statement_digest"],
                 "lifecycle_state": "DESIGN_MAPPED",
                 "design": {"path": "docs/spec.md", "section": "Outcome design"},
                 "contract": {
@@ -14000,11 +14025,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                     "path": "tests/test_outcome.py",
                     "selector": "test_missing_evidence_blocks",
                 },
-                "required_evidence": {
-                    "class": "real_outcome",
-                    "interface": "native_harness",
-                    "environment": "candidate",
-                },
+                "required_evidence": item["required_evidence"][0],
                 "exact_artifact": artifact,
             }
             for item in intent["outcomes"]
@@ -14581,7 +14602,7 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 with self.assertRaisesRegex(module.EngineeringError, label):
                     module.bind_owner_intent(self.root, binding, approval)
 
-    def test_postactivation_import_is_required_before_v061_or_frontend_dispatch(self):
+    def test_postactivation_import_is_required_before_successor_or_frontend_dispatch(self):
         """No downstream product-release or owner-outcome admission precedes import."""
         module = self.module()
         binding = self.owner_intent_binding()
@@ -14642,6 +14663,82 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 module.import_owner_intent(
                     self.root, value, self.owner_intent_import_approval(value)
                 )
+
+    def test_postactivation_import_rejects_unresolvable_design_contract_and_test_references(self):
+        """Plausible-looking caller strings are not exact-artifact evidence."""
+        module = self.module()
+        binding = self.owner_intent_binding()
+        intent = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        imported = self.owner_intent_import(intent)
+        imported["outcome_mappings"][0]["design"] = {
+            "path": "docs/invented-spec.md",
+            "section": "Invented outcome design",
+        }
+        imported["outcome_mappings"][0]["contract"] = {
+            "path": "schema/invented-outcome.json",
+            "interface": "invented native interface",
+        }
+        imported["outcome_mappings"][0]["negative_test"] = {
+            "path": "tests/test_invented_outcome.py",
+            "selector": "test_invented_evidence_blocks",
+        }
+        imported["outcome_mapping_digest"] = module._json_digest(
+            imported["outcome_mappings"]
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "mapping.*reference|artifact"):
+            module.import_owner_intent(
+                self.root, imported, self.owner_intent_import_approval(imported)
+            )
+
+    def test_postactivation_import_rejects_cross_wired_outcome_evidence(self):
+        """Each row must prove the evidence required by that exact owner outcome."""
+        module = self.module()
+        outcomes = [
+            {
+                "id": "OUTCOME-NATIVE-GRAPH",
+                "criticality": "core",
+                "statement_digest": "sha256:" + "2" * 64,
+                "required_evidence": [
+                    {
+                        "class": "real_outcome",
+                        "interface": "native_graph_harness",
+                        "environment": "candidate",
+                    }
+                ],
+            },
+            {
+                "id": "OUTCOME-SERVED-CONSUMER",
+                "criticality": "core",
+                "statement_digest": "sha256:" + "3" * 64,
+                "required_evidence": [
+                    {
+                        "class": "end_to_end",
+                        "interface": "served_consumer",
+                        "environment": "served",
+                    }
+                ],
+            },
+        ]
+        binding = self.owner_intent_binding(outcomes=outcomes)
+        intent = module.bind_owner_intent(
+            self.root, binding, self.host_owner_intent_approval(binding)
+        )
+        imported = self.owner_intent_import(intent)
+        imported["outcome_mappings"][0]["required_evidence"] = outcomes[1][
+            "required_evidence"
+        ][0]
+        imported["outcome_mappings"][1]["required_evidence"] = outcomes[0][
+            "required_evidence"
+        ][0]
+        imported["outcome_mapping_digest"] = module._json_digest(
+            imported["outcome_mappings"]
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "mapping.*evidence|outcome"):
+            module.import_owner_intent(
+                self.root, imported, self.owner_intent_import_approval(imported)
+            )
 
     def test_candidate_cannot_replace_host_owned_trust_anchor(self):
         """A candidate-local signer edit cannot replace the private host anchor."""

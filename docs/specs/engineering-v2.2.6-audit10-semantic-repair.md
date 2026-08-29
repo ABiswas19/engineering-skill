@@ -9,13 +9,17 @@ stable source requirement ID, `OWNER_APPROVED` lifecycle state, an exact source
 excerpt and statement digest, and the candidate requirement and obligation IDs
 that implement it. Verification resolves the immutable source bytes, requires
 the excerpt exactly once, verifies its digest, and compares the complete signed
-projection with the candidate registry. Missing, conflicting, unmapped, extra,
-or candidate-generated source semantics fail closed. Engineering validates the
-record but cannot mint it.
+projection with the candidate registry. A source row may cover only the exact
+generic classes semantically supported by its authenticated excerpt. Every
+other complete-ledger row remains explicitly `pending` with a reason; pending
+is retained truth, never promoted owner approval. Missing, conflicting,
+unclassified, extra, or candidate-generated source semantics fail closed.
+Engineering validates the record but cannot mint it.
 
 The host record uses `engineering.v2.2.6-owner-approved-ledger.v2` with exactly
-four top-level fields: `schema`, `source_requirements`, `requirements`, and
-`obligations`. `requirements` contains the complete normalized candidate rows,
+six top-level fields: `schema`, `source_requirements`, `pending_requirements`,
+`pending_obligations`, `requirements`, and `obligations`. `requirements`
+contains the complete normalized candidate rows,
 including their design, contract, runtime, negative-test, and native-evidence
 fields; changing any one of those fields under an unchanged host ledger fails
 closed. Every source requirement has exactly:
@@ -31,8 +35,9 @@ closed. Every source requirement has exactly:
 }
 ```
 
-Across the signed rows, every candidate requirement and obligation ID occurs
-exactly once. The supported validator requires both exact candidate roots, the
+Across the signed supported and pending rows together, every candidate
+requirement and obligation ID occurs exactly once, and no ID occurs in both
+states. The supported validator requires both exact candidate roots, the
 host ledger, and the host owner source; it only returns the canonical ledger
 after both candidate registries and the exact source bytes reconcile:
 
@@ -53,7 +58,7 @@ When approval is recorded in a native Codex session rather than an automation
 prompt, the signed source evidence uses
 `engineering.owner-approved-bootstrap-source.v2` with kind
 `codex_native_decision_receipt`. Its owner-private source is a canonical
-`engineering.owner-approved-native-decision-source.v1` receipt outside
+`engineering.owner-approved-native-decision-source.v2` receipt outside
 candidate Git. The receipt binds the immutable native JSONL file by absolute
 path, byte length, and SHA-256 digest; it separately binds the proposal and
 approval message IDs, turn IDs, UTC timestamps, one-based line numbers,
@@ -208,7 +213,7 @@ outcome. Each mapping binds:
 - exact design/contract artifact repository, commit, tree, and digest.
 
 The signed import covers the normalized mappings and their digest. The
-controller revalidates completeness at dispatch time and blocks a v0.6.1,
+controller revalidates completeness at dispatch time and blocks a successor release,
 frontend, or other dependent lane if any outcome is missing, duplicated,
 Unknown, proxy-only, stale, or bound to the wrong artifact. These mappings are
 the pre-dispatch design/acceptance contract; they do not claim future runtime

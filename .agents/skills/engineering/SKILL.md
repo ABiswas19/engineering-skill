@@ -14,6 +14,7 @@ The orchestrator independently accepts exact artifacts. Engineering preserves
 native Codex and Claude semantics and one writer per shared resource.
 
 Before dispatch, reconstruct approved intent, dependencies, and bounded scope.
+Reject narrow handoffs and proxy-only results.
 Material redesign, replacement, deletion, or simplification maps every baseline
 outcome to INCLUDED, REPLACED, DEFERRED, or EXCLUDED; replacement needs
 independent equivalence and deferral/exclusion exact owner authority. Unknown
@@ -66,13 +67,14 @@ a one-off run does not change the saved autonomy level.
 ## What always needs approval
 
 Treat approval presence and re-request as separate. Exact authority persists
-across unchanged turns, retries, callbacks, and repair epochs; re-request only
-for missing, revoked, consumed, expired, or changed binding; never request approval again otherwise. Full Access is
+across unchanged turns, retries, callbacks, and bounded repair epochs; re-request only
+for missing, revoked, consumed, expired, or when its project, target, action, scope,
+safeguards, or epoch changes; never request approval again otherwise. Full Access is
 technical permission, never business authority. Native destructive and connector
 approvals remain mandatory. Setup, Graphify, architecture, publication, merge,
 deployment, release, production, security, privacy, credentials, finance,
 persisted contracts, and ambiguity stay gated. Exhausted workers freeze as
-`PAUSED_AWAITING_CENTRAL_ADJUDICATION`; they do not re-ask automatically.
+`PAUSED_AWAITING_CENTRAL_ADJUDICATION`; they do not re-ask or retire automatically.
 
 `engineering retrospect` is bounded and read-only; host reconciliation stays
 advisory until recorded.

@@ -147,9 +147,24 @@ def _native_powershell() -> Path:
 
 
 def _native_powershell_environment(executable: Path) -> dict[str, str]:
-    environment = os.environ.copy()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper()
+        in {"SYSTEMROOT", "WINDIR", "TEMP", "TMP", "COMSPEC", "PATHEXT"}
+    }
     environment["PSModulePath"] = str(executable.parent / "Modules")
     return environment
+
+
+def native_powershell() -> Path:
+    """Return the OS-pinned Windows PowerShell executable."""
+    return _native_powershell()
+
+
+def native_powershell_environment(executable: Path) -> dict[str, str]:
+    """Return the minimal trusted runtime environment for native PowerShell."""
+    return _native_powershell_environment(executable)
 
 
 def verify_owner_private(path: Path, *, directory: bool) -> None:

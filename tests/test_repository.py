@@ -63,14 +63,22 @@ class RepositoryContractTests(unittest.TestCase):
             "schema": "engineering.v2.2.6-owner-approved-ledger.v2",
             "source_requirements": [
                 {
-                    "source_requirement_id": "OWNER-V226-PACKAGE",
+                    "source_requirement_id": "OWNER-V226-UNCLASSIFIED",
                     "lifecycle_state": "OWNER_APPROVED",
                     "source_excerpt": source_excerpt,
                     "statement_digest": "sha256:"
                     + hashlib.sha256(source_excerpt.encode("utf-8")).hexdigest(),
-                    "requirement_ids": [row["id"] for row in registry["requirements"]],
-                    "obligation_ids": [row["id"] for row in registry["obligations"]],
+                    "requirement_ids": [],
+                    "obligation_ids": [],
                 }
+            ],
+            "pending_requirements": [
+                {"id": row["id"], "state": "pending", "reason": "owner source does not semantically entail this generic contract"}
+                for row in registry["requirements"]
+            ],
+            "pending_obligations": [
+                {"id": row["id"], "state": "pending", "reason": "owner source does not semantically entail this generic obligation"}
+                for row in registry["obligations"]
             ],
             "requirements": [
                 json.loads(json.dumps(row))
@@ -81,23 +89,40 @@ class RepositoryContractTests(unittest.TestCase):
 
     def candidate_native_owner_ledger(self) -> dict:
         ledger = self.candidate_owner_ledger()
-        requirement_ids = [row["id"] for row in ledger["requirements"]]
-        obligation_ids = [row["id"] for row in ledger["obligations"]]
+        support = (
+            ("OWNER-V226-AUTHENTICATED-RUN-RECEIPTS", "authenticated run receipts", ["authenticated_execution_envelopes"], ["first_pass_incident_preservation"]),
+            ("OWNER-V226-EXACT-SOURCE-INSTALL", "exact source/install", ["exact_release_install_binding"], []),
+            ("OWNER-V226-GIT-OBJECT-BINDING", "Git-object binding", ["git_object_byte_identity"], []),
+            ("OWNER-V226-INDEPENDENT-EQUIVALENCE", "independent equivalence review", ["independent_equivalence"], []),
+            ("OWNER-V226-MODEL-ROUTING-DISCLOSURE", "full model-routing disclosure", ["model_routing_disclosure"], []),
+            ("OWNER-V226-TRANSACTIONAL-PREIMAGES", "transactional preimage checks", ["transactional_install_preimages"], []),
+            ("OWNER-V226-PREVIEW-FIRST-SETUP", "preview-first setup", [], ["project_setup_preview_authority"]),
+            ("OWNER-V226-BOUNDED-VERIFIED-MAINTENANCE", "bounded verified maintenance", [], ["bounded_maintenance"]),
+            ("OWNER-V226-EXTERNAL-CONSUMER", "external consumer-contract plus owner review", ["external_consumer_authority"], ["external_consumer_owner_receipt", "external_consumer_integration"]),
+        )
         rows = []
-        for index in range(9):
-            excerpt = f"safeguard-{index + 1}"
-            rows.append(
-                {
-                    "source_requirement_id": f"OWNER-SAFEGUARD-{index + 1}",
-                    "lifecycle_state": "OWNER_APPROVED",
-                    "source_excerpt": excerpt,
-                    "statement_digest": "sha256:"
-                    + hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
-                    "requirement_ids": requirement_ids[index::9],
-                    "obligation_ids": obligation_ids[index::9],
-                }
-            )
+        mapped_requirements = set()
+        mapped_obligations = set()
+        for source_id, excerpt, requirements, obligations in support:
+            mapped_requirements.update(requirements)
+            mapped_obligations.update(obligations)
+            rows.append({
+                "source_requirement_id": source_id,
+                "lifecycle_state": "OWNER_APPROVED",
+                "source_excerpt": excerpt,
+                "statement_digest": "sha256:" + hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+                "requirement_ids": requirements,
+                "obligation_ids": obligations,
+            })
         ledger["source_requirements"] = rows
+        ledger["pending_requirements"] = [
+            {"id": row["id"], "state": "pending", "reason": "not semantically entailed by the exact owner safeguard excerpts"}
+            for row in ledger["requirements"] if row["id"] not in mapped_requirements
+        ]
+        ledger["pending_obligations"] = [
+            {"id": row["id"], "state": "pending", "reason": "not semantically entailed by the exact owner safeguard excerpts"}
+            for row in ledger["obligations"] if row["id"] not in mapped_obligations
+        ]
         return ledger
 
     def write_native_decision_source(
@@ -173,7 +198,7 @@ class RepositoryContractTests(unittest.TestCase):
                 }
             )
         receipt = {
-            "schema": "engineering.owner-approved-native-decision-source.v1",
+            "schema": "engineering.owner-approved-native-decision-source.v2",
             "decision_id": decision_id,
             "lifecycle_state": "OWNER_APPROVED",
             "native_source": {
@@ -185,9 +210,56 @@ class RepositoryContractTests(unittest.TestCase):
             },
             "proposal": record(1, proposal, proposal_text, proposal_text),
             "approval": record(2, approval, approval_text, approval_text),
+            "proposal_binding": {
+                "decision_id": decision_id,
+                "proposal_line_number": 1,
+                "proposal_message_id": "proposal-message",
+                "proposal_turn_id": "proposal-turn",
+                "safeguard_projection_digest": "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        ledger["source_requirements"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest(),
+            },
             "safeguards": safeguards,
         }
         return session, receipt
+
+    def rewrite_native_proposal(
+        self, module, session: Path, receipt: dict, proposal_text: str
+    ) -> dict:
+        """Test-only exact native-source rewrite with independently rebuilt spans."""
+        updated = json.loads(json.dumps(receipt))
+        lines = session.read_bytes().splitlines()
+        proposal = json.loads(lines[0].decode("utf-8"))
+        proposal["payload"]["content"][0]["text"] = proposal_text
+        lines[0] = json.dumps(
+            proposal, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        session.write_bytes(b"\n".join(lines) + b"\n")
+        source_bytes = session.read_bytes()
+        updated["native_source"].update(
+            digest=module._digest(source_bytes), length=len(source_bytes)
+        )
+        proposal_bytes = proposal_text.encode("utf-8")
+        updated["proposal"].update(
+            excerpt=proposal_text,
+            excerpt_digest=module._digest(proposal_bytes),
+            excerpt_utf8_span={"start": 0, "end": len(proposal_bytes)},
+            raw_line_digest=module._digest(lines[0]),
+        )
+        for row in updated["safeguards"]:
+            excerpt_bytes = row["source_excerpt"].encode("utf-8")
+            start = proposal_bytes.index(excerpt_bytes)
+            row["proposal_excerpt_utf8_span"] = {
+                "start": start,
+                "end": start + len(excerpt_bytes),
+            }
+        return updated
 
     def candidate_owner_baseline(self) -> dict:
         """Explicit test-only projection; production resolves a signed host ledger."""
@@ -644,7 +716,7 @@ class RepositoryContractTests(unittest.TestCase):
             ledger, b"prompt = 'owner approved package'\n"
         )
         missing = json.loads(json.dumps(ledger))
-        missing["source_requirements"][0]["requirement_ids"].pop()
+        missing["pending_requirements"].pop()
         with self.assertRaisesRegex(module.MatrixError, "source projection"):
             module._validate_owner_source_projection(
                 missing, b"prompt = 'owner approved package'\n"
@@ -653,7 +725,6 @@ class RepositoryContractTests(unittest.TestCase):
         conflict["source_requirements"].append(
             json.loads(json.dumps(conflict["source_requirements"][0]))
         )
-        conflict["source_requirements"][1]["source_requirement_id"] = "OWNER-V226-CONFLICT"
         with self.assertRaisesRegex(module.MatrixError, "source projection"):
             module._validate_owner_source_projection(
                 conflict, b"prompt = 'owner approved package'\n"
@@ -684,6 +755,55 @@ class RepositoryContractTests(unittest.TestCase):
             [row["source_requirement_id"] for row in ledger["source_requirements"]],
             [row["source_requirement_id"] for row in resolved["safeguards"]],
         )
+
+    def test_v226_owner_projection_rejects_semantically_overbroad_complete_mapping(self) -> None:
+        """Cardinality cannot promote one narrow safeguard into all owner outcomes."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_owner_projection_semantic", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_owner_ledger("transactional preimage checks")
+        ledger["source_requirements"][0]["source_requirement_id"] = (
+            "OWNER-V226-TRANSACTIONAL-PREIMAGES"
+        )
+        ledger["source_requirements"][0]["requirement_ids"] = [
+            row["id"] for row in ledger["requirements"]
+        ]
+        ledger["source_requirements"][0]["obligation_ids"] = [
+            row["id"] for row in ledger["obligations"]
+        ]
+        ledger["pending_requirements"] = []
+        ledger["pending_obligations"] = []
+        with self.assertRaisesRegex(module.MatrixError, "semantic|pending|projection"):
+            module._validate_owner_source_projection(ledger)
+
+    def test_public_manifest_contains_only_project_neutral_outcome_categories(self) -> None:
+        """Populated local product identities stay in host-private owner evidence."""
+        manifest = json.loads(
+            (ROOT / "release" / "public-export.json").read_text(encoding="utf-8")
+        )
+        populated = (
+            "decision" + "_studio",
+            "decision " + "studio",
+            "manage_" + "".join(chr(value) for value in (107, 97, 107, 97)),
+            "".join(chr(value) for value in (107, 97, 107, 97)) + "_consumer",
+            "".join(chr(value) for value in (99, 116, 97, 111)) + "_",
+            "v" + "061",
+            "v0" + ".6.1",
+            "headless_" + "unified_product",
+        )
+        leaked = []
+        for relative in manifest["files"]:
+            path = ROOT / relative
+            try:
+                text = path.read_text(encoding="utf-8").casefold()
+            except UnicodeDecodeError:
+                continue
+            if any(term in text for term in populated):
+                leaked.append(relative)
+        self.assertEqual([], leaked)
 
     def test_v226_native_decision_source_rejects_changed_native_evidence(self) -> None:
         tool = ROOT / "tools" / "v226_release_matrix.py"
@@ -769,6 +889,92 @@ class RepositoryContractTests(unittest.TestCase):
                             receipt_path, ledger, ROOT
                         )
 
+    def test_native_decision_receipt_rejects_cross_decision_generic_proposal(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_cross_decision", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            session, original = self.write_native_decision_source(directory, ledger)
+            proposal_text = "Recommendation: explicitly approve different-decision; " + "; ".join(
+                row["source_excerpt"] for row in ledger["source_requirements"]
+            )
+            receipt = self.rewrite_native_proposal(
+                module, session, original, proposal_text
+            )
+            receipt_path = directory / "cross-decision.json"
+            receipt_path.write_bytes(module._canonical(receipt))
+            with (
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+                self.assertRaisesRegex(module.MatrixError, "affirmative|linked|decision"),
+            ):
+                module._validate_native_decision_source_receipt(
+                    receipt_path, ledger, ROOT
+                )
+
+    def test_native_decision_receipt_rejects_missing_proposal_identity(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_missing_identity", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            session, original = self.write_native_decision_source(directory, ledger)
+            proposal_text = "Recommendation: explicitly approve; " + "; ".join(
+                row["source_excerpt"] for row in ledger["source_requirements"]
+            )
+            receipt = self.rewrite_native_proposal(
+                module, session, original, proposal_text
+            )
+            del receipt["proposal_binding"]
+            receipt_path = directory / "missing-identity.json"
+            receipt_path.write_bytes(module._canonical(receipt))
+            with (
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+                self.assertRaisesRegex(module.MatrixError, "affirmative|linked|decision"),
+            ):
+                module._validate_native_decision_source_receipt(
+                    receipt_path, ledger, ROOT
+                )
+
+    def test_native_decision_receipt_rejects_multiple_proposal_candidates(self) -> None:
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_multiple_proposals", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            session, original = self.write_native_decision_source(directory, ledger)
+            proposal_text = (
+                "Recommendation: approve different-decision; "
+                "Recommendation: approve native-decision-fixture; "
+                + "; ".join(
+                    row["source_excerpt"] for row in ledger["source_requirements"]
+                )
+            )
+            receipt = self.rewrite_native_proposal(
+                module, session, original, proposal_text
+            )
+            receipt_path = directory / "multiple-proposals.json"
+            receipt_path.write_bytes(module._canonical(receipt))
+            with (
+                patch.object(module, "_verify_owner_private_path", return_value=None),
+                self.assertRaisesRegex(module.MatrixError, "affirmative|linked|decision"),
+            ):
+                module._validate_native_decision_source_receipt(
+                    receipt_path, ledger, ROOT
+                )
+
     def test_v226_native_decision_source_accepts_host_ambient_context_outside_request(self) -> None:
         tool = ROOT / "tools" / "v226_release_matrix.py"
         spec = importlib.util.spec_from_file_location(
@@ -783,8 +989,8 @@ class RepositoryContractTests(unittest.TestCase):
             lines = session.read_bytes().splitlines()
             proposal = json.loads(lines[0].decode("utf-8"))
             proposal_text = (
-                "Recommendation: explicitly approve the nine missing Engineering "
-                "release safeguards—"
+                "Recommendation: explicitly approve native-decision-fixture; "
+                "the nine missing Engineering release safeguards—"
                 + "; ".join(
                     row["source_excerpt"] for row in ledger["source_requirements"]
                 )
@@ -1545,8 +1751,8 @@ class RepositoryContractTests(unittest.TestCase):
         required_categories = {
             "graphify_overlay", "trace_coverage_impact_why", "setup_checkpoint_completion",
             "authority_persistence", "maintenance", "semantic_matrices",
-            "capability_assurance", "learning", "v061_runtime", "ctao_api",
-            "headless_product", "consumer_integration", "decision_studio",
+            "capability_assurance", "learning", "successor_runtime", "capability_api",
+            "unified_product", "consumer_integration", "external_consumer",
             "native_harness", "project_identity", "measurement", "first_pass",
             "false_acceptance", "graph_engineering", "readme", "langfuse_deferment",
             "postactivation_completeness",
@@ -1594,26 +1800,26 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("all active graph lanes", row["acceptance_criteria"]["environment"])
         self.assertEqual("real_outcome", row["acceptance_criteria"]["evidence_class"])
 
-    def test_v226_decision_studio_authority_remains_external_and_unbound(self) -> None:
+    def test_v226_external_consumer_authority_remains_external_and_unbound(self) -> None:
         registry = json.loads(
             (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
         )
         obligations = {row["id"]: row for row in registry["obligations"]}
-        receipt = obligations["decision_studio_external_receipt"]
-        consumer = obligations["decision_studio_consumer_integration"]
+        receipt = obligations["external_consumer_owner_receipt"]
+        consumer = obligations["external_consumer_integration"]
         self.assertIn("external", receipt["acceptance_criteria"]["interface"].lower())
-        self.assertIn("decision_studio_external_receipt", consumer["dependencies"])
+        self.assertIn("external_consumer_owner_receipt", consumer["dependencies"])
         self.assertEqual("post_activation", receipt["phase"])
 
-    def test_v226_manage_kaka_correction_is_a_separate_downstream_gate(self) -> None:
+    def test_v226_named_consumer_correction_is_a_separate_downstream_gate(self) -> None:
         registry = json.loads(
             (ROOT / "release" / "v2.2.6-requirements.json").read_text(encoding="utf-8")
         )
         obligations = {row["id"]: row for row in registry["obligations"]}
-        correction = obligations["manage_kaka_consumer_correction"]
-        integration = obligations["kaka_consumer_integration"]
-        self.assertIn("ctao_observability_api", correction["dependencies"])
-        self.assertIn("manage_kaka_consumer_correction", integration["dependencies"])
+        correction = obligations["named_consumer_contract_correction"]
+        integration = obligations["primary_consumer_integration"]
+        self.assertIn("capability_observability_api", correction["dependencies"])
+        self.assertIn("named_consumer_contract_correction", integration["dependencies"])
         self.assertNotEqual(correction["dispatch_gate"], integration["dispatch_gate"])
 
     def test_v226_adjacent_tool_comparison_is_factual_and_dependency_scanned(self) -> None:
@@ -1875,6 +2081,20 @@ class RepositoryContractTests(unittest.TestCase):
             "Outcome:",
             "authorize",
             "controller-contract.md",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, skill)
+
+    def test_handoff_and_reapproval_semantics_survive_without_narrowing(self) -> None:
+        """Rollover may compress prose but cannot narrow authority or terminal states."""
+        skill = " ".join(
+            (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split()
+        )
+        for required in (
+            "Reject narrow handoffs and proxy-only results.",
+            "bounded repair epochs",
+            "project, target, action, scope, safeguards, or epoch changes",
+            "they do not re-ask or retire automatically",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, skill)
