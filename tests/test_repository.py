@@ -975,6 +975,80 @@ class RepositoryContractTests(unittest.TestCase):
                     receipt_path, ledger, ROOT
                 )
 
+    def test_native_decision_receipt_requires_exact_or_bounded_group_proposal_link(self) -> None:
+        """An article/noun after approve is never interpreted as a decision id."""
+        tool = ROOT / "tools" / "v226_release_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_native_bounded_proposal", tool
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ledger = self.candidate_native_owner_ledger()
+        safeguards = "; ".join(
+            row["source_excerpt"] for row in ledger["source_requirements"]
+        )
+        proposals = (
+            (
+                "Recommendation: explicitly approve the nine missing Engineering "
+                f"release safeguards—{safeguards}",
+                True,
+            ),
+            (
+                "RECOMMENDATION:\tAPPROVE native-decision-fixture. " + safeguards,
+                True,
+            ),
+            ("Recommendation: explicitly approve the nine; " + safeguards, False),
+            ("Recommendation: explicitly approve; " + safeguards, False),
+            ("Recommendation: approve different-decision; " + safeguards, False),
+            ("Recommendation: approve native-decision-fixture-v2; " + safeguards, False),
+            (
+                "Recommendation: approve native-decision-fixture or "
+                "different-decision; " + safeguards,
+                False,
+            ),
+            ("Recommendation: do not approve native-decision-fixture; " + safeguards, False),
+            (
+                "Recommendation: approve native-decision-fixture; then change the "
+                "decision to different-decision; " + safeguards,
+                False,
+            ),
+            (
+                "Recommendation: approve native-decision-fixture; Recommendation: "
+                "approve different-decision; " + safeguards,
+                False,
+            ),
+            ("Status: native-decision-fixture is unrelated follow-up. " + safeguards, False),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for index, (proposal_text, accepted) in enumerate(proposals):
+                with self.subTest(proposal=proposal_text, accepted=accepted):
+                    session, original = self.write_native_decision_source(
+                        directory, ledger
+                    )
+                    receipt = self.rewrite_native_proposal(
+                        module, session, original, proposal_text
+                    )
+                    receipt_path = directory / f"bounded-proposal-{index}.json"
+                    receipt_path.write_bytes(module._canonical(receipt))
+                    with patch.object(
+                        module, "_verify_owner_private_path", return_value=None
+                    ):
+                        if accepted:
+                            resolved = module._validate_native_decision_source_receipt(
+                                receipt_path, ledger, ROOT
+                            )
+                            self.assertEqual(
+                                "native-decision-fixture", resolved["decision_id"]
+                            )
+                        else:
+                            with self.assertRaisesRegex(
+                                module.MatrixError, "affirmative|linked|decision"
+                            ):
+                                module._validate_native_decision_source_receipt(
+                                    receipt_path, ledger, ROOT
+                                )
+
     def test_v226_native_decision_source_accepts_host_ambient_context_outside_request(self) -> None:
         tool = ROOT / "tools" / "v226_release_matrix.py"
         spec = importlib.util.spec_from_file_location(

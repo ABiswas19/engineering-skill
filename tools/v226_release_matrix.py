@@ -586,6 +586,39 @@ def _native_owner_request(text: str) -> str:
     return request
 
 
+def _proposal_affirmatively_links_decision(text: str, decision_id: str) -> bool:
+    """Accept one exact-ID request or the one bounded nine-safeguard request."""
+    commands = list(
+        re.finditer(
+            r"(?i)\brecommendation\s*:\s*(?:explicitly\s+)?approve\b",
+            text,
+        )
+    )
+    if len(commands) != 1:
+        return False
+    if re.search(
+        r"(?i)\b(?:change|changed|switch|replace)(?:\s+to)?\s+"
+        r"(?:the\s+)?decision\b|\bdecision\s+(?:to|is now)\b",
+        text,
+    ):
+        return False
+    remainder = text[commands[0].end() :]
+    boundary = r"(?=$|[\s;:,.!?—–])"
+    exact = re.match(r"\s+" + re.escape(decision_id) + boundary, remainder)
+    if exact and not re.match(
+        r"(?i)\s*(?:/|\bor\b|\band\b)\s*[A-Za-z0-9][A-Za-z0-9._-]{2,127}",
+        remainder[exact.end() :],
+    ):
+        return True
+    return bool(
+        re.match(
+            r"(?i)\s+the\s+nine\s+missing\s+Engineering\s+release\s+"
+            r"safeguards" + boundary,
+            remainder,
+        )
+    )
+
+
 def _validate_native_decision_source_receipt(
     receipt_path: Path, owner_ledger: object, repository: Path
 ) -> dict:
@@ -692,14 +725,7 @@ def _validate_native_decision_source_receipt(
         != _digest(_canonical(ledger_rows))
     ):
         raise MatrixError("native decision source is not affirmatively linked")
-    proposal_candidates = re.findall(
-        r"(?i)\brecommendation:\s+(?:explicitly\s+)?approve(?:\s+"
-        r"([A-Za-z0-9][A-Za-z0-9._-]{2,127}))?",
-        proposal_text,
-    )
-    if len(proposal_candidates) != 1 or (
-        proposal_candidates[0] and proposal_candidates[0] != decision_id
-    ):
+    if not _proposal_affirmatively_links_decision(proposal_text, decision_id):
         raise MatrixError("native decision source is not affirmatively linked")
     approval = _native_owner_request(approval_text)
     if (
