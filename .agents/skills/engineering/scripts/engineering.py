@@ -331,6 +331,655 @@ class EngineeringError(Exception):
     pass
 
 
+UNITTEST_TERMINAL_SUMMARY_SCHEMA = "engineering.unittest-terminal-summary.v1"
+ISOLATED_TEMP_RECEIPT_SCHEMA = "engineering.isolated-temp-preflight.v1"
+ISOLATED_TEMP_PATHNAME_OBSERVATION_STATES = (
+    "absent-at-observation",
+    "identity-changed",
+    "original-present",
+    "reparse-present",
+    "unknown",
+)
+CHECKPOINT_DIAGNOSTIC_SCHEMA = "engineering.checkpoint-diagnostic.v1"
+PRESERVED_WINDOWS_TEMP_SUFFIX_LENGTH = 202
+ENGINEERING_TEMP_PATH_SAFETY_MARGIN = 16
+ENGINEERING_TEMP_WORST_CASE_SUFFIX_LENGTH = (
+    PRESERVED_WINDOWS_TEMP_SUFFIX_LENGTH + ENGINEERING_TEMP_PATH_SAFETY_MARGIN
+)
+
+
+def parse_unittest_terminal_summary(log: bytes | str) -> dict:
+    """Parse authoritative unittest terminal summaries without guessing."""
+    if isinstance(log, bytes):
+        try:
+            text = log.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EngineeringError("Unittest terminal output is not UTF-8.") from error
+    elif isinstance(log, str):
+        text = log
+    else:
+        raise EngineeringError("Unittest terminal output is invalid.")
+    pattern = re.compile(
+        r"(?m)^Ran\s+(\d+)\s+tests?\s+in\s+[^\r\n]+\r?\n"
+        r"(?:\r?\n)?"
+        r"(OK|FAILED)\s*(?:\(\s*([^)]*?)\s*\))?\s*$"
+    )
+    terminal_text = text.rstrip(" \t\r\n")
+    parsed = []
+    terminal_end = None
+    for match in pattern.finditer(terminal_text):
+        result, detail = match.group(2), match.group(3)
+        values = {"failures": 0, "errors": 0, "skipped": 0}
+        seen = set()
+        if detail:
+            for item in detail.split(","):
+                field = re.fullmatch(
+                    r"\s*(failures|errors|skipped)\s*=\s*(\d+)\s*", item
+                )
+                if field is None or field.group(1) in seen:
+                    raise EngineeringError("Unittest terminal summary is ambiguous.")
+                seen.add(field.group(1))
+                values[field.group(1)] = int(field.group(2))
+        if any(values[name] == 0 for name in seen):
+            raise EngineeringError("Unittest terminal summary contains an impossible field.")
+        if result == "OK" and seen - {"skipped"}:
+            raise EngineeringError("Unittest terminal summary is inconsistent.")
+        if result == "OK" and (values["failures"] or values["errors"]):
+            raise EngineeringError("Unittest terminal summary is inconsistent.")
+        if result == "FAILED" and not (values["failures"] or values["errors"]):
+            raise EngineeringError("Unittest terminal summary is inconsistent.")
+        counts = {"run": int(match.group(1)), **values}
+        if (
+            any(value > counts["run"] for value in values.values())
+            or sum(values.values()) > counts["run"]
+        ):
+            raise EngineeringError("Unittest terminal summary totals are impossible.")
+        parsed.append(counts)
+        terminal_end = match.end()
+    if not parsed:
+        raise EngineeringError("Unittest terminal summary is absent.")
+    if len(parsed) != 1 or terminal_end != len(terminal_text):
+        raise EngineeringError("Unittest terminal summary is not uniquely terminal.")
+    return parsed[0]
+
+
+def _safe_temp_segment(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,47}", value):
+        raise EngineeringError("Isolated TEMP run identity is invalid.")
+    return value
+
+
+def _temp_root_identity(path: Path) -> dict:
+    retained = Path(path).stat(follow_symlinks=False)
+    return {"device": retained.st_dev, "inode": retained.st_ino}
+
+
+def _open_windows_directory_delete_handle(path: Path):
+    """Open an exact directory object while denying rename/delete sharing."""
+    if os.name != "nt":
+        raise EngineeringError("Identity-bound TEMP deletion requires Windows.")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        str(Path(path)),
+        0x00010000 | 0x00000080 | 0x00020000,  # DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL
+        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE; never share delete
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        error = ctypes.get_last_error()
+        raise EngineeringError(
+            f"Identity-bound TEMP handle is unavailable (winerror={error})."
+        )
+    return handle
+
+
+def _close_windows_handle(handle) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    if not kernel32.CloseHandle(handle):
+        error = ctypes.get_last_error()
+        raise EngineeringError(f"Identity-bound TEMP handle close failed (winerror={error}).")
+
+
+def _windows_directory_handle_identity(handle) -> dict:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(FileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    information = FileInformation()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        raise EngineeringError(
+            f"Identity-bound TEMP handle identity is unavailable (winerror={error})."
+        )
+    return {
+        "volume_serial": int(information.dwVolumeSerialNumber),
+        "file_index": (int(information.nFileIndexHigh) << 32)
+        | int(information.nFileIndexLow),
+    }
+
+
+def _mark_windows_directory_delete_on_close(handle) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileDispositionInformation(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    disposition = FileDispositionInformation(True)
+    if not kernel32.SetFileInformationByHandle(
+        handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
+    ):
+        error = ctypes.get_last_error()
+        raise EngineeringError(
+            f"Identity-bound TEMP delete disposition failed (winerror={error})."
+        )
+
+
+def _capture_windows_directory_handle_identity(path: Path) -> dict:
+    handle = _open_windows_directory_delete_handle(path)
+    try:
+        return _windows_directory_handle_identity(handle)
+    finally:
+        _close_windows_handle(handle)
+
+
+def _rollback_unpublished_temp_root(root: Path, identity: dict) -> None:
+    """Rollback only the exact new root before a receipt is published."""
+    if (
+        not root.is_dir()
+        or root.is_symlink()
+        or _is_reparse_point(root)
+        or _temp_root_identity(root) != identity
+    ):
+        return
+    marker = root / ".engineering-temp-owner.json"
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return
+    if children == [marker] and marker.is_file() and not _is_reparse_point(marker):
+        marker.unlink()
+        children = []
+    if not children:
+        root.rmdir()
+
+
+def prepare_isolated_temp_root(
+    candidates: list[Path],
+    run_id: str,
+    candidate_root: Path,
+    test_suffixes: list[str],
+    max_path: int,
+    long_paths_enabled: bool,
+) -> dict:
+    """Create one owned short TEMP root only after a deterministic path-budget check."""
+    run_id = _safe_temp_segment(run_id)
+    if not isinstance(max_path, int) or not 64 <= max_path <= 259:
+        raise EngineeringError("Isolated TEMP path limit is invalid.")
+    if long_paths_enabled:
+        raise EngineeringError("Isolated TEMP preflight requires the bounded legacy path policy.")
+    if not candidates or not test_suffixes:
+        raise EngineeringError("Isolated TEMP preflight inputs are incomplete.")
+    relative_suffixes = []
+    for raw in test_suffixes:
+        suffix = PurePosixPath(str(raw).replace("\\", "/"))
+        if suffix.is_absolute() or not suffix.parts or ".." in suffix.parts:
+            raise EngineeringError("Isolated TEMP test suffix is unsafe.")
+        relative_suffixes.append(Path(*suffix.parts))
+    candidate_identity = hashlib.sha256(
+        os.path.normcase(str(Path(candidate_root).absolute())).encode("utf-8")
+    ).hexdigest()
+    root_name = "eg-" + hashlib.sha256(run_id.encode("ascii")).hexdigest()[:12]
+    eligible = []
+    for candidate in candidates:
+        base = Path(candidate)
+        if not base.is_absolute() or not base.is_dir() or _is_reparse_point(base):
+            continue
+        try:
+            _reject_reparse_ancestors(base.absolute())
+        except EngineeringError:
+            continue
+        resolved = base.resolve(strict=True)
+        root = resolved / root_name
+        lengths = [len(str(root / suffix)) for suffix in relative_suffixes]
+        lengths.append(len(str(root)) + 1 + ENGINEERING_TEMP_WORST_CASE_SUFFIX_LENGTH)
+        eligible.append((max(lengths), os.path.normcase(str(resolved)), resolved, root))
+    if not eligible:
+        raise EngineeringError("No safe isolated TEMP base is available.")
+    eligible.sort(key=lambda item: (item[0], item[1]))
+    worst, _, base, root = eligible[0]
+    if worst > max_path:
+        raise EngineeringError("Isolated TEMP path budget is unsafe.")
+    if root.exists() or root.is_symlink():
+        raise EngineeringError("Isolated TEMP root collides with existing state.")
+    root.mkdir(mode=0o700)
+    created_identity = _temp_root_identity(root)
+    try:
+        if _is_reparse_point(root) or root.parent.resolve(strict=True) != base:
+            raise EngineeringError("Isolated TEMP root boundary is unsafe.")
+        _reject_reparse_ancestors(root.absolute(), base.absolute())
+        _enforce_owner_private(root)
+        _verify_owner_private(root, directory=True)
+        if (
+            _is_reparse_point(root)
+            or _temp_root_identity(root) != created_identity
+            or root.parent.resolve(strict=True) != base
+        ):
+            raise EngineeringError("Isolated TEMP root was substituted after ACL verification.")
+        marker = root / ".engineering-temp-owner.json"
+        marker_value = {
+            "schema": ISOLATED_TEMP_RECEIPT_SCHEMA,
+            "run_id": run_id,
+            "root": str(root),
+            "root_name": root_name,
+            "root_identity": created_identity,
+        }
+        marker_bytes = (json.dumps(marker_value, sort_keys=True) + "\n").encode("utf-8")
+        marker.write_bytes(marker_bytes)
+        if _is_reparse_point(root) or _temp_root_identity(root) != created_identity:
+            raise EngineeringError("Isolated TEMP root was substituted before first use.")
+        root_handle_identity = _capture_windows_directory_handle_identity(root)
+    except Exception:
+        _rollback_unpublished_temp_root(root, created_identity)
+        raise
+    return {
+        **marker_value,
+        "base": str(base),
+        "candidate_identity": "sha256:" + candidate_identity,
+        "max_path": max_path,
+        "worst_case_path_length": worst,
+        "long_paths_enabled": False,
+        "marker_digest": "sha256:" + hashlib.sha256(marker_bytes).hexdigest(),
+        "root_handle_identity": root_handle_identity,
+        "owner_private_acl": {
+            "applied": True,
+            "verified": True,
+            "contract": "owner-private-directory-v1",
+        },
+        "environment": {"TEMP": str(root), "TMP": str(root)},
+    }
+
+
+def _rollback_identity_error(state: str) -> EngineeringError:
+    return EngineeringError(
+        f"Isolated TEMP rollback pre-delete identity is unproven (state={state})."
+    )
+
+
+def _validate_isolated_temp_root_before_delete(
+    root: Path, base: Path, receipt: dict
+) -> dict:
+    """Revalidate the exact owned object after traversal and immediately before deletion."""
+    expected_identity = receipt.get("root_identity")
+    marker = root / ".engineering-temp-owner.json"
+    try:
+        if root.is_symlink():
+            raise _rollback_identity_error("reparse")
+        if not root.is_dir():
+            raise _rollback_identity_error("missing")
+        if _is_reparse_point(root):
+            raise _rollback_identity_error("reparse")
+        if root.parent.resolve(strict=True) != base.resolve(strict=True):
+            raise _rollback_identity_error("identity-changed")
+        _reject_reparse_ancestors(root.absolute(), base.absolute())
+        identity_before_acl = _temp_root_identity(root)
+    except EngineeringError:
+        raise
+    except OSError as exc:
+        raise _rollback_identity_error("unknown") from exc
+    if identity_before_acl != expected_identity:
+        raise _rollback_identity_error("identity-changed")
+    try:
+        _verify_owner_private(root, directory=True)
+    except (EngineeringError, OSError) as exc:
+        raise _rollback_identity_error("acl-changed") from exc
+    try:
+        if root.is_symlink():
+            raise _rollback_identity_error("reparse")
+        if not root.is_dir():
+            raise _rollback_identity_error("missing")
+        if _is_reparse_point(root):
+            raise _rollback_identity_error("reparse")
+        identity_after_acl = _temp_root_identity(root)
+        if identity_after_acl != expected_identity:
+            raise _rollback_identity_error("identity-changed")
+        if root.parent.resolve(strict=True) != base.resolve(strict=True):
+            raise _rollback_identity_error("identity-changed")
+        if marker.is_symlink() or _is_reparse_point(marker) or not marker.is_file():
+            raise _rollback_identity_error("marker-changed")
+        marker_bytes = marker.read_bytes()
+        if "sha256:" + hashlib.sha256(marker_bytes).hexdigest() != receipt.get(
+            "marker_digest"
+        ):
+            raise _rollback_identity_error("marker-changed")
+        identity_after_marker = _temp_root_identity(root)
+    except EngineeringError:
+        raise
+    except OSError as exc:
+        raise _rollback_identity_error("unknown") from exc
+    if identity_after_marker != expected_identity:
+        raise _rollback_identity_error("identity-changed")
+    return {
+        "normalized_root": os.path.normcase(os.path.abspath(root)),
+        "resolved_base": os.path.normcase(str(base.resolve(strict=True))),
+        "root_identity": identity_after_marker,
+        "marker_digest": receipt["marker_digest"],
+        "owner_private_verified": True,
+        "non_reparse_verified": True,
+    }
+
+
+def _remove_identity_bound_isolated_temp_root(
+    root: Path, base: Path, receipt: dict
+) -> dict:
+    """Delete only the creation-bound Windows directory object through its locked handle."""
+    expected_handle_identity = receipt.get("root_handle_identity")
+    if not isinstance(expected_handle_identity, dict):
+        raise _rollback_identity_error("unknown")
+    if root.is_symlink():
+        raise _rollback_identity_error("reparse")
+    if not root.is_dir():
+        raise _rollback_identity_error("missing")
+    if _is_reparse_point(root):
+        raise _rollback_identity_error("reparse")
+    handle = _open_windows_directory_delete_handle(root)
+    disposition_applied = False
+    try:
+        handle_identity = _windows_directory_handle_identity(handle)
+        if handle_identity != expected_handle_identity:
+            raise _rollback_identity_error("identity-changed")
+        pre_delete = _validate_isolated_temp_root_before_delete(root, base, receipt)
+        if _windows_directory_handle_identity(handle) != expected_handle_identity:
+            raise _rollback_identity_error("identity-changed")
+        for child in list(root.iterdir()):
+            if child.is_symlink() or _is_reparse_point(child):
+                raise _rollback_identity_error("reparse")
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        if list(root.iterdir()):
+            raise _rollback_identity_error("unknown")
+        if _windows_directory_handle_identity(handle) != expected_handle_identity:
+            raise _rollback_identity_error("identity-changed")
+        _mark_windows_directory_delete_on_close(handle)
+        disposition_applied = True
+    finally:
+        _close_windows_handle(handle)
+    if not disposition_applied:
+        raise _rollback_identity_error("unknown")
+    post_close = _inspect_isolated_temp_root_after_handle_close(root, receipt)
+    return {
+        "pre_delete_validation": pre_delete,
+        "removed_handle_identity": expected_handle_identity,
+        **post_close,
+        "removal_primitive": "windows-handle-disposition",
+    }
+
+
+def _inspect_isolated_temp_root_after_handle_close(root: Path, receipt: dict) -> dict:
+    """Separate object disposition from a time-bounded pathname observation."""
+    observation = _observe_isolated_temp_root_after_handle_close(root, receipt)
+    if observation["state"] == "original-present":
+        disposition = "original-object-retained"
+    elif observation["state"] == "unknown":
+        disposition = "unknown"
+    else:
+        disposition = "original-object-removed"
+    return _publish_isolated_temp_cleanup_result(disposition, observation)
+
+
+def _observe_isolated_temp_root_after_handle_close(root: Path, receipt: dict) -> dict:
+    """Observe a pathname once; never promote that snapshot to durable absence."""
+    expected_identity = receipt.get("root_identity")
+    observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        current_identity = _temp_root_identity(root)
+    except FileNotFoundError:
+        try:
+            current_identity = _temp_root_identity(root)
+        except FileNotFoundError:
+            return {
+                "state": "absent-at-observation",
+                "observed_at": observed_at,
+                "identity": None,
+            }
+        except OSError:
+            return {
+                "state": "unknown",
+                "observed_at": observed_at,
+                "identity": None,
+            }
+    except OSError:
+        return {
+            "state": "unknown",
+            "observed_at": observed_at,
+            "identity": None,
+        }
+    if root.is_symlink() or _is_reparse_point(root):
+        return {
+            "state": "reparse-present",
+            "observed_at": observed_at,
+            "identity": current_identity,
+        }
+    if current_identity == expected_identity:
+        return {
+            "state": "original-present",
+            "observed_at": observed_at,
+            "identity": current_identity,
+        }
+    return {
+        "state": "identity-changed",
+        "observed_at": observed_at,
+        "identity": current_identity,
+    }
+
+
+def _publish_isolated_temp_cleanup_result(
+    original_object_disposition: str, pathname_observation: dict
+) -> dict:
+    """Publish only object truth plus an explicitly non-durable path snapshot."""
+    if original_object_disposition not in {
+        "original-object-removed",
+        "original-object-retained",
+        "unknown",
+    }:
+        raise EngineeringError("Isolated TEMP object disposition is invalid.")
+    if (
+        not isinstance(pathname_observation, dict)
+        or pathname_observation.get("state")
+        not in ISOLATED_TEMP_PATHNAME_OBSERVATION_STATES
+    ):
+        raise EngineeringError("Isolated TEMP pathname observation is invalid.")
+    legacy_object_state = {
+        "original-object-removed": "dispositioned",
+        "original-object-retained": "retained",
+        "unknown": "unknown",
+    }[original_object_disposition]
+    return {
+        "state": "path-unverified",
+        "original_object_disposition": original_object_disposition,
+        "pathname_observation": pathname_observation,
+        "original_object_state": legacy_object_state,
+        "original_path_state": pathname_observation["state"],
+        "post_removal_verified": False,
+    }
+
+
+def rollback_isolated_temp_root(receipt: dict) -> dict:
+    """Remove only the freshly marked isolated root named by an exact receipt."""
+    if not isinstance(receipt, dict) or receipt.get("schema") != ISOLATED_TEMP_RECEIPT_SCHEMA:
+        raise EngineeringError("Isolated TEMP rollback receipt is invalid.")
+    root = Path(str(receipt.get("root", "")))
+    base = Path(str(receipt.get("base", "")))
+    run_id = _safe_temp_segment(str(receipt.get("run_id", "")))
+    if root.is_symlink():
+        raise _rollback_identity_error("reparse")
+    if not root.is_dir():
+        raise _rollback_identity_error("missing")
+    if _is_reparse_point(root):
+        raise _rollback_identity_error("reparse")
+    try:
+        current_identity = _temp_root_identity(root)
+        same_base = root.parent.resolve(strict=True) == base.resolve(strict=True)
+    except OSError as exc:
+        raise _rollback_identity_error("unknown") from exc
+    if current_identity != receipt.get("root_identity"):
+        raise _rollback_identity_error("identity-changed")
+    if (
+        root.name != receipt.get("root_name")
+        or root.name != "eg-" + hashlib.sha256(run_id.encode("ascii")).hexdigest()[:12]
+        or not same_base
+    ):
+        raise EngineeringError("Isolated TEMP rollback boundary is unsafe.")
+    _reject_reparse_ancestors(root.absolute(), base.absolute())
+    _verify_owner_private(root, directory=True)
+    marker = root / ".engineering-temp-owner.json"
+    if (
+        not marker.is_file()
+        or "sha256:" + hashlib.sha256(marker.read_bytes()).hexdigest()
+        != receipt.get("marker_digest")
+    ):
+        raise EngineeringError("Isolated TEMP rollback ownership is unproven.")
+    for child in root.rglob("*"):
+        if child.is_symlink() or _is_reparse_point(child):
+            raise EngineeringError("Isolated TEMP rollback contains a reparse boundary.")
+    removal = _remove_identity_bound_isolated_temp_root(root, base, receipt)
+    return {
+        "schema": "engineering.isolated-temp-rollback.v1",
+        "root": str(root),
+        "root_identity": receipt["root_identity"],
+        "removed_identity": removal["pre_delete_validation"]["root_identity"],
+        "removed_handle_identity": removal["removed_handle_identity"],
+        "pre_delete_validation": removal["pre_delete_validation"],
+        "owner_private_verified_before_delete": True,
+        "original_object_disposition": removal["original_object_disposition"],
+        "pathname_observation": removal["pathname_observation"],
+        "original_path_state": removal["original_path_state"],
+        "original_object_state": removal["original_object_state"],
+        "post_removal_verified": removal["post_removal_verified"],
+        "removal_primitive": removal["removal_primitive"],
+        "state": removal["state"],
+    }
+
+
+def _diagnostic_path_snapshot(path: Path) -> dict:
+    path = Path(path)
+    if not path.exists() and not path.is_symlink():
+        return {"path": str(path), "state": "missing"}
+    stat_result = path.lstat()
+    result = {
+        "path": str(path),
+        "state": "reparse" if _is_reparse_point(path) else ("directory" if path.is_dir() else "file"),
+        "size": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+    }
+    if result["state"] == "file":
+        result["digest"] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    elif result["state"] == "directory":
+        rows = []
+        for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+            relative = child.relative_to(path).as_posix()
+            if child.is_symlink() or _is_reparse_point(child):
+                rows.append([relative, "reparse", None])
+            elif child.is_file():
+                rows.append([relative, "file", hashlib.sha256(child.read_bytes()).hexdigest()])
+            elif child.is_dir():
+                rows.append([relative, "directory", None])
+            else:
+                rows.append([relative, "other", None])
+        result["digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(rows, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        ).hexdigest()
+    return result
+
+
+def capture_checkpoint_diagnostic(
+    *,
+    paths: dict[str, Path],
+    environment: dict[str, str],
+    processes: list[dict],
+    observations: dict,
+) -> dict:
+    """Capture caller-observed causal inputs without changing checkpoint state."""
+    path_snapshots = {
+        str(name): _diagnostic_path_snapshot(Path(path))
+        for name, path in sorted(paths.items())
+    }
+    process_rows = sorted(
+        (dict(row) for row in processes),
+        key=lambda row: (str(row.get("started_at", "")), int(row.get("pid", -1))),
+    )
+    observations = dict(observations)
+    if (
+        observations.get("path_error") is True
+        and isinstance(observations.get("longest_path"), int)
+        and isinstance(observations.get("path_limit"), int)
+        and observations["longest_path"] > observations["path_limit"]
+    ):
+        classification = "PATH_ENVIRONMENT"
+    elif (
+        observations.get("shared_identity_conflict") is True
+        and observations.get("overlap_proven") is True
+    ):
+        classification = "PROCESS_SHARED_STATE_INTERFERENCE"
+    elif (
+        observations.get("isolated_reproduction") is True
+        and observations.get("expected_mismatch") is True
+        and observations.get("clean_precondition") is True
+    ):
+        classification = "CODE_DEFECT"
+    else:
+        classification = "UNKNOWN"
+    return {
+        "schema": CHECKPOINT_DIAGNOSTIC_SCHEMA,
+        "classification": classification,
+        "paths": path_snapshots,
+        "environment": {str(key): str(environment[key]) for key in sorted(environment)},
+        "processes": process_rows,
+        "observations": observations,
+    }
+
+
 TraceabilityError = EngineeringError
 
 

@@ -54,6 +54,992 @@ def synthetic_owner_private(path: Path) -> None:
 
 
 class CrossPlatformFilesystemTests(unittest.TestCase):
+    def test_unittest_terminal_parser_covers_authoritative_summary_variants(self):
+        fixtures = {
+            "Ran 3 tests in 0.1s\n\nOK\n": {
+                "run": 3, "failures": 0, "errors": 0, "skipped": 0,
+            },
+            "Ran 4 tests in 0.1s\n\nOK (skipped=2)\n": {
+                "run": 4, "failures": 0, "errors": 0, "skipped": 2,
+            },
+            "Ran 5 tests in 0.1s\n\nFAILED (failures=1)\n": {
+                "run": 5, "failures": 1, "errors": 0, "skipped": 0,
+            },
+            "Ran 6 tests in 0.1s\n\nFAILED (errors=2)\n": {
+                "run": 6, "failures": 0, "errors": 2, "skipped": 0,
+            },
+            "Ran 7 tests in 0.1s\n\nFAILED ( skipped = 3 , errors=2, failures = 1 )\n": {
+                "run": 7, "failures": 1, "errors": 2, "skipped": 3,
+            },
+        }
+        for log, expected in fixtures.items():
+            with self.subTest(log=log):
+                self.assertEqual(expected, engineering.parse_unittest_terminal_summary(log))
+
+    def test_unittest_terminal_parser_fails_closed_on_absent_or_conflicting_summary(self):
+        invalid = (
+            "test output without a terminal summary",
+            "Ran 1 test in 0.1s\n",
+            (
+                "Ran 1 test in 0.1s\n\nOK\n"
+                "Ran 2 tests in 0.2s\n\nFAILED (failures=1)\n"
+            ),
+            "Ran 1 test in 0.1s\n\nFAILED (failures=1, failures=2)\n",
+        )
+        for log in invalid:
+            with self.subTest(log=log):
+                with self.assertRaises(engineering.EngineeringError):
+                    engineering.parse_unittest_terminal_summary(log)
+
+    def test_unittest_terminal_parser_rejects_nonterminal_or_multiple_summaries(self):
+        invalid = (
+            "Ran 1 test in 0.1s\n\nOK\ntrailing output\n",
+            "Ran 1 test in 0.1s\n\nFAILED (failures=1)\ntrailing output\n",
+            "Ran 1 test in 0.1s\n\nOK\nRan 1 test in 0.2s\n\nOK\n",
+            "Ran 1 test in 0.1s\n\nOK\nRan 2 tests in 0.2s\n\nFAILED (failures=x)\n",
+        )
+        for log in invalid:
+            with self.subTest(log=log):
+                with self.assertRaises(engineering.EngineeringError):
+                    engineering.parse_unittest_terminal_summary(log)
+
+    def test_unittest_terminal_parser_rejects_impossible_totals(self):
+        invalid = (
+            "Ran 1 test in 0.1s\n\nOK (skipped=2)\n",
+            "Ran 1 test in 0.1s\n\nFAILED (failures=2)\n",
+            "Ran 1 test in 0.1s\n\nFAILED (errors=2)\n",
+            "Ran 2 tests in 0.1s\n\nFAILED (failures=1, errors=1, skipped=1)\n",
+            "Ran 2 tests in 0.1s\n\nFAILED (failures=-1)\n",
+            "Ran 2 tests in 0.1s\n\nFAILED (errors=1, errors=1)\n",
+            "Ran 2 tests in 0.1s\n\nOK (failures=0)\n",
+            "Ran 2 tests in 0.1s\n\nFAILED (errors=1, skipped=0)\n",
+        )
+        for log in invalid:
+            with self.subTest(log=log):
+                with self.assertRaises(engineering.EngineeringError):
+                    engineering.parse_unittest_terminal_summary(log)
+
+    @unittest.skipUnless(os.name == "nt", "Windows legacy path budget only")
+    def test_isolated_temp_preflight_selects_short_root_and_rolls_back(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g4-") as temporary:
+            base = Path(temporary) / "t"
+            base.mkdir()
+            receipt = engineering.prepare_isolated_temp_root(
+                [base],
+                run_id="gate-1",
+                candidate_root=Path("C:/candidate"),
+                test_suffixes=["case/" + "x" * 40],
+                max_path=259,
+                long_paths_enabled=False,
+            )
+            root = Path(receipt["root"])
+            self.assertTrue(root.is_dir())
+            self.assertRegex(root.name, r"^eg-[0-9a-f]{12}$")
+            self.assertLessEqual(receipt["worst_case_path_length"], 259)
+            self.assertGreaterEqual(
+                receipt["worst_case_path_length"],
+                len(str(root)) + 1 + engineering.ENGINEERING_TEMP_WORST_CASE_SUFFIX_LENGTH,
+            )
+            self.assertEqual(
+                {"applied": True, "verified": True, "contract": "owner-private-directory-v1"},
+                receipt["owner_private_acl"],
+            )
+            (root / "owned-payload.txt").write_text("temporary\n", encoding="utf-8")
+            cleanup = engineering.rollback_isolated_temp_root(receipt)
+            self.assertEqual("path-unverified", cleanup["state"])
+            self.assertFalse(cleanup["post_removal_verified"])
+            self.assertEqual(
+                "original-object-removed", cleanup["original_object_disposition"]
+            )
+            self.assertEqual(
+                "absent-at-observation", cleanup["pathname_observation"]["state"]
+            )
+            self.assertTrue(cleanup["owner_private_verified_before_delete"])
+            self.assertEqual(receipt["root_identity"], cleanup["root_identity"])
+            self.assertFalse(root.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows legacy path budget only")
+    def test_isolated_temp_preflight_rejects_a_caller_understated_suffix_budget(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g4-") as temporary:
+            base = Path(temporary) / "t"
+            base.mkdir()
+            required = (
+                len(str(base / ("eg-" + "x" * 12)))
+                + 1
+                + engineering.ENGINEERING_TEMP_WORST_CASE_SUFFIX_LENGTH
+            )
+            with self.assertRaises(engineering.EngineeringError):
+                engineering.prepare_isolated_temp_root(
+                    [base], "understated", Path("C:/candidate"), ["x"],
+                    required - 1, False,
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows owner-private TEMP contract only")
+    def test_isolated_temp_root_is_owner_private_before_marker_or_use(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g5-") as temporary:
+            base = Path(temporary)
+            events = []
+
+            def enforce(path):
+                events.append(("enforce", Path(path), (Path(path) / ".engineering-temp-owner.json").exists()))
+
+            def verify(path, *, directory):
+                events.append(("verify", Path(path), (Path(path) / ".engineering-temp-owner.json").exists()))
+                self.assertTrue(directory)
+
+            with (
+                patch.object(engineering, "_enforce_owner_private", side_effect=enforce),
+                patch.object(engineering, "_verify_owner_private", side_effect=verify),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "acl-order", Path("C:/candidate"), ["case"], 259, False
+                )
+                root = Path(receipt["root"])
+                self.assertEqual(["enforce", "verify"], [item[0] for item in events])
+                self.assertEqual([False, False], [item[2] for item in events])
+                engineering.rollback_isolated_temp_root(receipt)
+            self.assertFalse(root.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows owner-private TEMP contract only")
+    def test_isolated_temp_acl_failure_rolls_back_before_use(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g5-") as temporary:
+            base = Path(temporary)
+            root = base / ("eg-" + hashlib.sha256(b"acl-failure").hexdigest()[:12])
+            with (
+                patch.object(
+                    engineering,
+                    "_enforce_owner_private",
+                    side_effect=engineering.EngineeringError("synthetic ACL failure"),
+                ),
+                self.assertRaises(engineering.EngineeringError),
+            ):
+                engineering.prepare_isolated_temp_root(
+                    [base], "acl-failure", Path("C:/candidate"), ["case"], 259, False
+                )
+            self.assertFalse(root.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows owner-private TEMP contract only")
+    def test_isolated_temp_acl_spoof_verification_rolls_back_before_use(self):
+        for index, defect in enumerate(
+            ("spoofed principal/tool/runtime", "inherited unauthorized ACE", "widened ACE")
+        ):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g5-"
+            ) as temporary:
+                base = Path(temporary)
+                run_id = f"acl-spoof-{index}"
+                root = base / (
+                    "eg-" + hashlib.sha256(run_id.encode("ascii")).hexdigest()[:12]
+                )
+                with (
+                    patch.object(engineering, "_enforce_owner_private", return_value=None),
+                    patch.object(
+                        engineering,
+                        "_verify_owner_private",
+                        side_effect=engineering.EngineeringError(f"synthetic {defect}"),
+                    ),
+                    self.assertRaises(engineering.EngineeringError),
+                ):
+                    engineering.prepare_isolated_temp_root(
+                        [base], run_id, Path("C:/candidate"), ["case"], 259, False
+                    )
+                self.assertFalse(root.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows owner-private TEMP contract only")
+    def test_isolated_temp_post_create_replacement_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g5-") as temporary:
+            base = Path(temporary)
+            root = base / ("eg-" + hashlib.sha256(b"replacement").hexdigest()[:12])
+            retained = base / "retained-original"
+
+            def substitute(path, *, directory):
+                self.assertTrue(directory)
+                Path(path).rename(retained)
+                Path(path).mkdir()
+
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", side_effect=substitute),
+                self.assertRaises(engineering.EngineeringError),
+            ):
+                engineering.prepare_isolated_temp_root(
+                    [base], "replacement", Path("C:/candidate"), ["case"], 259, False
+                )
+            self.assertTrue(root.is_dir(), "substituted target must not be deleted")
+            self.assertTrue(retained.is_dir(), "original target must remain recoverable")
+            root.rmdir()
+            retained.rmdir()
+
+    def test_isolated_temp_budget_covers_preserved_suffix_and_margin(self):
+        self.assertEqual(202, engineering.PRESERVED_WINDOWS_TEMP_SUFFIX_LENGTH)
+        self.assertGreaterEqual(engineering.ENGINEERING_TEMP_PATH_SAFETY_MARGIN, 8)
+        self.assertGreaterEqual(
+            engineering.ENGINEERING_TEMP_WORST_CASE_SUFFIX_LENGTH,
+            engineering.PRESERVED_WINDOWS_TEMP_SUFFIX_LENGTH
+            + engineering.ENGINEERING_TEMP_PATH_SAFETY_MARGIN,
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows owner-private TEMP contract only")
+    def test_isolated_temp_rollback_rejects_marker_ownership_mismatch(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g5-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "marker-mismatch", Path("C:/candidate"), ["case"], 259, False
+                )
+                with self.assertRaises(engineering.EngineeringError):
+                    engineering.rollback_isolated_temp_root(
+                        {**receipt, "marker_digest": "sha256:" + "0" * 64}
+                    )
+                self.assertTrue(Path(receipt["root"]).is_dir())
+                engineering.rollback_isolated_temp_root(receipt)
+
+    @unittest.skipUnless(os.name == "nt", "Windows rollback identity contract only")
+    def test_isolated_temp_rollback_rejects_post_traversal_root_replacement(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g6-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "rollback-replace", Path("C:/candidate"), ["case"], 259, False
+                )
+            root = Path(receipt["root"])
+            retained = base / "retained-original"
+            marker_bytes = (root / ".engineering-temp-owner.json").read_bytes()
+            original_rglob = Path.rglob
+
+            def substitute_after_traversal(path, pattern):
+                yield from original_rglob(path, pattern)
+                root.rename(retained)
+                root.mkdir()
+                (root / ".engineering-temp-owner.json").write_bytes(marker_bytes)
+
+            with (
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+                patch.object(Path, "rglob", new=substitute_after_traversal),
+                self.assertRaisesRegex(engineering.EngineeringError, "state=identity-changed"),
+            ):
+                engineering.rollback_isolated_temp_root(receipt)
+            self.assertTrue(root.is_dir(), "replacement must survive rollback rejection")
+            self.assertTrue(retained.is_dir(), "original must remain retained")
+            shutil.rmtree(root)
+            shutil.rmtree(retained)
+
+    @unittest.skipUnless(os.name == "nt", "Windows rollback identity contract only")
+    def test_isolated_temp_rollback_rejects_post_traversal_marker_or_acl_change(self):
+        for defect in ("marker", "acl"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g6-"
+            ) as temporary:
+                base = Path(temporary)
+                with (
+                    patch.object(engineering, "_enforce_owner_private", return_value=None),
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                ):
+                    receipt = engineering.prepare_isolated_temp_root(
+                        [base], f"rollback-{defect}", Path("C:/candidate"), ["case"], 259, False
+                    )
+                root = Path(receipt["root"])
+                traversed = {"value": False}
+                original_rglob = Path.rglob
+
+                def change_after_traversal(path, pattern):
+                    yield from original_rglob(path, pattern)
+                    traversed["value"] = True
+                    if defect == "marker":
+                        (root / ".engineering-temp-owner.json").write_text(
+                            "spoofed\n", encoding="utf-8"
+                        )
+
+                def verify(path, *, directory):
+                    self.assertTrue(directory)
+                    if defect == "acl" and traversed["value"]:
+                        raise engineering.EngineeringError("synthetic ACL binding changed")
+
+                expected = "state=marker-changed" if defect == "marker" else "state=acl-changed"
+                with (
+                    patch.object(engineering, "_verify_owner_private", side_effect=verify),
+                    patch.object(Path, "rglob", new=change_after_traversal),
+                    self.assertRaisesRegex(engineering.EngineeringError, expected),
+                ):
+                    engineering.rollback_isolated_temp_root(receipt)
+                self.assertTrue(root.is_dir())
+                shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows rollback identity contract only")
+    def test_isolated_temp_rollback_rejects_post_traversal_missing_or_reparse_root(self):
+        for defect in ("missing", "reparse"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g6-"
+            ) as temporary:
+                base = Path(temporary)
+                with (
+                    patch.object(engineering, "_enforce_owner_private", return_value=None),
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                ):
+                    receipt = engineering.prepare_isolated_temp_root(
+                        [base], f"rollback-{defect}", Path("C:/candidate"), ["case"], 259, False
+                    )
+                root = Path(receipt["root"])
+                retained = base / "retained-original"
+                injected = {"value": False}
+                original_rglob = Path.rglob
+                original_reparse = engineering._is_reparse_point
+
+                def change_after_traversal(path, pattern):
+                    yield from original_rglob(path, pattern)
+                    injected["value"] = True
+                    if defect == "missing":
+                        root.rename(retained)
+
+                def reparse_after_traversal(path):
+                    if defect == "reparse" and injected["value"] and Path(path) == root:
+                        return True
+                    return original_reparse(path)
+
+                with (
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                    patch.object(Path, "rglob", new=change_after_traversal),
+                    patch.object(engineering, "_is_reparse_point", side_effect=reparse_after_traversal),
+                    self.assertRaisesRegex(engineering.EngineeringError, f"state={defect}"),
+                ):
+                    engineering.rollback_isolated_temp_root(receipt)
+                if defect == "missing":
+                    self.assertFalse(root.exists())
+                    self.assertTrue(retained.is_dir())
+                    shutil.rmtree(retained)
+                else:
+                    self.assertTrue(root.is_dir())
+                    shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows rollback identity contract only")
+    def test_isolated_temp_rollback_rejects_post_traversal_identity_mismatch_or_unknown(self):
+        for defect in ("identity-changed", "unknown"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g6-"
+            ) as temporary:
+                base = Path(temporary)
+                with (
+                    patch.object(engineering, "_enforce_owner_private", return_value=None),
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                ):
+                    receipt = engineering.prepare_isolated_temp_root(
+                        [base], f"rollback-{defect}", Path("C:/candidate"), ["case"], 259, False
+                    )
+                root = Path(receipt["root"])
+                injected = {"value": False}
+                original_rglob = Path.rglob
+                original_identity = engineering._temp_root_identity
+
+                def inject_after_traversal(path, pattern):
+                    yield from original_rglob(path, pattern)
+                    injected["value"] = True
+
+                def changed_identity(path):
+                    if injected["value"]:
+                        if defect == "unknown":
+                            raise OSError("synthetic unavailable identity")
+                        return {"device": -1, "inode": -1}
+                    return original_identity(path)
+
+                with (
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                    patch.object(Path, "rglob", new=inject_after_traversal),
+                    patch.object(engineering, "_temp_root_identity", side_effect=changed_identity),
+                    self.assertRaisesRegex(engineering.EngineeringError, f"state={defect}"),
+                ):
+                    engineering.rollback_isolated_temp_root(receipt)
+                self.assertTrue(root.is_dir())
+                shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows rollback identity contract only")
+    def test_isolated_temp_rollback_reports_removed_only_for_exact_unchanged_root(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g6-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "rollback-control", Path("C:/candidate"), ["case"], 259, False
+                )
+                cleanup = engineering.rollback_isolated_temp_root(receipt)
+            self.assertEqual("path-unverified", cleanup["state"])
+            self.assertFalse(cleanup["post_removal_verified"])
+            self.assertEqual("original-object-removed", cleanup["original_object_disposition"])
+            self.assertEqual(
+                "absent-at-observation", cleanup["pathname_observation"]["state"]
+            )
+            self.assertEqual(receipt["root_identity"], cleanup["removed_identity"])
+            self.assertEqual("windows-handle-disposition", cleanup["removal_primitive"])
+            self.assertFalse(Path(receipt["root"]).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_blocks_exact_post_validator_auditor_sequence(self):
+        for attempt in range(3):
+            with self.subTest(attempt=attempt), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g7-"
+            ) as temporary:
+                base = Path(temporary)
+                with (
+                    patch.object(engineering, "_enforce_owner_private", return_value=None),
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                ):
+                    receipt = engineering.prepare_isolated_temp_root(
+                        [base], f"auditor-sequence-{attempt}", Path("C:/candidate"),
+                        ["case"], 259, False,
+                    )
+                root = Path(receipt["root"])
+                retained = base / "retained-original"
+                real_validate = engineering._validate_isolated_temp_root_before_delete
+
+                def substitute_after_validation(root_arg, base_arg, receipt_arg):
+                    validated = real_validate(root_arg, base_arg, receipt_arg)
+                    root.rename(retained)
+                    root.mkdir()
+                    (root / "substitute-sentinel.txt").write_text(
+                        "must survive\n", encoding="utf-8"
+                    )
+                    return validated
+
+                with (
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                    patch.object(
+                        engineering,
+                        "_validate_isolated_temp_root_before_delete",
+                        side_effect=substitute_after_validation,
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    engineering.rollback_isolated_temp_root(receipt)
+                self.assertTrue(root.is_dir(), "locked original must remain after blocked injection")
+                self.assertFalse(retained.exists())
+                self.assertFalse((root / "substitute-sentinel.txt").exists())
+                shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_never_deletes_matching_marker_replacement(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g7-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "matching-replacement", Path("C:/candidate"), ["case"], 259, False
+                )
+            root = Path(receipt["root"])
+            retained = base / "retained-original"
+            marker_bytes = (root / ".engineering-temp-owner.json").read_bytes()
+            root.rename(retained)
+            root.mkdir()
+            (root / ".engineering-temp-owner.json").write_bytes(marker_bytes)
+            with (
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+                self.assertRaisesRegex(engineering.EngineeringError, "state=identity-changed"),
+            ):
+                engineering.rollback_isolated_temp_root(receipt)
+            self.assertTrue(root.is_dir())
+            self.assertTrue(retained.is_dir())
+            shutil.rmtree(root)
+            shutil.rmtree(retained)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_retains_renamed_original_and_reparse_replacement(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g7-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "renamed-original", Path("C:/candidate"), ["case"], 259, False
+                )
+            root = Path(receipt["root"])
+            retained = base / "retained-original"
+            root.rename(retained)
+            with self.assertRaisesRegex(engineering.EngineeringError, "state=missing"):
+                engineering.rollback_isolated_temp_root(receipt)
+            self.assertTrue(retained.is_dir())
+            root.mkdir()
+            with (
+                patch.object(engineering, "_is_reparse_point", side_effect=lambda path: Path(path) == root),
+                self.assertRaisesRegex(engineering.EngineeringError, "state=reparse"),
+            ):
+                engineering.rollback_isolated_temp_root(receipt)
+            self.assertTrue(root.is_dir())
+            shutil.rmtree(root)
+            shutil.rmtree(retained)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_fails_closed_when_handle_proof_is_unavailable(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g7-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "missing-handle-proof", Path("C:/candidate"), ["case"], 259, False
+                )
+            root = Path(receipt["root"])
+            with (
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+                patch.object(
+                    engineering,
+                    "_open_windows_directory_delete_handle",
+                    side_effect=engineering.EngineeringError("synthetic unavailable handle proof"),
+                ),
+                self.assertRaisesRegex(engineering.EngineeringError, "unavailable handle proof"),
+            ):
+                engineering.rollback_isolated_temp_root(receipt)
+            self.assertTrue(root.is_dir())
+            shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_fails_closed_when_handle_identity_changes(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g7-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "changed-handle-proof", Path("C:/candidate"), ["case"], 259, False
+                )
+            root = Path(receipt["root"])
+            calls = {"count": 0}
+            original_identity = engineering._windows_directory_handle_identity
+
+            def identity_changes(handle):
+                calls["count"] += 1
+                identity = original_identity(handle)
+                if calls["count"] > 1:
+                    return {**identity, "file_index": identity["file_index"] + 1}
+                return identity
+
+            with (
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+                patch.object(
+                    engineering,
+                    "_windows_directory_handle_identity",
+                    side_effect=identity_changes,
+                ),
+                self.assertRaisesRegex(engineering.EngineeringError, "state=identity-changed"),
+            ):
+                engineering.rollback_isolated_temp_root(receipt)
+            self.assertTrue(root.is_dir())
+            shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_reports_post_close_replacement_truthfully(self):
+        for attempt in range(3):
+            with self.subTest(attempt=attempt), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g8-"
+            ) as temporary:
+                base = Path(temporary)
+                with (
+                    patch.object(engineering, "_enforce_owner_private", return_value=None),
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                ):
+                    receipt = engineering.prepare_isolated_temp_root(
+                        [base], f"post-close-replacement-{attempt}", Path("C:/candidate"),
+                        ["case"], 259, False,
+                    )
+                root = Path(receipt["root"])
+                marker_bytes = (root / ".engineering-temp-owner.json").read_bytes()
+                real_close = engineering._close_windows_handle
+
+                def close_then_replace(handle):
+                    real_close(handle)
+                    root.mkdir()
+                    (root / ".engineering-temp-owner.json").write_bytes(marker_bytes)
+                    (root / "replacement-sentinel.txt").write_text(
+                        "replacement must survive\n", encoding="utf-8"
+                    )
+
+                with (
+                    patch.object(engineering, "_verify_owner_private", return_value=None),
+                    patch.object(
+                        engineering, "_close_windows_handle", side_effect=close_then_replace
+                    ),
+                ):
+                    cleanup = engineering.rollback_isolated_temp_root(receipt)
+                self.assertEqual("path-unverified", cleanup["state"])
+                self.assertEqual(
+                    "identity-changed", cleanup["pathname_observation"]["state"]
+                )
+                self.assertEqual(
+                    "original-object-removed", cleanup["original_object_disposition"]
+                )
+                self.assertFalse(cleanup["post_removal_verified"])
+                self.assertTrue((root / "replacement-sentinel.txt").is_file())
+                shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_reports_post_close_reparse_replacement_truthfully(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g8-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "post-close-reparse", Path("C:/candidate"), ["case"], 259, False
+                )
+            root = Path(receipt["root"])
+            real_close = engineering._close_windows_handle
+            injected = {"value": False}
+            real_reparse = engineering._is_reparse_point
+
+            def close_then_replace(handle):
+                real_close(handle)
+                root.mkdir()
+                (root / "replacement-sentinel.txt").write_text(
+                    "replacement must survive\n", encoding="utf-8"
+                )
+                injected["value"] = True
+
+            def post_close_reparse(path):
+                return (injected["value"] and Path(path) == root) or real_reparse(path)
+
+            with (
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+                patch.object(
+                    engineering, "_close_windows_handle", side_effect=close_then_replace
+                ),
+                patch.object(
+                    engineering, "_is_reparse_point", side_effect=post_close_reparse
+                ),
+            ):
+                cleanup = engineering.rollback_isolated_temp_root(receipt)
+            self.assertEqual("path-unverified", cleanup["state"])
+            self.assertEqual("reparse-present", cleanup["pathname_observation"]["state"])
+            self.assertFalse(cleanup["post_removal_verified"])
+            self.assertTrue((root / "replacement-sentinel.txt").is_file())
+            shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_reports_unknown_post_close_identity_truthfully(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g8-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "post-close-unknown", Path("C:/candidate"), ["case"], 259, False
+                )
+            root = Path(receipt["root"])
+            real_close = engineering._close_windows_handle
+            real_identity = engineering._temp_root_identity
+            injected = {"value": False}
+
+            def close_then_replace(handle):
+                real_close(handle)
+                root.mkdir()
+                injected["value"] = True
+
+            def unavailable_identity(path):
+                if injected["value"] and Path(path) == root:
+                    raise OSError("synthetic post-close identity unavailable")
+                return real_identity(path)
+
+            with (
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+                patch.object(
+                    engineering, "_close_windows_handle", side_effect=close_then_replace
+                ),
+                patch.object(
+                    engineering, "_temp_root_identity", side_effect=unavailable_identity
+                ),
+            ):
+                cleanup = engineering.rollback_isolated_temp_root(receipt)
+            self.assertEqual("path-unverified", cleanup["state"])
+            self.assertEqual("unknown", cleanup["pathname_observation"]["state"])
+            self.assertEqual("unknown", cleanup["original_object_disposition"])
+            self.assertFalse(cleanup["post_removal_verified"])
+            self.assertTrue(root.is_dir())
+            shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_rollback_detects_recreation_during_absence_postcondition(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g8-") as temporary:
+            base = Path(temporary)
+            with (
+                patch.object(engineering, "_enforce_owner_private", return_value=None),
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+            ):
+                receipt = engineering.prepare_isolated_temp_root(
+                    [base], "post-close-during-absence", Path("C:/candidate"),
+                    ["case"], 259, False,
+                )
+            root = Path(receipt["root"])
+            real_close = engineering._close_windows_handle
+            real_identity = engineering._temp_root_identity
+            closed = {"value": False}
+            injected = {"value": False}
+
+            def close_then_arm(handle):
+                real_close(handle)
+                closed["value"] = True
+
+            def recreate_during_absence_check(path):
+                try:
+                    return real_identity(path)
+                except FileNotFoundError:
+                    if closed["value"] and not injected["value"]:
+                        root.mkdir()
+                        (root / "replacement-sentinel.txt").write_text(
+                            "replacement must survive\n", encoding="utf-8"
+                        )
+                        injected["value"] = True
+                    raise
+
+            with (
+                patch.object(engineering, "_verify_owner_private", return_value=None),
+                patch.object(
+                    engineering, "_close_windows_handle", side_effect=close_then_arm
+                ),
+                patch.object(
+                    engineering, "_temp_root_identity", side_effect=recreate_during_absence_check
+                ),
+            ):
+                cleanup = engineering.rollback_isolated_temp_root(receipt)
+            self.assertEqual("path-unverified", cleanup["state"])
+            self.assertEqual(
+                "identity-changed", cleanup["pathname_observation"]["state"]
+            )
+            self.assertFalse(cleanup["post_removal_verified"])
+            self.assertTrue((root / "replacement-sentinel.txt").is_file())
+            shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_post_close_final_observation_never_claims_path_removed(self):
+        for attempt in range(3):
+            with self.subTest(attempt=attempt), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g9-"
+            ) as temporary:
+                root = Path(temporary) / "target"
+                calls = {"count": 0}
+
+                def recreate_after_final_observation(path):
+                    calls["count"] += 1
+                    if calls["count"] == 2:
+                        root.mkdir()
+                        (root / "replacement-sentinel.txt").write_text(
+                            "replacement must survive\n", encoding="utf-8"
+                        )
+                    raise FileNotFoundError(str(path))
+
+                with patch.object(
+                    engineering,
+                    "_temp_root_identity",
+                    side_effect=recreate_after_final_observation,
+                ):
+                    result = engineering._inspect_isolated_temp_root_after_handle_close(
+                        root, {"root_identity": {"device": 1, "inode": 1}}
+                    )
+                self.assertEqual("path-unverified", result["state"])
+                self.assertFalse(result["post_removal_verified"])
+                self.assertEqual(
+                    "original-object-removed", result["original_object_disposition"]
+                )
+                self.assertEqual(
+                    "absent-at-observation", result["pathname_observation"]["state"]
+                )
+                self.assertTrue((root / "replacement-sentinel.txt").is_file())
+                shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_recreation_after_observer_return_remains_path_unverified(self):
+        for attempt in range(3):
+            with self.subTest(attempt=attempt), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g9-"
+            ) as temporary:
+                root = Path(temporary) / "target"
+                real_observe = engineering._observe_isolated_temp_root_after_handle_close
+
+                def observe_then_replace(root_arg, receipt_arg):
+                    observation = real_observe(root_arg, receipt_arg)
+                    root.mkdir()
+                    (root / "replacement-sentinel.txt").write_text(
+                        "replacement must survive\n", encoding="utf-8"
+                    )
+                    return observation
+
+                with patch.object(
+                    engineering,
+                    "_observe_isolated_temp_root_after_handle_close",
+                    side_effect=observe_then_replace,
+                ):
+                    result = engineering._inspect_isolated_temp_root_after_handle_close(
+                        root, {"root_identity": {"device": 1, "inode": 1}}
+                    )
+                self.assertEqual("path-unverified", result["state"])
+                self.assertFalse(result["post_removal_verified"])
+                self.assertEqual(
+                    "absent-at-observation", result["pathname_observation"]["state"]
+                )
+                self.assertRegex(
+                    result["pathname_observation"]["observed_at"], r"Z$"
+                )
+                self.assertTrue((root / "replacement-sentinel.txt").is_file())
+                shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound deletion only")
+    def test_isolated_temp_no_finite_absence_observation_claims_path_removed(self):
+        for inject_after in (1, 2):
+            with self.subTest(inject_after=inject_after), tempfile.TemporaryDirectory(
+                dir=r"C:\Temp", prefix="g9-"
+            ) as temporary:
+                root = Path(temporary) / "target"
+                real_identity = engineering._temp_root_identity
+                calls = {"count": 0}
+
+                def recreate_at_observation(path):
+                    calls["count"] += 1
+                    try:
+                        return real_identity(path)
+                    except FileNotFoundError:
+                        if calls["count"] == inject_after:
+                            root.mkdir()
+                            (root / "replacement-sentinel.txt").write_text(
+                                "replacement must survive\n", encoding="utf-8"
+                            )
+                        raise
+
+                with patch.object(
+                    engineering, "_temp_root_identity", side_effect=recreate_at_observation
+                ):
+                    result = engineering._inspect_isolated_temp_root_after_handle_close(
+                        root, {"root_identity": {"device": 1, "inode": 1}}
+                    )
+                self.assertEqual("path-unverified", result["state"])
+                self.assertFalse(result["post_removal_verified"])
+                self.assertTrue((root / "replacement-sentinel.txt").is_file())
+                shutil.rmtree(root)
+
+    def test_isolated_temp_result_keeps_unknown_object_disposition_separate(self):
+        observation = {
+            "state": "unknown",
+            "observed_at": "2026-08-29T00:00:00Z",
+            "identity": None,
+        }
+        result = engineering._publish_isolated_temp_cleanup_result(
+            "unknown", observation
+        )
+        self.assertEqual("path-unverified", result["state"])
+        self.assertFalse(result["post_removal_verified"])
+        self.assertEqual("unknown", result["original_object_disposition"])
+        self.assertEqual(observation, result["pathname_observation"])
+
+    def test_isolated_temp_pathname_observation_contract_matches_runtime_exactly(self):
+        expected = (
+            "absent-at-observation",
+            "identity-changed",
+            "original-present",
+            "reparse-present",
+            "unknown",
+        )
+        self.assertEqual(
+            expected, engineering.ISOLATED_TEMP_PATHNAME_OBSERVATION_STATES
+        )
+        for state in expected:
+            with self.subTest(state=state):
+                observation = {
+                    "state": state,
+                    "observed_at": "2026-08-29T00:00:00Z",
+                    "identity": None,
+                }
+                result = engineering._publish_isolated_temp_cleanup_result(
+                    "unknown", observation
+                )
+                self.assertEqual(observation, result["pathname_observation"])
+        with self.assertRaises(engineering.EngineeringError):
+            engineering._publish_isolated_temp_cleanup_result(
+                "unknown",
+                {
+                    "state": "replacement-present",
+                    "observed_at": "2026-08-29T00:00:00Z",
+                    "identity": None,
+                },
+            )
+
+    def test_isolated_temp_preflight_rejects_unsafe_bases_budgets_and_collisions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing"
+            with self.assertRaises(engineering.EngineeringError):
+                engineering.prepare_isolated_temp_root(
+                    [missing], "gate", Path("C:/candidate"), ["case"], 120, False
+                )
+            base = Path(temporary) / "base"
+            base.mkdir()
+            with self.assertRaises(engineering.EngineeringError):
+                engineering.prepare_isolated_temp_root(
+                    [base], "gate", Path("C:/" + "c" * 100), ["x" * 100], 80, False
+                )
+            collision = base / (
+                "eg-" + hashlib.sha256(b"gate").hexdigest()[:12]
+            )
+            collision.mkdir()
+            with self.assertRaises(engineering.EngineeringError):
+                engineering.prepare_isolated_temp_root(
+                    [base], "gate", Path("C:/candidate"), ["case"], 240, False
+                )
+            with self.assertRaises(engineering.EngineeringError):
+                engineering.prepare_isolated_temp_root(
+                    [base], "gate-2", Path("C:/candidate"), ["../escape"], 240, False
+                )
+            with (
+                patch.object(engineering, "_is_reparse_point", return_value=True),
+                self.assertRaises(engineering.EngineeringError),
+            ):
+                engineering.prepare_isolated_temp_root(
+                    [base], "gate-3", Path("C:/candidate"), ["case"], 240, False
+                )
+
+    def test_checkpoint_diagnostic_is_read_only_and_evidence_classified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint.json"
+            checkpoint.write_text('{"freshness":"stale"}\n', encoding="utf-8")
+            before = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            snapshot = engineering.capture_checkpoint_diagnostic(
+                paths={"checkpoint": checkpoint, "catalogue": root / "missing.json"},
+                environment={"TEMP": str(root), "TMP": str(root)},
+                processes=[{"pid": 11, "role": "consumer", "started_at": 2}],
+                observations={"path_error": True, "longest_path": 272, "path_limit": 259},
+            )
+            self.assertEqual(before, hashlib.sha256(checkpoint.read_bytes()).hexdigest())
+            self.assertEqual("PATH_ENVIRONMENT", snapshot["classification"])
+            self.assertEqual("missing", snapshot["paths"]["catalogue"]["state"])
+
+    def test_checkpoint_diagnostic_never_infers_a_cause_without_complete_evidence(self):
+        cases = (
+            ({}, "UNKNOWN"),
+            (
+                {
+                    "isolated_reproduction": True,
+                    "expected_mismatch": True,
+                    "clean_precondition": True,
+                },
+                "CODE_DEFECT",
+            ),
+            ({"shared_identity_conflict": True, "overlap_proven": True}, "PROCESS_SHARED_STATE_INTERFERENCE"),
+        )
+        for observations, expected in cases:
+            with self.subTest(expected=expected):
+                result = engineering.capture_checkpoint_diagnostic(
+                    paths={}, environment={}, processes=[], observations=observations
+                )
+                self.assertEqual(expected, result["classification"])
+
     def test_posix_ignores_windows_reparse_attributes(self):
         class OrdinaryPath:
             def is_symlink(self):
