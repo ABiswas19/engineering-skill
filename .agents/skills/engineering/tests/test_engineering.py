@@ -9678,6 +9678,14 @@ class Task7ContractTests(unittest.TestCase):
         module = self.module()
         target = self.home / "controller.json"
         target.write_text("{}", encoding="utf-8")
+        executable = Path(
+            "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+            if os.name == "nt"
+            else "/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        native_environment = {
+            "PSModulePath": str(executable.parent / "Modules")
+        }
         private = {
             "protected": True,
             "owner_sid": "S-1-5-21-1",
@@ -9697,15 +9705,23 @@ class Task7ContractTests(unittest.TestCase):
         )
         with (
             patch.object(module.os, "name", "nt"),
+            patch.object(
+                module, "_shared_native_powershell", return_value=executable
+            ),
+            patch.object(
+                module,
+                "_shared_native_powershell_environment",
+                return_value=native_environment,
+            ),
             patch.object(module.subprocess, "run", return_value=completed) as run,
         ):
             self.real_owner_private(target)
         self.assertEqual(1, run.call_count)
-        executable = Path(run.call_args.args[0][0])
-        self.assertTrue(executable.is_absolute())
-        self.assertEqual("powershell.exe", executable.name.casefold())
+        invoked = Path(run.call_args.args[0][0])
+        self.assertTrue(invoked.is_absolute())
+        self.assertEqual("powershell.exe", invoked.name.casefold())
         self.assertEqual(
-            str(executable.parent / "Modules"),
+            str(invoked.parent / "Modules"),
             run.call_args.kwargs["env"]["PSModulePath"],
         )
         self.assertNotIn("PATH", {
@@ -9733,6 +9749,14 @@ class Task7ContractTests(unittest.TestCase):
         )
         with (
             patch.object(module.os, "name", "nt"),
+            patch.object(
+                module, "_shared_native_powershell", return_value=executable
+            ),
+            patch.object(
+                module,
+                "_shared_native_powershell_environment",
+                return_value=native_environment,
+            ),
             patch.object(module.subprocess, "run", return_value=result),
         ):
             self.real_owner_private(target)
@@ -9769,6 +9793,14 @@ class Task7ContractTests(unittest.TestCase):
             )
             with (
                 patch.object(module.os, "name", "nt"),
+                patch.object(
+                    module, "_shared_native_powershell", return_value=executable
+                ),
+                patch.object(
+                    module,
+                    "_shared_native_powershell_environment",
+                    return_value=native_environment,
+                ),
                 patch.object(module.subprocess, "run", return_value=result),
                 self.assertRaisesRegex(module.EngineeringError, "owner-private"),
             ):
@@ -9782,6 +9814,14 @@ class Task7ContractTests(unittest.TestCase):
             with self.subTest(result=result):
                 with (
                     patch.object(module.os, "name", "nt"),
+                    patch.object(
+                        module, "_shared_native_powershell", return_value=executable
+                    ),
+                    patch.object(
+                        module,
+                        "_shared_native_powershell_environment",
+                        return_value=native_environment,
+                    ),
                     patch.object(module.subprocess, "run", return_value=result),
                     self.assertRaisesRegex(module.EngineeringError, "owner-private"),
                 ):
@@ -9811,6 +9851,14 @@ class Task7ContractTests(unittest.TestCase):
         module = self.module()
         target = self.home / "controller"
         target.mkdir()
+        executable = Path(
+            "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+            if os.name == "nt"
+            else "/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        native_environment = {
+            "PSModulePath": str(executable.parent / "Modules")
+        }
         private = {
             "protected": True,
             "owner_sid": "S-1-5-21-1",
@@ -9830,6 +9878,14 @@ class Task7ContractTests(unittest.TestCase):
         )
         with (
             patch.object(module.os, "name", "nt"),
+            patch.object(
+                module, "_shared_native_powershell", return_value=executable
+            ),
+            patch.object(
+                module,
+                "_shared_native_powershell_environment",
+                return_value=native_environment,
+            ),
             patch.object(module.subprocess, "run", return_value=completed) as run,
         ):
             self.real_owner_private(target)

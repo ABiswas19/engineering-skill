@@ -128,6 +128,8 @@ $entries = @($acl.Access | ForEach-Object {
 
 
 def _native_powershell() -> Path:
+    if os.name != "nt":
+        raise HostBoundaryError("owner-private ACL verification is unavailable")
     import ctypes
 
     buffer = ctypes.create_unicode_buffer(32768)

@@ -661,6 +661,29 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("[System.IO.FileInfo]", controller_module._WINDOWS_PRIVATE_ACL)
         self.assertNotIn("Get-Acl", controller_module._WINDOWS_PRIVATE_ACL)
 
+    def test_v226_native_powershell_fails_closed_off_windows(self) -> None:
+        script = (
+            ROOT
+            / ".agents"
+            / "skills"
+            / "engineering"
+            / "scripts"
+            / "engineering_host_boundary.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "engineering_v226_host_boundary_non_windows", script
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with (
+            patch.object(module.os, "name", "posix"),
+            self.assertRaisesRegex(
+                module.HostBoundaryError,
+                "owner-private ACL verification is unavailable",
+            ),
+        ):
+            module.native_powershell()
+
     def test_v226_owner_baseline_cli_only_validates_external_owner_projection(self) -> None:
         tool = ROOT / "tools" / "v226_owner_baseline.py"
         missing = subprocess.run(
@@ -2836,6 +2859,120 @@ Residual risk: No repository-supported vulnerability intake is available.
             self.assertEqual(
                 [], module.audit_reachable_history(root, policy, "distribution")
             )
+
+    def test_reachable_history_budget_counts_reused_blobs_once_and_unique_bytes_fail_closed(
+        self,
+    ) -> None:
+        """An unchanged blob is one evidence object, while new bytes consume budget."""
+        spec = importlib.util.spec_from_file_location(
+            "engineering_audience_unique_history_budget",
+            ROOT / "tools" / "check_audience.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        policy = {
+            "schema": "engineering.audience-isolation-policy.v1",
+            "audiences": {
+                "source": {
+                    "forbidden_markers": ["DISTRIBUTION-ONLY"],
+                    "security_route": {
+                        "state": "not_required",
+                        "mechanism": None,
+                        "authority_reference": "owner-approved:synthetic-release-scope",
+                        "residual_risk": "No repository-supported vulnerability intake is available.",
+                    },
+                },
+                "distribution": {
+                    "forbidden_markers": ["CANONICAL-ONLY"],
+                    "security_route": {
+                        "state": "verified",
+                        "mechanism": "private",
+                    },
+                },
+            },
+            "surfaces": {
+                "tree": ["manifests", "tree", "workflows"],
+                "history": ["reachable_history"],
+                "metadata": [
+                    "comments",
+                    "issues",
+                    "pull_requests",
+                    "releases",
+                    "reviews",
+                ],
+            },
+            "export": {
+                "mode": "byte_identical",
+                "same_snapshot_required": True,
+                "transformations": [],
+            },
+            "literal_exceptions": [],
+            "history_exceptions": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "history"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(root)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Synthetic"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "user.email",
+                    "synthetic" + "@" + "example.invalid",
+                ],
+                check=True,
+            )
+            (root / "payload.txt").write_bytes(b"s" * 1024)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "payload.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-m", "safe initial"],
+                check=True,
+                capture_output=True,
+            )
+            for index in range(4):
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        f"safe reuse {index}",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            with patch.object(module, "HISTORY_LIMIT", 1536):
+                self.assertEqual(
+                    [], module.audit_reachable_history(root, policy, "source")
+                )
+
+            (root / "payload.txt").write_bytes(b"n" * 2048)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "payload.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-m", "safe new bytes"],
+                check=True,
+                capture_output=True,
+            )
+            with patch.object(module, "HISTORY_LIMIT", 1536):
+                self.assertEqual(
+                    ["history_surface_unknown"],
+                    module.audit_reachable_history(root, policy, "source"),
+                )
 
     def test_repository_has_no_generated_or_private_state(self) -> None:
         forbidden_names = {
