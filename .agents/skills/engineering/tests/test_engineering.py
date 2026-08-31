@@ -46,6 +46,7 @@ def load_engineering():
 
 
 engineering = load_engineering()
+host_boundary = sys.modules["engineering_host_boundary"]
 
 
 def synthetic_owner_private(path: Path) -> None:
@@ -54,6 +55,152 @@ def synthetic_owner_private(path: Path) -> None:
 
 
 class CrossPlatformFilesystemTests(unittest.TestCase):
+    def test_windows_acl_commands_use_the_bounded_hosted_runner_budget(self):
+        executable = Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        environment = {"PSModulePath": str(executable.parent / "Modules")}
+        private = {
+            "protected": True,
+            "owner_sid": "S-1-5-21-1",
+            "current_sid": "S-1-5-21-1",
+            "access": [
+                {
+                    "sid": "S-1-5-21-1",
+                    "type": "Allow",
+                    "inherited": False,
+                    "inheritance": "None",
+                    "propagation": "None",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "attestation.key"
+            target.write_text("synthetic\n", encoding="utf-8")
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ENGINEERING_WINDOWS_ACL_TIMEOUT_SECONDS": "0"},
+                    clear=False,
+                ),
+                patch.object(host_boundary.os, "name", "nt"),
+                patch.object(host_boundary, "_native_powershell", return_value=executable),
+                patch.object(
+                    host_boundary,
+                    "_native_powershell_environment",
+                    return_value=environment,
+                ),
+                patch.object(
+                    host_boundary.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps(private), stderr=""
+                    ),
+                ) as boundary_run,
+            ):
+                host_boundary.verify_owner_private(target, directory=False)
+            self.assertEqual(90, boundary_run.call_args.kwargs["timeout"])
+
+            controller_result = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout="ENGINEERING_ACL_RESULT:" + json.dumps(private),
+                stderr="",
+            )
+            with (
+                patch.object(engineering.os, "name", "nt"),
+                patch.object(
+                    engineering, "_shared_native_powershell", return_value=executable
+                ),
+                patch.object(
+                    engineering,
+                    "_shared_native_powershell_environment",
+                    return_value=environment,
+                ),
+                patch.object(
+                    engineering.subprocess, "run", return_value=controller_result
+                ) as controller_run,
+            ):
+                engineering._windows_owner_private(target, enforce=True)
+            self.assertEqual(90, controller_run.call_args.kwargs["timeout"])
+
+    def test_windows_acl_timeout_preserves_diagnostics_and_fails_closed(self):
+        executable = Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        timeout = subprocess.TimeoutExpired(
+            [str(executable)], 90, output="partial-out", stderr="partial-err"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "controller"
+            target.mkdir()
+            with (
+                patch.object(host_boundary.os, "name", "nt"),
+                patch.object(host_boundary, "_native_powershell", return_value=executable),
+                patch.object(
+                    host_boundary,
+                    "_native_powershell_environment",
+                    return_value={"PSModulePath": str(executable.parent / "Modules")},
+                ),
+                patch.object(host_boundary.subprocess, "run", side_effect=timeout),
+                self.assertRaises(host_boundary.HostBoundaryError) as caught,
+            ):
+                host_boundary.verify_owner_private(target, directory=True)
+
+        self.assertEqual("partial-out", getattr(caught.exception, "stdout", None))
+        self.assertEqual("partial-err", getattr(caught.exception, "stderr", None))
+        self.assertEqual(90, getattr(caught.exception, "timeout_seconds", None))
+        self.assertIs(caught.exception.__cause__, timeout)
+
+    def test_windows_acl_timeout_kills_and_reaps_the_child(self):
+        runner = getattr(host_boundary, "run_native_powershell_acl", None)
+        self.assertIsNotNone(runner, "shared bounded ACL subprocess runner is required")
+        if runner is None:
+            return
+        with patch.object(host_boundary, "WINDOWS_ACL_TIMEOUT_SECONDS", 0.2):
+            with self.assertRaises(host_boundary.HostBoundaryError) as caught:
+                runner(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,time; "
+                            "print(os.getpid(), flush=True); "
+                            "time.sleep(60)"
+                        ),
+                    ],
+                    environment=os.environ.copy(),
+                )
+        child_pid = int(str(caught.exception.stdout).strip())
+        if os.name == "nt":
+            active = subprocess.run(
+                ["tasklist.exe", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotIn(f'"{child_pid}"', active.stdout)
+        else:
+            with self.assertRaises(OSError):
+                os.kill(child_pid, 0)
+
+    def test_posix_owner_private_verification_never_starts_powershell(self):
+        class PosixPrivateDirectory:
+            def is_dir(self):
+                return True
+
+            def is_file(self):
+                return False
+
+            def stat(self):
+                return type("StatResult", (), {"st_mode": 0o40700, "st_uid": 0})()
+
+        target = PosixPrivateDirectory()
+        with (
+            patch.object(host_boundary, "Path", return_value=target),
+            patch.object(host_boundary, "reject_reparse_ancestors"),
+            patch.object(host_boundary.os, "name", "posix"),
+            patch.object(host_boundary.subprocess, "run") as run,
+        ):
+            host_boundary.verify_owner_private(target, directory=True)
+        run.assert_not_called()
+
     def test_unittest_terminal_parser_covers_authoritative_summary_variants(self):
         fixtures = {
             "Ran 3 tests in 0.1s\n\nOK\n": {

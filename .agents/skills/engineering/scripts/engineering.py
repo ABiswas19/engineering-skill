@@ -35,6 +35,7 @@ try:
         canonical_host_home as _shared_canonical_host_home,
         native_powershell as _shared_native_powershell,
         native_powershell_environment as _shared_native_powershell_environment,
+        run_native_powershell_acl as _shared_run_native_powershell_acl,
     )
 finally:
     sys.path.remove(_SCRIPT_DIRECTORY)
@@ -10586,27 +10587,23 @@ def _windows_owner_private(path: Path, *, enforce: bool) -> None:
     try:
         executable = _shared_native_powershell()
         environment = _shared_native_powershell_environment(executable)
+        result = _shared_run_native_powershell_acl(
+            [
+                str(executable),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                _WINDOWS_PRIVATE_ACL,
+                str(path),
+                "1" if enforce else "0",
+                "1" if directory else "0",
+            ],
+            environment=environment,
+        )
     except (HostBoundaryError, OSError) as error:
         raise EngineeringError(
             "Engineering controller owner-private ACL verification failed."
         ) from error
-    result = subprocess.run(
-        [
-            str(executable),
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            _WINDOWS_PRIVATE_ACL,
-            str(path),
-            "1" if enforce else "0",
-            "1" if directory else "0",
-        ],
-        capture_output=True,
-        text=True,
-        env=environment,
-        timeout=30,
-        check=False,
-    )
     if result.returncode != 0:
         raise EngineeringError("Engineering controller owner-private ACL verification failed.")
     records = [

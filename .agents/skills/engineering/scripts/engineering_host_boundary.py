@@ -10,8 +10,52 @@ import subprocess
 import uuid
 
 
+WINDOWS_ACL_TIMEOUT_SECONDS = 90
+
+
 class HostBoundaryError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: str | None = None,
+        stderr: str | None = None,
+        timeout_seconds: int | float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timeout_seconds = timeout_seconds
+
+
+def _diagnostic_text(value: str | bytes | None) -> str | None:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def run_native_powershell_acl(
+    command: list[str], *, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run one fail-closed ACL command with the hosted-Windows evidence budget."""
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=WINDOWS_ACL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise HostBoundaryError(
+            "owner-private ACL verification timed out",
+            stdout=_diagnostic_text(error.stdout),
+            stderr=_diagnostic_text(error.stderr),
+            timeout_seconds=WINDOWS_ACL_TIMEOUT_SECONDS,
+        ) from error
+    except OSError as error:
+        raise HostBoundaryError("owner-private ACL verification is unavailable") from error
 
 
 def _native_profile_home() -> Path:
@@ -184,7 +228,7 @@ def verify_owner_private(path: Path, *, directory: bool) -> None:
         return
     try:
         executable = _native_powershell()
-        result = subprocess.run(
+        result = run_native_powershell_acl(
             [
                 str(executable),
                 "-NoProfile",
@@ -193,14 +237,10 @@ def verify_owner_private(path: Path, *, directory: bool) -> None:
                 _WINDOWS_ACL_QUERY,
                 str(path),
             ],
-            capture_output=True,
-            text=True,
-            env=_native_powershell_environment(executable),
-            timeout=30,
-            check=False,
+            environment=_native_powershell_environment(executable),
         )
         payload = json.loads(result.stdout)
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+    except json.JSONDecodeError as error:
         raise HostBoundaryError("owner-private ACL verification is unavailable") from error
     access = payload.get("access") if isinstance(payload, dict) else None
     current = payload.get("current_sid") if isinstance(payload, dict) else None
