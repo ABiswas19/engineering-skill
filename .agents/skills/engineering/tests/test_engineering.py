@@ -11,6 +11,7 @@ import runpy
 import signal
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 import threading
@@ -304,6 +305,135 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
             self.assertTrue(cleanup["owner_private_verified_before_delete"])
             self.assertEqual(receipt["root_identity"], cleanup["root_identity"])
             self.assertFalse(root.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only TEMP rollback only")
+    def test_isolated_temp_rollback_removes_owned_readonly_file(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g4-") as temporary:
+            receipt = engineering.prepare_isolated_temp_root(
+                [Path(temporary)], "readonly-file", Path("C:/candidate"),
+                ["case"], 259, False,
+            )
+            root = Path(receipt["root"])
+            nested = root / ".git" / "objects" / "ab"
+            nested.mkdir(parents=True)
+            target = nested / "git-object"
+            target.write_bytes(b"temporary object")
+            target.chmod(stat.S_IREAD)
+            direct = root / "direct-object"
+            direct.write_bytes(b"temporary direct object")
+            direct.chmod(stat.S_IREAD)
+            try:
+                cleanup = engineering.rollback_isolated_temp_root(receipt)
+                self.assertEqual("original-object-removed", cleanup["original_object_disposition"])
+                self.assertFalse(root.exists())
+            finally:
+                if target.exists():
+                    target.chmod(stat.S_IWRITE)
+                if direct.exists():
+                    direct.chmod(stat.S_IWRITE)
+                if root.exists():
+                    shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows TEMP rollback ordering only")
+    def test_isolated_temp_rollback_keeps_marker_when_child_removal_fails(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g4-") as temporary:
+            receipt = engineering.prepare_isolated_temp_root(
+                [Path(temporary)], "child-failure", Path("C:/candidate"),
+                ["case"], 259, False,
+            )
+            root = Path(receipt["root"])
+            marker = root / ".engineering-temp-owner.json"
+            (root / "nested").mkdir()
+            try:
+                with patch.object(
+                    engineering, "_delete_windows_temp_directory_tree",
+                    side_effect=PermissionError("synthetic"),
+                ):
+                    with self.assertRaises(PermissionError):
+                        engineering.rollback_isolated_temp_root(receipt)
+                self.assertTrue(marker.is_file())
+            finally:
+                if root.exists():
+                    shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows readonly hardlink rollback only")
+    def test_isolated_temp_rollback_does_not_change_outside_hardlink_attributes(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g4-") as temporary:
+            base = Path(temporary)
+            outside = base / "outside-readonly"
+            outside.write_bytes(b"preserve outside attributes")
+            outside.chmod(stat.S_IREAD)
+            receipt = engineering.prepare_isolated_temp_root(
+                [base], "hardlink-check", Path("C:/candidate"), ["case"], 259, False,
+            )
+            root = Path(receipt["root"])
+            os.link(outside, root / "owned-hardlink")
+            try:
+                engineering.rollback_isolated_temp_root(receipt)
+                self.assertTrue(outside.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+                self.assertEqual(b"preserve outside attributes", outside.read_bytes())
+            finally:
+                if outside.exists():
+                    outside.chmod(stat.S_IWRITE)
+                if root.exists():
+                    for path in root.iterdir():
+                        if path.name != ".engineering-temp-owner.json" and path.is_file():
+                            path.chmod(stat.S_IWRITE)
+                    shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows TEMP rollback ordering only")
+    def test_isolated_temp_rollback_keeps_marker_for_late_child(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g4-") as temporary:
+            receipt = engineering.prepare_isolated_temp_root(
+                [Path(temporary)], "late-child", Path("C:/candidate"), ["case"], 259, False,
+            )
+            root = Path(receipt["root"])
+            marker = root / ".engineering-temp-owner.json"
+            original = engineering._validate_isolated_temp_root_before_delete
+            calls = 0
+
+            def inject_after_validation(*args):
+                nonlocal calls
+                result = original(*args)
+                calls += 1
+                if calls == 2:
+                    (root / "late-child").write_text("late", encoding="utf-8")
+                return result
+
+            try:
+                with patch.object(
+                    engineering, "_validate_isolated_temp_root_before_delete",
+                    side_effect=inject_after_validation,
+                ):
+                    with self.assertRaises(engineering.EngineeringError):
+                        engineering.rollback_isolated_temp_root(receipt)
+                self.assertTrue(marker.is_file())
+                self.assertTrue((root / "late-child").is_file())
+            finally:
+                if root.exists():
+                    shutil.rmtree(root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows identity-bound tree rollback only")
+    def test_isolated_temp_rollback_never_uses_path_recursive_delete(self):
+        with tempfile.TemporaryDirectory(dir=r"C:\Temp", prefix="g4-") as temporary:
+            receipt = engineering.prepare_isolated_temp_root(
+                [Path(temporary)], "nested-tree", Path("C:/candidate"), ["case"], 259, False,
+            )
+            root = Path(receipt["root"])
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "file").write_text("temporary", encoding="utf-8")
+            try:
+                with patch.object(
+                    engineering.shutil, "rmtree",
+                    side_effect=AssertionError("unsafe path-recursive delete"),
+                ):
+                    cleanup = engineering.rollback_isolated_temp_root(receipt)
+                self.assertEqual("original-object-removed", cleanup["original_object_disposition"])
+                self.assertFalse(root.exists())
+            finally:
+                if root.exists():
+                    shutil.rmtree(root)
 
     @unittest.skipUnless(os.name == "nt", "Windows legacy path budget only")
     def test_isolated_temp_preflight_rejects_a_caller_understated_suffix_budget(self):
@@ -1235,6 +1365,15 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
                 )
             engineering._windows_owner_private(controller, enforce=True)
             engineering._verify_owner_private(controller, directory=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL transport only")
+    def test_windows_owner_private_accepts_space_and_apostrophe_in_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = Path(temporary) / "owner private O'Brien"
+            controller.mkdir()
+            engineering._windows_owner_private(controller, enforce=True)
+            engineering._verify_owner_private(controller, directory=True)
+            host_boundary.verify_owner_private(controller, directory=True)
 
 
 class SkillShapeTests(unittest.TestCase):
@@ -9874,9 +10013,10 @@ class Task7ContractTests(unittest.TestCase):
         self.assertNotIn("PATH", {
             key.upper(): value for key, value in run.call_args.kwargs["env"].items()
         })
-        self.assertEqual(str(target), run.call_args.args[0][-3])
-        self.assertEqual("1", run.call_args.args[0][-2])
-        self.assertEqual("0", run.call_args.args[0][-1])
+        expected_target = "'" + str(target).replace("'", "''") + "'"
+        self.assertEqual(expected_target, run.call_args.args[0][-3])
+        self.assertEqual("'1'", run.call_args.args[0][-2])
+        self.assertEqual("'0'", run.call_args.args[0][-1])
 
         system_private = {
             **private,
@@ -10037,9 +10177,10 @@ class Task7ContractTests(unittest.TestCase):
         ):
             self.real_owner_private(target)
 
-        self.assertEqual(str(target), run.call_args.args[0][-3])
-        self.assertEqual("1", run.call_args.args[0][-2])
-        self.assertEqual("1", run.call_args.args[0][-1])
+        expected_target = "'" + str(target).replace("'", "''") + "'"
+        self.assertEqual(expected_target, run.call_args.args[0][-3])
+        self.assertEqual("'1'", run.call_args.args[0][-2])
+        self.assertEqual("'1'", run.call_args.args[0][-1])
 
     def test_proposed_candidate_is_project_local_and_not_discoverable(self):
         module = self.module()

@@ -38,6 +38,11 @@ def run_native_powershell_acl(
     command: list[str], *, environment: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
     """Run one fail-closed ACL command with the hosted-Windows evidence budget."""
+    if "-Command" in command:
+        script_end = command.index("-Command") + 2
+        command = command[:script_end] + [
+            "'" + value.replace("'", "''") + "'" for value in command[script_end:]
+        ]
     try:
         return subprocess.run(
             command,

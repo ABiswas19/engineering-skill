@@ -523,6 +523,118 @@ def _capture_windows_directory_handle_identity(path: Path) -> dict:
         _close_windows_handle(handle)
 
 
+def _verify_windows_temp_handle(handle, path: Path, *, directory: bool) -> None:
+    """Require an opened, non-reparse object at the exact expected path."""
+    if os.name != "nt":
+        raise _rollback_identity_error("unknown")
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    info = FileAttributeTagInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        raise _rollback_identity_error("unknown")
+    attributes = info.FileAttributes
+    if attributes & 0x00000400 or bool(attributes & 0x00000010) != directory:
+        raise _rollback_identity_error("reparse")
+    kernel32.GetFinalPathNameByHandleW.argtypes = (
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+    )
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = kernel32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+    final_path = buffer.value
+    if not (0 < length < len(buffer) and final_path.startswith("\\\\?\\")):
+        raise _rollback_identity_error("unknown")
+    if os.path.normcase(os.path.abspath(final_path[4:])) != os.path.normcase(
+        os.path.abspath(path)
+    ):
+        raise _rollback_identity_error("identity-changed")
+
+
+def _delete_windows_temp_regular_file(
+    path: Path, root: Path, base: Path, receipt: dict
+) -> None:
+    """Delete one owned regular file by non-reparse handle without changing attributes."""
+    if os.name != "nt":
+        raise _rollback_identity_error("unknown")
+    import ctypes
+    from ctypes import wintypes
+
+    _validate_isolated_temp_root_before_delete(root, base, receipt)
+    _reject_reparse_ancestors(path, root)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x00010000 | 0x00000080 | 0x00000100,  # DELETE | READ_ATTRIBUTES | WRITE_ATTRIBUTES
+        0,  # no sharing: the opened file cannot be replaced before disposition
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # OPEN_REPARSE_POINT: inspect the link itself, never its target
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise _rollback_identity_error("unknown")
+    try:
+        _verify_windows_temp_handle(handle, path, directory=False)
+        _validate_isolated_temp_root_before_delete(root, base, receipt)
+
+        kernel32.SetFileInformationByHandle.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        )
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        flags = wintypes.DWORD(0x00000001 | 0x00000010)  # DELETE | IGNORE_READONLY_ATTRIBUTE
+        if not kernel32.SetFileInformationByHandle(
+            handle, 21, ctypes.byref(flags), ctypes.sizeof(flags)  # FileDispositionInfoEx
+        ):
+            raise _rollback_identity_error("unknown")
+    finally:
+        _close_windows_handle(handle)
+    if path.exists() or path.is_symlink():
+        raise _rollback_identity_error("unknown")
+
+
+def _delete_windows_temp_directory_tree(
+    path: Path, root: Path, base: Path, receipt: dict
+) -> None:
+    """Walk owned directories using pinned non-reparse handles, not shutil.rmtree."""
+    _validate_isolated_temp_root_before_delete(root, base, receipt)
+    _reject_reparse_ancestors(path, root)
+    handle = _open_windows_directory_delete_handle(path)
+    try:
+        _verify_windows_temp_handle(handle, path, directory=True)
+        expected_identity = _windows_directory_handle_identity(handle)
+        for child in list(path.iterdir()):
+            if child.is_dir() and not child.is_symlink() and not _is_reparse_point(child):
+                _delete_windows_temp_directory_tree(child, root, base, receipt)
+            else:
+                _delete_windows_temp_regular_file(child, root, base, receipt)
+        _validate_isolated_temp_root_before_delete(root, base, receipt)
+        if list(path.iterdir()):
+            raise _rollback_identity_error("unknown")
+        if _windows_directory_handle_identity(handle) != expected_identity:
+            raise _rollback_identity_error("identity-changed")
+        _mark_windows_directory_delete_on_close(handle)
+    finally:
+        _close_windows_handle(handle)
+    if path.exists() or path.is_symlink():
+        raise _rollback_identity_error("unknown")
+
+
 def _rollback_unpublished_temp_root(root: Path, identity: dict) -> None:
     """Rollback only the exact new root before a receipt is published."""
     if (
@@ -731,13 +843,19 @@ def _remove_identity_bound_isolated_temp_root(
         pre_delete = _validate_isolated_temp_root_before_delete(root, base, receipt)
         if _windows_directory_handle_identity(handle) != expected_handle_identity:
             raise _rollback_identity_error("identity-changed")
+
+        marker = root / ".engineering-temp-owner.json"
         for child in list(root.iterdir()):
-            if child.is_symlink() or _is_reparse_point(child):
-                raise _rollback_identity_error("reparse")
-            if child.is_dir():
-                shutil.rmtree(child)
+            if child == marker:
+                continue
+            if child.is_dir() and not child.is_symlink() and not _is_reparse_point(child):
+                _delete_windows_temp_directory_tree(child, root, base, receipt)
             else:
-                child.unlink()
+                _delete_windows_temp_regular_file(child, root, base, receipt)
+        _validate_isolated_temp_root_before_delete(root, base, receipt)
+        if any(child != marker for child in root.iterdir()):
+            raise _rollback_identity_error("unknown")
+        marker.unlink()
         if list(root.iterdir()):
             raise _rollback_identity_error("unknown")
         if _windows_directory_handle_identity(handle) != expected_handle_identity:
