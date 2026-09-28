@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 from pathlib import Path, PosixPath
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -82,7 +83,7 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
                     {"ENGINEERING_WINDOWS_ACL_TIMEOUT_SECONDS": "0"},
                     clear=False,
                 ),
-                patch.object(host_boundary.os, "name", "nt"),
+                patch.object(host_boundary, "os", SimpleNamespace(name="nt")),
                 patch.object(host_boundary, "_native_powershell", return_value=executable),
                 patch.object(
                     host_boundary,
@@ -107,7 +108,7 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
                 stderr="",
             )
             with (
-                patch.object(engineering.os, "name", "nt"),
+                patch.object(engineering, "os", SimpleNamespace(name="nt")),
                 patch.object(
                     engineering, "_shared_native_powershell", return_value=executable
                 ),
@@ -132,7 +133,7 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
             target = Path(temporary) / "controller"
             target.mkdir()
             with (
-                patch.object(host_boundary.os, "name", "nt"),
+                patch.object(host_boundary, "os", SimpleNamespace(name="nt")),
                 patch.object(host_boundary, "_native_powershell", return_value=executable),
                 patch.object(
                     host_boundary,
@@ -190,7 +191,11 @@ class CrossPlatformFilesystemTests(unittest.TestCase):
                 return False
 
             def stat(self):
-                return type("StatResult", (), {"st_mode": 0o40700, "st_uid": 0})()
+                return type(
+                    "StatResult",
+                    (),
+                    {"st_mode": 0o40700, "st_uid": getattr(os, "geteuid", lambda: 0)()},
+                )()
 
         target = PosixPrivateDirectory()
         with (
