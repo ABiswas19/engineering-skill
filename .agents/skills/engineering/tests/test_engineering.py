@@ -3727,6 +3727,118 @@ class Task3ContractTests(unittest.TestCase):
         )
         return extra
 
+    @staticmethod
+    def _safe_rebuild_diagnostic(result: object) -> dict[str, object]:
+        result = result if isinstance(result, dict) else {}
+        modes = {"blocked", "changed_path_adapter", "exact_cache", "full", "stale"}
+        reasons = {
+            "canonical_authority_changed",
+            "candidate_checkpoint_invalid",
+            "checkpoint_quarantine_boundary_invalid",
+            "checkpoint_quarantine_collision",
+            "checkpoint_quarantine_failed",
+            "checkpoint_quarantine_record_invalid",
+            "checkpoint_quarantine_rollback_failed",
+            "cold_rebuild_deferred",
+            "commit_mismatch",
+            "graph_worker_failed",
+            "graphify_adapter_failed",
+            "hook_budget_exceeded",
+            "live_hook_operation",
+            "overlay_mismatch",
+            "repository_lock_owner_mismatch",
+            "root_binding_mismatch",
+            "unresolved_hook_worker_orphan",
+        }
+        cleanup_reasons = {
+            "clean",
+            "registered_operation_remove_failed",
+            "registered_worktree_remove_failed",
+            "repository_lock_owner_mismatch",
+        }
+        operation = result.get("operation")
+        cleanup = result.get("cleanup")
+        operation = operation if isinstance(operation, dict) else None
+        cleanup = cleanup if isinstance(cleanup, dict) else None
+        evidence = operation.get("worker_process_tree_evidence") if operation else None
+        evidence = evidence if isinstance(evidence, dict) else {}
+        mode = result.get("mode")
+        reason = result.get("reason")
+        cleanup_reason = cleanup.get("reason") if cleanup else None
+        tree_state = evidence.get("state")
+        return {
+            "mode": mode if isinstance(mode, str) and mode in modes else "other",
+            "reason": reason if isinstance(reason, str) and reason in reasons else "other",
+            "operation_present": operation is not None,
+            "worker_tree_state": (
+                tree_state
+                if isinstance(tree_state, str)
+                and tree_state in {"dead", "live", "identity_ambiguous"}
+                else "unknown"
+            ),
+            "worker_tree_authoritative": (
+                operation.get("worker_process_tree_authoritative")
+                if operation
+                and isinstance(operation.get("worker_process_tree_authoritative"), bool)
+                else None
+            ),
+            "cleanup_present": cleanup is not None,
+            "cleanup_completed": (
+                cleanup.get("completed")
+                if cleanup and isinstance(cleanup.get("completed"), bool)
+                else None
+            ),
+            "cleanup_reason": (
+                cleanup_reason
+                if isinstance(cleanup_reason, str) and cleanup_reason in cleanup_reasons
+                else "other"
+            ) if cleanup else None,
+            "orphan_reconciled_before_worker": (
+                result.get("orphan_reconciled_before_worker")
+                if isinstance(result.get("orphan_reconciled_before_worker"), bool)
+                else None
+            ),
+            "quarantine_present": isinstance(result.get("quarantine"), dict),
+        }
+
+    def test_rebuild_failure_diagnostic_exposes_only_safe_summary_fields(self):
+        summarize = getattr(self, "_safe_rebuild_diagnostic", None)
+        self.assertIsNotNone(summarize, "safe rebuild diagnostics are required")
+        self.assertEqual(
+            {
+                "mode": "stale",
+                "reason": "other",
+                "operation_present": True,
+                "worker_tree_state": "dead",
+                "worker_tree_authoritative": True,
+                "cleanup_present": True,
+                "cleanup_completed": True,
+                "cleanup_reason": "clean",
+                "orphan_reconciled_before_worker": False,
+                "quarantine_present": True,
+            },
+            summarize(
+                {
+                    "mode": "stale",
+                    "reason": r"C:\private\raw exception text",
+                    "checkpoint": r"C:\private\checkpoint.json",
+                    "operation": {
+                        "owner_pid": 12345,
+                        "root": r"C:\private\repo",
+                        "worker_process_tree_authoritative": True,
+                        "worker_process_tree_evidence": {"state": "dead"},
+                    },
+                    "cleanup": {
+                        "completed": True,
+                        "reason": "clean",
+                        "path": r"C:\private\operation.json",
+                    },
+                    "orphan_reconciled_before_worker": False,
+                    "quarantine": {"relative_path": "quarantine/private"},
+                },
+            ),
+        )
+
     def adversarial_graphify_environment(self) -> tuple[dict[str, str], dict[str, str]]:
         """Return a fixed runtime baseline plus values Graphify must never inherit."""
         temporary = Path(self.temporary_directory.name) / "graphify-runtime"
@@ -3790,7 +3902,14 @@ class Task3ContractTests(unittest.TestCase):
         environment = self.graphify_environment(fake)
         with patch.dict(os.environ, environment, clear=False):
             result = self.module().rebuild(root, sys.executable)
-        self.assertEqual("full", result["mode"])
+        self.assertEqual(
+            "full",
+            result.get("mode"),
+            msg=(
+                "cold_checkpoint_diagnostic="
+                + json.dumps(self._safe_rebuild_diagnostic(result), sort_keys=True)
+            ),
+        )
         return fake, environment
 
     def test_all_worktrees_share_one_git_common_graph_root(self):
@@ -4238,6 +4357,17 @@ class Task3ContractTests(unittest.TestCase):
         environment = self.graphify_environment(fake)
         with patch.dict(os.environ, environment, clear=False):
             first = module.rebuild(root, sys.executable)
+        first_diagnostic = self._safe_rebuild_diagnostic(first)
+        self.assertEqual(
+            "current",
+            first.get("freshness"),
+            msg=f"initial_checkpoint_diagnostic={json.dumps(first_diagnostic, sort_keys=True)}",
+        )
+        self.assertIs(
+            True,
+            first_diagnostic["cleanup_completed"],
+            msg=f"initial_checkpoint_diagnostic={json.dumps(first_diagnostic, sort_keys=True)}",
+        )
         commit = self.git(root, "rev-parse", "HEAD")
         destination = module._checkpoint_path(root, commit)
         invalid = json.loads(destination.read_text(encoding="utf-8"))
@@ -4302,6 +4432,17 @@ class Task3ContractTests(unittest.TestCase):
         destination.write_text(json.dumps(invalid), encoding="utf-8")
         with patch.dict(os.environ, environment, clear=False):
             result = module.rebuild(root, sys.executable)
+        diagnostic = self._safe_rebuild_diagnostic(result)
+        self.assertEqual(
+            "current",
+            result.get("freshness"),
+            msg=f"quarantine_checkpoint_diagnostic={json.dumps(diagnostic, sort_keys=True)}",
+        )
+        self.assertIs(
+            True,
+            diagnostic["quarantine_present"],
+            msg=f"quarantine_checkpoint_diagnostic={json.dumps(diagnostic, sort_keys=True)}",
+        )
         quarantine_path = module.common_graph_dir(root) / result["quarantine"]["relative_path"]
         metadata_path = quarantine_path.with_name(quarantine_path.name + ".json")
         tampered = json.loads(metadata_path.read_text(encoding="utf-8"))
