@@ -3839,6 +3839,14 @@ class Task3ContractTests(unittest.TestCase):
             ),
         )
 
+    def test_rebuild_diagnostic_helper_is_available_to_all_shared_callers(self):
+        for test_class in (Task3ContractTests, Task3AmendedContractTests, Task6ContractTests):
+            with self.subTest(test_class=test_class.__name__):
+                self.assertTrue(
+                    callable(getattr(test_class, "_safe_rebuild_diagnostic", None)),
+                    f"{test_class.__name__} must expose the shared diagnostic helper",
+                )
+
     def adversarial_graphify_environment(self) -> tuple[dict[str, str], dict[str, str]]:
         """Return a fixed runtime baseline plus values Graphify must never inherit."""
         temporary = Path(self.temporary_directory.name) / "graphify-runtime"
@@ -4804,6 +4812,7 @@ class Task3ContractTests(unittest.TestCase):
 class Task3AmendedContractTests(unittest.TestCase):
     setUp = Task3ContractTests.setUp
     module = Task3ContractTests.module
+    _safe_rebuild_diagnostic = staticmethod(Task3ContractTests._safe_rebuild_diagnostic)
     init_repo = Task3ContractTests.init_repo
     write_canonical_checkpoint = Task2ContractTests.write_canonical_checkpoint
     recover_fixture_checkpoint = Task2ContractTests.recover_fixture_checkpoint
@@ -6088,7 +6097,7 @@ class Task3AmendedContractTests(unittest.TestCase):
             "_process_tree_status",
             return_value={"state": "dead", "evidence": "saved_identity_absent"},
             create=True,
-        ):
+        ), patch.object(module, "_owner_process_state", return_value="dead"):
             status = module.orphan_operation_status(root)
             reap = module.reap_orphan_operation(
                 root, operation["operation_id"], timeout_seconds=30
@@ -6135,7 +6144,7 @@ class Task3AmendedContractTests(unittest.TestCase):
             "_process_tree_status",
             return_value={"state": "live", "evidence": "saved_child_alive"},
             create=True,
-        ):
+        ), patch.object(module, "_owner_process_state", return_value="dead"):
             result = module.reap_orphan_operation(
                 root, operation["operation_id"], timeout_seconds=30
             )
@@ -6181,7 +6190,7 @@ class Task3AmendedContractTests(unittest.TestCase):
             "_process_tree_status",
             return_value={"state": "identity_ambiguous", "evidence": "pid_reused"},
             create=True,
-        ):
+        ), patch.object(module, "_owner_process_state", return_value="dead"):
             result = module.reap_orphan_operation(
                 root, operation["operation_id"], timeout_seconds=30
             )
@@ -6226,13 +6235,60 @@ class Task3AmendedContractTests(unittest.TestCase):
             "_process_tree_status",
             return_value={"state": "dead", "evidence": "saved_identity_absent"},
             create=True,
-        ):
+        ), patch.object(module, "_owner_process_state", return_value="dead"):
             result = module.reap_orphan_operation(
                 root, operation["operation_id"], timeout_seconds=30
             )
         self.assertFalse(result["completed"])
         self.assertEqual("repository_lock_owner_mismatch", result["reason"])
         self.assertTrue(Path(record["record_path"]).exists())
+
+    def test_orphan_reap_preserves_operation_when_owner_identity_is_ambiguous(self):
+        module = self.module()
+        root = self.governed_repo("orphan-ambiguous-owner")
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            owner_pid=4242,
+            worker_pid=4242,
+            phase="orphaned",
+            worker_process_tree_dead=False,
+            worker_identity={"pid": 4242, "start_time": "worker-start"},
+            worker_process_tree=[
+                {"pid": 4242, "parent_pid": 1, "start_time": "worker-start"}
+            ],
+            created_at=time.time() - module.ORPHAN_MINIMUM_AGE_SECONDS - 1,
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+        owner_path = Path(record["repository_lock_path"], "owner.json")
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "operation_id": operation["operation_id"],
+                    "lock_token": record["lock_token"],
+                    "owner_pid": record["worker_pid"],
+                    "owner_identity": record["worker_identity"],
+                    "created_at": record["created_at"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(module, "_owner_process_state", return_value="ambiguous"),
+            patch.object(module, "_process_tree_status") as process_tree_status,
+        ):
+            result = module.reap_orphan_operation(
+                root, operation["operation_id"], timeout_seconds=30
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual("ambiguous_worker_process_identity", result["reason"])
+        process_tree_status.assert_not_called()
+        self.assertTrue(Path(record["record_path"]).exists())
+        self.assertTrue(Path(record["repository_lock_path"]).exists())
+        self.assertEqual(record["lock_token"], module._lock_owner(record)["lock_token"])
 
     def test_orphan_reap_never_removes_live_pre_worker_registration(self):
         module = self.module()
@@ -8910,6 +8966,7 @@ class Task5ContractTests(unittest.TestCase):
 
 class Task6ContractTests(unittest.TestCase):
     init_repo = Task2ContractTests.init_repo
+    _safe_rebuild_diagnostic = staticmethod(Task3ContractTests._safe_rebuild_diagnostic)
     git = Task2ContractTests.git
     commit_all = Task2ContractTests.commit_all
     run_cli = Task2ContractTests.run_cli
