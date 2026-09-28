@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -292,6 +293,7 @@ class RepositoryContractTests(unittest.TestCase):
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        fixture_now = datetime.now(timezone.utc)
 
         role = (
             "internal"
@@ -375,8 +377,8 @@ class RepositoryContractTests(unittest.TestCase):
                             "role": role,
                             "argv": argv,
                             "cwd": str(ROOT.resolve()),
-                            "started_at": "2026-08-25T08:00:00+00:00",
-                            "finished_at": "2026-08-25T08:01:00+00:00",
+                            "started_at": (fixture_now - timedelta(minutes=2)).isoformat(),
+                            "finished_at": (fixture_now - timedelta(minutes=1)).isoformat(),
                             "exit_code": 0,
                             "parser": "python-unittest-v1",
                             "counts": {
@@ -496,7 +498,7 @@ class RepositoryContractTests(unittest.TestCase):
                             },
                             "artifact": unknown["artifact"],
                             "decision": "accepted",
-                            "issued_at": "2026-08-25T08:02:00+00:00",
+                            "issued_at": (fixture_now - timedelta(minutes=1)).isoformat(),
                             "report_digest": reference(report)["digest"],
                         },
                         sort_keys=True,
@@ -1405,6 +1407,7 @@ class RepositoryContractTests(unittest.TestCase):
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        fixture_now = datetime.now(timezone.utc)
         role = (
             "internal"
             if (ROOT / "release" / "audience-classification.json").is_file()
@@ -1506,8 +1509,8 @@ class RepositoryContractTests(unittest.TestCase):
                         },
                     ],
                 },
-                "issued_at": "2026-08-25T09:00:00+00:00",
-                "expires_at": "2026-09-24T09:00:00+00:00",
+                "issued_at": (fixture_now - timedelta(days=1)).isoformat(),
+                "expires_at": (fixture_now + timedelta(days=1)).isoformat(),
                 "status": "active",
                 "replay_policy": "idempotent_same_digest_only",
                 "replay_nonce": "owner-baseline-fixture-nonce",
@@ -1682,6 +1685,7 @@ class RepositoryContractTests(unittest.TestCase):
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        fixture_now = datetime.now(timezone.utc)
         role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
         artifact = module._artifact(ROOT, role)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1709,7 +1713,7 @@ class RepositoryContractTests(unittest.TestCase):
                         },
                         "artifact": artifact,
                         "decision": "accepted",
-                        "issued_at": "2026-08-25T09:00:00+00:00",
+                        "issued_at": (fixture_now - timedelta(minutes=1)).isoformat(),
                         "report_digest": "sha256:"
                         + hashlib.sha256(report.read_bytes()).hexdigest(),
                     },
@@ -1934,6 +1938,7 @@ class RepositoryContractTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("engineering_v226_native_tamper", tool)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        fixture_now = datetime.now(timezone.utc)
         role = "internal" if (ROOT / "release" / "audience-classification.json").is_file() else "public"
         artifact = module._artifact(ROOT, role)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1956,8 +1961,8 @@ class RepositoryContractTests(unittest.TestCase):
                     f"tests.test_repository.RepositoryContractTests.{selector}",
                 ],
                 "cwd": str(ROOT.resolve()),
-                "started_at": "2026-08-24T10:00:00+00:00",
-                "finished_at": "2026-08-24T10:01:00+00:00",
+                "started_at": (fixture_now - timedelta(minutes=2)).isoformat(),
+                "finished_at": (fixture_now - timedelta(minutes=1)).isoformat(),
                 "exit_code": 0,
                 "parser": "python-unittest-v1",
                 "counts": {"run": 1, "failures": 0, "errors": 0, "skipped": 0},
