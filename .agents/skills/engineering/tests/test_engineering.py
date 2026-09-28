@@ -7185,9 +7185,21 @@ class Task3AmendedContractTests(unittest.TestCase):
         )
         self.commit_all(root, "process baseline")
         fake, environment = self.cold_checkpoint(root)
+        operations_root = module.common_graph_dir(root) / "state" / "operations"
+        cold_operation_entries = (
+            len(list(operations_root.iterdir())) if operations_root.is_dir() else 0
+        )
+        self.assertEqual(
+            0,
+            cold_operation_entries,
+            msg=f"cold_checkpoint_operation_registry_entries={cold_operation_entries}",
+        )
         self.commit_file(root, "src/value.py", "def value():\n    return 2\n")
         child_pid_path = Path(self.temporary_directory.name) / "descendant.pid"
         before = self.git(root, "worktree", "list", "--porcelain")
+        before_worktree_count = sum(
+            line.startswith("worktree ") for line in before.splitlines()
+        )
         self.set_fake_graphify_controls(
             FAKE_GRAPHIFY_SLOW="120",
             FAKE_GRAPHIFY_CHILD_PID=str(child_pid_path),
@@ -7202,13 +7214,107 @@ class Task3AmendedContractTests(unittest.TestCase):
                 cleanup_timeout_seconds=10,
             )
 
-        self.assertEqual("hook_budget_exceeded", result["reason"])
-        self.assertTrue(child_pid_path.is_file())
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        self.assertFalse(module._process_alive(child_pid))
+        child_pid_file_present = child_pid_path.is_file()
+        child_alive = (
+            module._process_alive(
+                int(child_pid_path.read_text(encoding="utf-8"))
+            )
+            if child_pid_file_present
+            else False
+        )
+        cleanup = result.get("cleanup")
+        operation = result.get("operation")
+        after = self.git(root, "worktree", "list", "--porcelain")
+        operation_entries_after = (
+            len(list(operations_root.iterdir())) if operations_root.is_dir() else 0
+        )
+        operation_worktree_registered = (
+            "engineering-graphs/state/operations" in after.replace("\\", "/")
+        )
+        reason = result.get("reason")
+        safe_reason = (
+            reason
+            if isinstance(reason, str)
+            and reason in {
+                "hook_budget_exceeded",
+                "unresolved_hook_worker_orphan",
+                "live_hook_operation",
+                "repository_lock_owner_mismatch",
+            }
+            else "other"
+        )
+        failure_branch = (
+            "timeout_cleanup" if isinstance(operation, dict) else "pre_worker_reconcile"
+        ) if safe_reason == "unresolved_hook_worker_orphan" else "other"
+        worker_evidence = (
+            operation.get("worker_process_tree_evidence")
+            if isinstance(operation, dict)
+            else None
+        )
+        worker_tree_state = (
+            worker_evidence.get("state")
+            if isinstance(worker_evidence, dict)
+            else "unknown"
+        )
+        if not isinstance(worker_tree_state, str) or worker_tree_state not in {
+            "dead",
+            "live",
+            "identity_ambiguous",
+        }:
+            worker_tree_state = "unknown"
+        diagnostic = {
+            "branch": failure_branch,
+            "reason": safe_reason,
+            "cold_operation_entries": cold_operation_entries,
+            "operation_entries_after": operation_entries_after,
+            "operation_worktree_registered": operation_worktree_registered,
+            "operation_present": isinstance(operation, dict),
+            "cleanup_present": isinstance(cleanup, dict),
+            "cleanup_completed": (
+                cleanup.get("completed") is True if isinstance(cleanup, dict) else None
+            ),
+            "cleanup_reason": (
+                cleanup.get("reason")
+                if isinstance(cleanup, dict)
+                and isinstance(cleanup.get("reason"), str)
+                and cleanup.get("reason") in {
+                    "clean",
+                    "registered_operation_remove_failed",
+                    "registered_worktree_remove_failed",
+                    "repository_lock_owner_mismatch",
+                }
+                else "other"
+            ),
+            "worker_tree_dead": (
+                operation.get("worker_process_tree_dead") is True
+                if isinstance(operation, dict)
+                else None
+            ),
+            "worker_tree_authoritative": (
+                operation.get("worker_process_tree_authoritative") is True
+                if isinstance(operation, dict)
+                else None
+            ),
+            "worker_tree_state": worker_tree_state,
+            "child_pid_file_present": child_pid_file_present,
+            "child_alive": child_alive,
+            "worktrees_before": before_worktree_count,
+            "worktrees_after": sum(
+                line.startswith("worktree ") for line in after.splitlines()
+            ),
+        }
+        self.assertEqual(
+            "hook_budget_exceeded",
+            safe_reason,
+            msg=f"timeout_diagnostic={json.dumps(diagnostic, sort_keys=True)}",
+        )
+        self.assertTrue(child_pid_file_present)
+        self.assertFalse(child_alive)
         self.assertTrue(result["cleanup"]["completed"])
-        registry = self.git(root, "worktree", "list", "--porcelain")
-        self.assertNotIn("engineering-graphs/state/operations", registry.replace("\\", "/"))
+        self.assertFalse(
+            operation_worktree_registered,
+            msg=f"timeout_registry_diagnostic={json.dumps(diagnostic, sort_keys=True)}",
+        )
 
     def test_orphan_blocks_next_worker_then_exact_recovery_allows_rebuild(self):
         module = self.module()
