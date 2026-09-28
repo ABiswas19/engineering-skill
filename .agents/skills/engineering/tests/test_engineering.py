@@ -3751,10 +3751,26 @@ class Task3ContractTests(unittest.TestCase):
             "unresolved_hook_worker_orphan",
         }
         cleanup_reasons = {
+            "ambiguous_worker_process_identity",
             "clean",
-            "registered_operation_remove_failed",
+            "cleanup_timeout",
+            "invalid_hook_operation_boundary",
+            "invalid_hook_operation_record",
+            "live_cleanup_process",
+            "live_hook_operation",
+            "live_worker_process_tree",
             "registered_worktree_remove_failed",
+            "registered_operation_remove_failed",
+            "remove_failed",
             "repository_lock_owner_mismatch",
+        }
+        operation_phases = {
+            "orphaned",
+            "published",
+            "registered",
+            "staging_ready",
+            "validating",
+            "worktree_created",
         }
         operation = result.get("operation")
         cleanup = result.get("cleanup")
@@ -3765,7 +3781,34 @@ class Task3ContractTests(unittest.TestCase):
         mode = result.get("mode")
         reason = result.get("reason")
         cleanup_reason = cleanup.get("reason") if cleanup else None
+        cleanup_stages = {
+            "ambiguous_worker_process_identity": "identity_or_tree_validation",
+            "clean": "complete",
+            "cleanup_timeout": "timeout",
+            "invalid_hook_operation_boundary": "operation_validation",
+            "invalid_hook_operation_record": "operation_validation",
+            "live_cleanup_process": "cleanup_process_check",
+            "live_hook_operation": "lock_owner_validation",
+            "live_worker_process_tree": "worker_tree_recovery",
+            "registered_operation_remove_failed": "operation_record_removal",
+            "registered_worktree_remove_failed": "worktree_removal",
+            "remove_failed": "staging_removal",
+            "repository_lock_owner_mismatch": "lock_owner_validation",
+        }
+        worker_tree_evidence_values = {
+            "missing_process_tree_identity",
+            "invalid_process_tree_identity",
+            "duplicate_process_identity",
+            "leader_identity_mismatch",
+            "incomplete_process_tree_snapshot",
+            "fresh_process_tree_unavailable",
+            "invalid_fresh_process_tree",
+            "pid_reused",
+            "process_state_unknown",
+            "process_identity_unreadable",
+        }
         tree_state = evidence.get("state")
+        tree_evidence = evidence.get("evidence")
         return {
             "mode": mode if isinstance(mode, str) and mode in modes else "other",
             "reason": reason if isinstance(reason, str) and reason in reasons else "other",
@@ -3776,6 +3819,17 @@ class Task3ContractTests(unittest.TestCase):
                 and tree_state in {"dead", "live", "identity_ambiguous"}
                 else "unknown"
             ),
+            "worker_tree_evidence": (
+                tree_evidence
+                if isinstance(tree_evidence, str)
+                and tree_evidence in worker_tree_evidence_values
+                else "unknown"
+            ),
+            "worker_tree_evidence_stage": (
+                "pre_cleanup" if operation and isinstance(
+                    operation.get("worker_process_tree_evidence"), dict
+                ) else "unknown"
+            ),
             "worker_tree_authoritative": (
                 operation.get("worker_process_tree_authoritative")
                 if operation
@@ -3783,6 +3837,12 @@ class Task3ContractTests(unittest.TestCase):
                 else None
             ),
             "cleanup_present": cleanup is not None,
+            "operation_phase": (
+                operation.get("phase")
+                if operation and isinstance(operation.get("phase"), str)
+                and operation.get("phase") in operation_phases
+                else "unknown"
+            ),
             "cleanup_completed": (
                 cleanup.get("completed")
                 if cleanup and isinstance(cleanup.get("completed"), bool)
@@ -3791,6 +3851,11 @@ class Task3ContractTests(unittest.TestCase):
             "cleanup_reason": (
                 cleanup_reason
                 if isinstance(cleanup_reason, str) and cleanup_reason in cleanup_reasons
+                else "other"
+            ) if cleanup else None,
+            "cleanup_stage": (
+                cleanup_stages.get(cleanup_reason, "other")
+                if isinstance(cleanup_reason, str)
                 else "other"
             ) if cleanup else None,
             "orphan_reconciled_before_worker": (
@@ -3810,10 +3875,14 @@ class Task3ContractTests(unittest.TestCase):
                 "reason": "other",
                 "operation_present": True,
                 "worker_tree_state": "dead",
+                "worker_tree_evidence": "unknown",
+                "worker_tree_evidence_stage": "pre_cleanup",
                 "worker_tree_authoritative": True,
                 "cleanup_present": True,
+                "operation_phase": "unknown",
                 "cleanup_completed": True,
                 "cleanup_reason": "clean",
+                "cleanup_stage": "complete",
                 "orphan_reconciled_before_worker": False,
                 "quarantine_present": True,
             },
@@ -3837,6 +3906,84 @@ class Task3ContractTests(unittest.TestCase):
                     "quarantine": {"relative_path": "quarantine/private"},
                 },
             ),
+        )
+
+    def test_rebuild_diagnostic_exposes_bounded_cleanup_reason_and_phase(self):
+        diagnostic = self._safe_rebuild_diagnostic(
+            {
+                "operation": {
+                    "phase": "orphaned",
+                    "root": r"C:\private\repo",
+                    "worker_pid": 4812,
+                },
+                "cleanup": {
+                    "completed": False,
+                    "reason": "ambiguous_worker_process_identity",
+                    "detail": r"C:\private\raw cleanup output",
+                },
+            }
+        )
+        rendered = json.dumps(diagnostic, sort_keys=True)
+        self.assertNotIn(r"C:\private", rendered)
+        self.assertNotIn("4812", rendered)
+        self.assertEqual("ambiguous_worker_process_identity", diagnostic["cleanup_reason"])
+        self.assertEqual("identity_or_tree_validation", diagnostic["cleanup_stage"])
+        self.assertEqual("orphaned", diagnostic["operation_phase"])
+        self.assertEqual(
+            "other",
+            self._safe_rebuild_diagnostic(
+                {
+                    "operation": {"phase": "raw-private-phase"},
+                    "cleanup": {"reason": "raw-private-reason"},
+                }
+            )["cleanup_reason"],
+        )
+
+    def test_rebuild_diagnostic_allowlists_pre_cleanup_tree_evidence(self):
+        accepted = (
+            "missing_process_tree_identity",
+            "invalid_process_tree_identity",
+            "duplicate_process_identity",
+            "leader_identity_mismatch",
+            "incomplete_process_tree_snapshot",
+            "fresh_process_tree_unavailable",
+            "invalid_fresh_process_tree",
+            "pid_reused",
+            "process_state_unknown",
+            "process_identity_unreadable",
+        )
+        for evidence in accepted:
+            with self.subTest(evidence=evidence):
+                diagnostic = self._safe_rebuild_diagnostic(
+                    {
+                        "operation": {
+                            "worker_process_tree_evidence": {
+                                "state": "identity_ambiguous",
+                                "evidence": evidence,
+                                "pid": 4812,
+                                "start_time": "private-start-time",
+                                "path": r"C:\private\record.json",
+                            }
+                        }
+                    }
+                )
+                self.assertEqual(evidence, diagnostic.get("worker_tree_evidence"))
+                self.assertEqual("pre_cleanup", diagnostic.get("worker_tree_evidence_stage"))
+                rendered = json.dumps(diagnostic, sort_keys=True)
+                for forbidden in ("4812", "private-start-time", r"C:\private"):
+                    self.assertNotIn(forbidden, rendered)
+        self.assertEqual(
+            "unknown",
+            self._safe_rebuild_diagnostic(
+                {
+                    "operation": {
+                        "worker_process_tree_evidence": {
+                            "state": "identity_ambiguous",
+                            "evidence": r"C:\private\raw evidence",
+                        }
+                    }
+                }
+            ).get("worker_tree_evidence"),
         )
 
     def test_rebuild_diagnostic_helper_is_available_to_all_shared_callers(self):
@@ -15015,15 +15162,118 @@ class Task10ContractTests(unittest.TestCase):
             module._publish_scoped_authorities(self.root, ledger, b"x" * 32)
         self.assertFalse(module._scoped_authority_path(self.root).exists())
 
+    @staticmethod
+    def _safe_transition_diagnostic(
+        engineering_error_type: type[BaseException],
+        worker_errors: list[BaseException],
+        outcomes: list[str],
+        ledger_statuses: list[str],
+        *,
+        lock_exists: bool,
+        lock_owner_record_exists: bool,
+        ledger_readable: bool,
+        workers_alive: int,
+    ) -> dict[str, object]:
+        def safe_error(error: BaseException) -> dict[str, str]:
+            if not isinstance(error, engineering_error_type):
+                return {"type": "other", "reason": "other"}
+            message = str(error).lower()
+            if "already terminal" in message:
+                reason = "authority_already_terminal"
+            elif "repository lock timed out" in message:
+                reason = "lock_timeout"
+            elif "repository lock is unavailable" in message:
+                reason = "lock_unavailable"
+            else:
+                reason = "other"
+            return {"type": "EngineeringError", "reason": reason}
+
+        def counts(values: list[str], allowed: set[str]) -> dict[str, int]:
+            result = {value: 0 for value in sorted(allowed)}
+            result["other"] = 0
+            for value in values:
+                result[value if value in allowed else "other"] += 1
+            return result
+
+        return {
+            "worker_errors": [safe_error(error) for error in worker_errors[:2]],
+            "outcome_counts": counts(outcomes[:2], {"consumed", "revoked"}),
+            "ledger_status_counts": counts(
+                ledger_statuses[:32], {"active", "consumed", "revoked"}
+            ),
+            "lock_exists": lock_exists is True,
+            "lock_owner_record_exists": lock_owner_record_exists is True,
+            "ledger_readable": ledger_readable is True,
+            "workers_alive": max(0, min(2, workers_alive)),
+        }
+
+    def test_transition_diagnostic_is_allowlisted_and_bounded(self):
+        module = self.module()
+        diagnostic = self._safe_transition_diagnostic(
+            module.EngineeringError,
+            [
+                RuntimeError(r"C:\private\raw traceback pid=4812 token=secret"),
+                module.EngineeringError("Engineering scoped authority is already terminal."),
+            ],
+            ["revoked", r"C:\private\raw error"],
+            ["consumed", "active", "unexpected-private-value"],
+            lock_exists=True,
+            lock_owner_record_exists=False,
+            ledger_readable=True,
+            workers_alive=0,
+        )
+        rendered = json.dumps(diagnostic, sort_keys=True)
+        for forbidden in (r"C:\private", "4812", "secret", "unexpected-private-value"):
+            self.assertNotIn(forbidden, rendered)
+        self.assertEqual(
+            {
+                "worker_errors": [
+                    {"type": "other", "reason": "other"},
+                    {"type": "EngineeringError", "reason": "authority_already_terminal"},
+                ],
+                "outcome_counts": {"consumed": 0, "other": 1, "revoked": 1},
+                "ledger_status_counts": {"active": 1, "consumed": 1, "other": 1, "revoked": 0},
+                "lock_exists": True,
+                "lock_owner_record_exists": False,
+                "ledger_readable": True,
+                "workers_alive": 0,
+            },
+            diagnostic,
+        )
+
+    def test_transition_diagnostic_rejects_terminal_phrase_from_other_exception_type(self):
+        module = self.module()
+        diagnostic = self._safe_transition_diagnostic(
+            module.EngineeringError,
+            [
+                RuntimeError("Engineering scoped authority is already terminal."),
+                module.EngineeringError("Engineering scoped authority is already terminal."),
+            ],
+            [],
+            [],
+            lock_exists=False,
+            lock_owner_record_exists=False,
+            ledger_readable=True,
+            workers_alive=0,
+        )
+        self.assertEqual(
+            [
+                {"type": "other", "reason": "other"},
+                {"type": "EngineeringError", "reason": "authority_already_terminal"},
+            ],
+            diagnostic["worker_errors"],
+        )
+
     def test_conflicting_concurrent_transitions_are_serialized(self):
         module = self.module()
         authority = self.persist()
         barrier = threading.Barrier(3)
         outcomes = []
+        worker_errors = []
 
         def transition(status):
-            barrier.wait()
             try:
+                barrier.wait()
                 outcomes.append(
                     module.transition_scoped_authority(
                         self.root,
@@ -15033,7 +15283,11 @@ class Task10ContractTests(unittest.TestCase):
                     )["status"]
                 )
             except module.EngineeringError as error:
-                outcomes.append(str(error))
+                worker_errors.append(error)
+                outcomes.append("worker_error")
+            except Exception as error:
+                worker_errors.append(error)
+                outcomes.append("worker_error")
 
         workers = [
             threading.Thread(target=transition, args=(status,))
@@ -15042,17 +15296,63 @@ class Task10ContractTests(unittest.TestCase):
         for worker in workers:
             worker.start()
         barrier.wait()
+        join_deadline = time.monotonic() + 35
         for worker in workers:
             # Authority mutations use the shared completion cleanup boundary,
             # whose bounded recovery budget is 30 seconds.  Keep this test
             # fail-closed for a real liveness fault without declaring a busy
             # Windows host deadlocked halfway through that documented budget.
-            worker.join(timeout=35)
-            self.assertFalse(worker.is_alive())
-        self.assertEqual(1, sum(item in {"revoked", "consumed"} for item in outcomes))
+            worker.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        workers_alive = sum(worker.is_alive() for worker in workers)
+        ledger_readable = workers_alive == 0
+        ledger_statuses = []
+        if ledger_readable:
+            try:
+                ledger_statuses = [
+                    item.get("status")
+                    if isinstance(item, dict) and isinstance(item.get("status"), str)
+                    else "other"
+                    for item in module._load_scoped_authorities(self.root)["authorities"]
+                ]
+            except Exception:
+                ledger_readable = False
+        lock_path = module._common_graph_dir(self.root) / "state" / "lock"
+        diagnostic = json.dumps(
+            self._safe_transition_diagnostic(
+                module.EngineeringError,
+                worker_errors,
+                outcomes,
+                ledger_statuses,
+                lock_exists=lock_path.exists(),
+                lock_owner_record_exists=(lock_path / "owner.json").is_file(),
+                ledger_readable=ledger_readable,
+                workers_alive=workers_alive,
+            ),
+            sort_keys=True,
+        )
+        self.assertEqual(0, workers_alive, diagnostic)
         self.assertEqual(
             1,
-            sum("terminal" in item or "lock timed out" in item for item in outcomes),
+            sum(item in {"revoked", "consumed"} for item in outcomes),
+            diagnostic,
+        )
+        self.assertEqual(
+            1,
+            sum(
+                item["type"] == "EngineeringError"
+                and item["reason"] in {"authority_already_terminal", "lock_timeout"}
+                for item in self._safe_transition_diagnostic(
+                    module.EngineeringError,
+                    worker_errors,
+                    outcomes,
+                    ledger_statuses,
+                    lock_exists=lock_path.exists(),
+                    lock_owner_record_exists=(lock_path / "owner.json").is_file(),
+                    ledger_readable=ledger_readable,
+                    workers_alive=workers_alive,
+                )["worker_errors"]
+            ),
+            diagnostic,
         )
         retained = module._load_scoped_authorities(self.root)["authorities"][0]
         self.assertIn(retained["status"], {"revoked", "consumed"})
