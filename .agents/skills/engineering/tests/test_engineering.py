@@ -4944,6 +4944,15 @@ class Task3ContractTests(unittest.TestCase):
 
         self.assertEqual(("full", "changed_path_adapter", "exact_cache"), (
             cold["mode"], incremental["mode"], exact["mode"]
+        ), msg=(
+            "rebuild_diagnostics="
+            + json.dumps(
+                tuple(
+                    self._safe_rebuild_diagnostic(result)
+                    for result in (cold, incremental, exact)
+                ),
+                sort_keys=True,
+            )
         ))
         self.assertTrue(all(value >= 0 for value in (
             cold_seconds, incremental_seconds, exact_seconds
