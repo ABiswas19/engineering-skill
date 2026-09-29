@@ -289,6 +289,7 @@ def audit_reachable_history(root: Path, policy_value: object, audience: str) -> 
     markers = policy["audiences"][audience]["forbidden_markers"]
     total = 0
     blockers: set[str] = set()
+    seen_blobs: set[bytes] = set()
     for commit in commits:
         try:
             message = subprocess.run(
@@ -303,6 +304,7 @@ def audit_reachable_history(root: Path, policy_value: object, audience: str) -> 
             ).stdout
         except subprocess.SubprocessError:
             return ["history_surface_unknown"]
+        total += len(message)
         chunks = [message]
         try:
             with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tree:
@@ -311,11 +313,16 @@ def audit_reachable_history(root: Path, policy_value: object, audience: str) -> 
                     if not member.isfile() or normalized in exceptions:
                         continue
                     handle = tree.extractfile(member)
-                    if handle is not None:
-                        chunks.append(handle.read())
+                    if handle is None:
+                        return ["history_surface_unknown"]
+                    content = handle.read()
+                    chunks.append(content)
+                    identity = hashlib.sha256(content).digest()
+                    if identity not in seen_blobs:
+                        seen_blobs.add(identity)
+                        total += len(content)
         except (tarfile.TarError, OSError):
             return ["history_surface_unknown"]
-        total += sum(len(chunk) for chunk in chunks)
         if total > HISTORY_LIMIT:
             return ["history_surface_unknown"]
         texts = [chunk.decode("utf-8", errors="ignore") for chunk in chunks]

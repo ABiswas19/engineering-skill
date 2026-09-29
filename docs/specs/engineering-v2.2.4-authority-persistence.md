@@ -25,14 +25,24 @@ worktrees on the same machine. Each record and audit event is authenticated by
 the existing project-controller HMAC key. This provides local tamper evidence;
 it does not prove a human identity or replace a native host approval.
 
-The trusted host adapter signs an exact-binding approval attestation with an
-external SSH key only after it has observed the applicable native approval.
-The allowed signer is pinned in the governed repository's committed
-`.engineering-host-approvers` file, while the private key remains outside
-Engineering. Engineering exposes no approval-minting API. Authority persistence
-verifies the `engineering-authority` signature against the file at `HEAD` and
-rejects arbitrary caller-provided references, untrusted keys, changed claims,
-or invalid signatures.
+### Superseded trust transport (historical only)
+
+The original v2.2.4 design described a trusted-host SSH signer whose public
+material was carried in a committed `.engineering-host-approvers` file and
+read at `HEAD`. That transport is preserved here only to explain historical
+records. It is superseded and is not a current trust or release mechanism:
+neither a candidate tree nor a default branch may select the signer material
+that admits a new approval, exception, equivalence review, or audit.
+
+### Current v2.2.6 host-owned trust transport
+
+The native host retains the approval record, trust descriptor, and
+allowed-signers material outside candidate Git at its private Engineering
+boundary. Engineering only reads and verifies exact host receipts from that
+boundary; it exposes no approval-minting or signer-management API. Missing,
+untrusted, changed, or invalid receipt, signer, repository, epoch, or contract
+facts fail closed. The boundary records a typed unknown identity unless the
+native host can prove a stronger identity.
 The controller never infers authority from prose, Full Access,
 sandbox mode, a passing test, task completion, or an audit verdict.
 

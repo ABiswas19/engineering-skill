@@ -232,6 +232,27 @@ not a graph exploration application: `trace`, `impact`, `why-code`, `why-test`,
 and `compare` provide relationship paths and evidence detail. There is no hosted
 UI or enterprise graph service.
 
+## Native observability and limits
+
+Engineering's native observability is deterministic, project-local evidence
+about the engineering lifecycle. It is not a runtime telemetry backend. It has
+no persistent dashboard and no token or cost collection unless a separately
+approved external provider supplies those capabilities. Static HTML is a
+projection, not the canonical store; exact Git objects, Graphify checkpoints,
+Engineering overlays, and retained host receipts remain the evidence sources.
+
+| Capability | Owning module | Evidence source | Storage/projection | Interface | Privacy boundary | Support state | Known limitation |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Commit-bound code graph and deterministic overlay | Graphify runner and Engineering overlay compiler | Exact Git commit/tree, pinned Graphify checkpoint, reviewed overlay entries | Git-common private checkpoints; local map projection | `checkpoint`, `map`, `compare` | Project-local; no graph upload | Supported | Describes static project evidence, not live runtime telemetry |
+| Requirement, decision, code, test, and evidence paths | Engineering traceability reducer | Checkpoint nodes plus provenance-checked overlay edges | Local checkpoint and bounded query result | `trace`, `coverage`, `impact`, `why-code`, `why-test` | Queries remain local and redact rather than infer missing evidence | Supported | Missing, stale, conflicting, or ambiguous links remain Unknown |
+| Checkpoint, provenance, and integrity status | Engineering controller | Exact Git objects, checkpoint catalogues, integrity digests, completion receipts | Owner-private controller records and project-local checkpoint catalogue | `status`, `prepare`, `complete` | Receipts are local/private and contain bounded facts | Supported | A green check or completion receipt is evidence only, not live acceptance |
+| Scope, outcome survival, acceptance, and release-gate evidence | Engineering authority and outcome controller | External owner intent, host receipts, independent audit evidence, exact-artifact tokens | Owner-private host/controller ledgers; sanitized report projection | `intent-status`, `outcome-accept`, `release-gate` | Populated owner outcomes and signer material stay outside candidate Git | Supported with external authority | Engineering validates evidence but cannot mint owner approval or perform native delivery |
+
+This evidence surface does not grant owner, merge, install, deployment, or
+product authority. LangGraph and Langfuse are adjacent tools with different
+runtime and telemetry purposes; neither is installed, required, or truthfully
+represented as an Engineering capability by this matrix.
+
 ## Workflow integrations
 
 Engineering also supports governed delivery without making orchestration the
@@ -243,15 +264,34 @@ their native capabilities and permissions. Automated and technical checks are
 necessary evidence; domain and real-consumer outcome acceptance remain separate
 and Unknown when representative evidence is missing.
 
-Material redesign, replacement, capability deletion, and simplification also
-use the existing signed scope handoff to map every baseline requirement as
-`INCLUDED`, `REPLACED`, `DEFERRED`, or `EXCLUDED`, with a reason and verification
-method. Replacement needs outcome-equivalence evidence. Deferral or exclusion
-needs exact owner-approved scope. Unmanaged, missing-checkpoint, stale,
-conflicting, or otherwise Unknown traceability supports advisory analysis only;
-it cannot be reported as accepted design or implementation-ready. Independent
-design and final acceptance verify that original user/business outcomes survive,
-so a narrowed contract does not pass merely by auditing itself.
+Version 2.2.6 binds intent-impacting work to an external, owner-private
+`engineering.owner-intent.v1`. The host validates that binding before the
+controller retains it; Engineering has no approval-minting path. The controller
+injects its complete outcome baseline into the signed scope handoff, so a
+candidate cannot substitute a shorter list. Each outcome is `INCLUDED`,
+`REPLACED`, `DEFERRED`, or `EXCLUDED`: replacement needs independently reviewed
+equivalence, and deferral or exclusion needs a separately host-attested owner
+exception. New owner approvals, exceptions, equivalence reviews, and outcome
+audits are verified against host-owned, owner-private trust receipts and
+signer material outside candidate Git, never against a default branch or
+candidate `HEAD`; the signer principal must equal the declared independent
+role. Historical v2.2.5 records stay readable but their missing owner
+intent is `owner_intent_unknown` and cannot receive a new release token.
+
+`outcome-accept` records independent exact-artifact acceptance using typed
+evidence (`design`, `proxy`, `unit`, `integration`, `end_to_end`, or
+`real_outcome`). Lower evidence classes never satisfy a higher owner
+requirement, and interface and environment must match exactly. The independent
+auditor must be distinct from architect, implementer, and writer and attest to
+the original owner intent. `release-gate` emits a signed
+`engineering.release-token.v2` only when every core outcome is accepted for the
+exact artifact. It can authorize `install` only when `--install-source` resolves
+to the accepted clean bundle commit and digest; otherwise it authorizes only
+`merge` and `activation`. `verify-release-token` returns the token digest and
+source-bundle receipt, and the installer recomputes that bundle before copying
+and after staging. A v2.2.6+ installation requires that exact `install` token
+before its separate native approval. Neither operation performs or authorizes
+the native action.
 
 Version 2.2.4 distinguishes business-authority presence from whether approval
 must be requested again. Exact scoped authority can persist across unchanged
@@ -263,8 +303,10 @@ connector approvals remain mandatory. Exact-artifact audit records are evidence
 only; they never mint or expand authority.
 
 Optional owner-private delivery evaluation records requested and actual model
-facts, dependencies, coordination, rework, auditor coverage, and independent
-technical, semantic, and outcome states. It retains the newest 365 records
+facts, typed routing facts (reasoning, owner override, execution target, and
+scope), dependencies, coordination, rework, auditor coverage, and independent
+technical, semantic, and outcome states. A native host records `unknown` rather
+than guessing an unavailable routing fact. It retains the newest 365 records
 within 1 MiB and returns `insufficient_sample` below two comparable records.
 Model selection stays with the caller and native platform. No LangGraph runtime
 ships; adding one requires a demonstrated native-task gap and separate
