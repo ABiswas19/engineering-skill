@@ -20,10 +20,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def clone_fixture(source: Path) -> None:
     try:
+        source_git_metadata_present = "true" if (ROOT / ".git").exists() else "false"
+    except OSError:
+        source_git_metadata_present = "unknown"
+    try:
+        destination_parent_is_dir = "true" if source.parent.is_dir() else "false"
+    except OSError:
+        destination_parent_is_dir = "unknown"
+    try:
+        destination_preexisted = "true" if source.exists() else "false"
+    except OSError:
+        destination_preexisted = "unknown"
+    try:
         subprocess.run(["git", "clone", "--quiet", "--local", str(ROOT), str(source)],
                        check=True, capture_output=True)
     except subprocess.CalledProcessError as error:
-        stderr = (error.stderr or b"").decode("utf-8", errors="replace").lower()
+        stderr_bytes = error.stderr or b""
+        stderr = stderr_bytes.decode("utf-8", errors="replace").lower()
         cause = next((label for marker, label in (
             ("not a git repository", "source is not a Git repository"),
             ("permission denied", "permission denied"),
@@ -37,7 +50,32 @@ def clone_fixture(source: Path) -> None:
             ("could not create work tree dir", "Git could not create fixture files"),
             ("unable to create", "Git could not create fixture files"),
         ) if marker in stderr), "unclassified Git clone failure")
-        raise AssertionError(f"fixture clone failed (exit {error.returncode}; {cause})") from None
+        if cause != "unclassified Git clone failure":
+            raise AssertionError(f"fixture clone failed (exit {error.returncode}; {cause})") from None
+        if not stderr_bytes:
+            stderr_class = "empty"
+        else:
+            try:
+                strict_stderr = stderr_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                stderr_class = "utf8_invalid"
+            else:
+                first_nonblank = next((line.strip().lower() for line in strict_stderr.splitlines()
+                                       if line.strip()), "")
+                if first_nonblank.startswith("fatal:"):
+                    stderr_class = "fatal_prefix"
+                elif first_nonblank.startswith("error:"):
+                    stderr_class = "error_prefix"
+                elif first_nonblank.startswith("warning:"):
+                    stderr_class = "warning_prefix"
+                else:
+                    stderr_class = "other_nonempty"
+        raise AssertionError(
+            f"fixture clone failed (exit {error.returncode}; {cause}; "
+            f"source_git_metadata_present={source_git_metadata_present}; "
+            f"destination_parent_is_dir={destination_parent_is_dir}; "
+            f"destination_preexisted={destination_preexisted}; stderr_class={stderr_class})"
+        ) from None
 
 
 def candidate_export_source_fixture(source: Path) -> str:
@@ -173,13 +211,15 @@ class RepositoryContractTests(unittest.TestCase):
             (b"fatal: invalid cross-device link PRIVATE_MARKER", "cross-device clone failure"),
             (b"fatal: unable to create file PRIVATE_MARKER", "Git could not create fixture files"),
             (b"fatal: could not create work tree dir PRIVATE_MARKER", "Git could not create fixture files"),
+            (b"fatal: could not create work tree dir PRIVATE_MARKER\xff", "Git could not create fixture files"),
         ):
             with self.subTest(cause=cause):
                 error = subprocess.CalledProcessError(128, ["git"], stderr=stderr)
-                with patch("subprocess.run", side_effect=error), self.assertRaisesRegex(
-                    AssertionError, f"exit 128; {cause}"
+                with patch("subprocess.run", side_effect=error), self.assertRaises(
+                    AssertionError
                 ) as caught:
                     clone_fixture(Path("synthetic"))
+                self.assertEqual(f"fixture clone failed (exit 128; {cause})", str(caught.exception))
                 self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
 
         error = subprocess.CalledProcessError(
@@ -190,6 +230,118 @@ class RepositoryContractTests(unittest.TestCase):
         ) as caught:
             clone_fixture(Path("synthetic"))
         self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
+
+    def test_clone_fixture_reports_sanitized_facets_for_unclassified_stderr(self) -> None:
+        cases = (
+            (b"", "empty", True, True, False, "file"),
+            (b"PRIVATE_MARKER\xff", "utf8_invalid", False, True, True, "absent"),
+            (b"\nFatal: PRIVATE_MARKER synthetic failure", "fatal_prefix", True, False, False, "directory"),
+            (b"\n\nerror: PRIVATE_MARKER synthetic failure", "error_prefix", False, False, False, "absent"),
+            (b"warning: PRIVATE_MARKER synthetic failure", "warning_prefix", True, True, True, "file"),
+            (b"PRIVATE_MARKER", "other_nonempty", False, True, False, "absent"),
+        )
+        for stderr, stderr_class, git_metadata, parent_is_dir, destination_exists, git_kind in cases:
+            with self.subTest(stderr_class=stderr_class):
+                with tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary)
+                    root = base / "source"
+                    root.mkdir()
+                    if git_metadata:
+                        if git_kind == "directory":
+                            (root / ".git").mkdir()
+                        else:
+                            (root / ".git").write_text("synthetic", encoding="utf-8")
+                    parent = base / "destination-parent"
+                    if parent_is_dir:
+                        parent.mkdir()
+                    destination = parent / "fixture"
+                    if destination_exists:
+                        destination.write_text("preexisting", encoding="utf-8")
+                    error = subprocess.CalledProcessError(128, ["git"], stderr=stderr)
+                    expected = (
+                        "fixture clone failed (exit 128; unclassified Git clone failure; "
+                        f"source_git_metadata_present={str(git_metadata).lower()}; "
+                        f"destination_parent_is_dir={str(parent_is_dir).lower()}; "
+                        f"destination_preexisted={str(destination_exists).lower()}; "
+                        f"stderr_class={stderr_class})"
+                    )
+                    with patch.object(sys.modules[__name__], "ROOT", root), patch(
+                        "subprocess.run", side_effect=error
+                    ) as run, self.assertRaises(AssertionError) as caught:
+                        clone_fixture(destination)
+                    self.assertEqual(expected, str(caught.exception))
+                    self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
+                    run.assert_called_once_with(
+                        ["git", "clone", "--quiet", "--local", str(root), str(destination)],
+                        check=True,
+                        capture_output=True,
+                    )
+
+    def test_clone_fixture_stat_oserror_is_sanitized_and_clone_still_runs(self) -> None:
+        for facet in (
+            "source_git_metadata_present",
+            "destination_parent_is_dir",
+            "destination_preexisted",
+        ):
+            with self.subTest(facet=facet):
+                with tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary)
+                    root = base / "source"
+                    root.mkdir()
+                    git_metadata = root / ".git"
+                    git_metadata.write_text("synthetic", encoding="utf-8")
+                    parent = base / "destination-parent"
+                    parent.mkdir()
+                    destination = parent / "fixture"
+                    error = subprocess.CalledProcessError(
+                        128, ["git"], stderr=b"fatal: PRIVATE_MARKER synthetic failure"
+                    )
+                    real_exists = Path.exists
+                    real_is_dir = Path.is_dir
+
+                    def exists(path: Path) -> bool:
+                        if facet == "source_git_metadata_present" and path == git_metadata:
+                            raise OSError("PRIVATE_MARKER")
+                        if facet == "destination_preexisted" and path == destination:
+                            raise OSError("PRIVATE_MARKER")
+                        return real_exists(path)
+
+                    def is_dir(path: Path) -> bool:
+                        if facet == "destination_parent_is_dir" and path == parent:
+                            raise OSError("PRIVATE_MARKER")
+                        return real_is_dir(path)
+
+                    expected_values = {
+                        "source_git_metadata_present": "unknown",
+                        "destination_parent_is_dir": "unknown",
+                        "destination_preexisted": "unknown",
+                    }
+                    with patch.object(sys.modules[__name__], "ROOT", root), patch.object(
+                        Path, "exists", new=exists
+                    ), patch.object(Path, "is_dir", new=is_dir), patch(
+                        "subprocess.run", side_effect=error
+                    ) as run, self.assertRaises(AssertionError) as caught:
+                        clone_fixture(destination)
+                    observed = {
+                        "source_git_metadata_present": "true",
+                        "destination_parent_is_dir": "true",
+                        "destination_preexisted": "false",
+                    }
+                    observed[facet] = expected_values[facet]
+                    expected = (
+                        "fixture clone failed (exit 128; unclassified Git clone failure; "
+                        f"source_git_metadata_present={observed['source_git_metadata_present']}; "
+                        f"destination_parent_is_dir={observed['destination_parent_is_dir']}; "
+                        f"destination_preexisted={observed['destination_preexisted']}; "
+                        "stderr_class=fatal_prefix)"
+                    )
+                    self.assertEqual(expected, str(caught.exception))
+                    self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
+                    run.assert_called_once_with(
+                        ["git", "clone", "--quiet", "--local", str(root), str(destination)],
+                        check=True,
+                        capture_output=True,
+                    )
 
     def write_public_only_overlay(self, destination: Path) -> None:
         path = destination / "docs" / "public-contributing.md"
