@@ -34,6 +34,7 @@ def clone_fixture(source: Path) -> None:
             ("hardlink", "hardlink clone failure"),
             ("access is denied", "access denied"),
             ("no such file", "source or destination unavailable"),
+            ("could not create work tree dir", "Git could not create fixture files"),
             ("unable to create", "Git could not create fixture files"),
         ) if marker in stderr), "unclassified Git clone failure")
         raise AssertionError(f"fixture clone failed (exit {error.returncode}; {cause})") from None
@@ -171,6 +172,7 @@ class RepositoryContractTests(unittest.TestCase):
             (b"fatal: detected dubious ownership in PRIVATE_MARKER", "Git ownership check failed"),
             (b"fatal: invalid cross-device link PRIVATE_MARKER", "cross-device clone failure"),
             (b"fatal: unable to create file PRIVATE_MARKER", "Git could not create fixture files"),
+            (b"fatal: could not create work tree dir PRIVATE_MARKER", "Git could not create fixture files"),
         ):
             with self.subTest(cause=cause):
                 error = subprocess.CalledProcessError(128, ["git"], stderr=stderr)
@@ -179,6 +181,15 @@ class RepositoryContractTests(unittest.TestCase):
                 ) as caught:
                     clone_fixture(Path("synthetic"))
                 self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
+
+        error = subprocess.CalledProcessError(
+            128, ["git"], stderr=b"fatal: unexpected failure PRIVATE_MARKER"
+        )
+        with patch("subprocess.run", side_effect=error), self.assertRaisesRegex(
+            AssertionError, "exit 128; unclassified Git clone failure"
+        ) as caught:
+            clone_fixture(Path("synthetic"))
+        self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
 
     def write_public_only_overlay(self, destination: Path) -> None:
         path = destination / "docs" / "public-contributing.md"
@@ -3591,10 +3602,18 @@ Residual risk: No repository-supported vulnerability intake is available.
             source = base / "source"
             candidate_commit = candidate_export_source_fixture(source)
             self.assertEqual(candidate_commit, module._source_commit(source))
+            if (source / "release" / "audience-isolation-policy.json").is_file():
+                (destination / "SECURITY.md").write_text(
+                    "Use GitHub private vulnerability reporting at "
+                    "https://example.invalid/security/advisories/new.\n",
+                    encoding="utf-8",
+                )
+            self.write_public_only_overlay(destination)
             with self.assertRaisesRegex(
                 module.ExportError, r"^unsafe export destination: redirect/stale\.txt$"
             ):
                 module.export_tree(source, destination)
+            self.assertEqual("generated\n", stale.read_text(encoding="utf-8"))
 
     def test_public_export_rejects_a_broken_leaf_link(self) -> None:
         spec = importlib.util.spec_from_file_location(

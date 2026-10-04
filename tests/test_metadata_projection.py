@@ -32,6 +32,7 @@ def clone_fixture(source: Path) -> None:
             ("hardlink", "hardlink clone failure"),
             ("access is denied", "access denied"),
             ("no such file", "source or destination unavailable"),
+            ("could not create work tree dir", "Git could not create fixture files"),
             ("unable to create", "Git could not create fixture files"),
         ) if marker in stderr), "unclassified Git clone failure")
         raise AssertionError(f"fixture clone failed (exit {error.returncode}; {cause})") from None
@@ -44,6 +45,7 @@ class MetadataProjectionTests(unittest.TestCase):
             (b"fatal: detected dubious ownership in PRIVATE_MARKER", "Git ownership check failed"),
             (b"fatal: invalid cross-device link PRIVATE_MARKER", "cross-device clone failure"),
             (b"fatal: unable to create file PRIVATE_MARKER", "Git could not create fixture files"),
+            (b"fatal: could not create work tree dir PRIVATE_MARKER", "Git could not create fixture files"),
         ):
             with self.subTest(cause=cause):
                 error = subprocess.CalledProcessError(128, ["git"], stderr=stderr)
@@ -52,6 +54,15 @@ class MetadataProjectionTests(unittest.TestCase):
                 ) as caught:
                     clone_fixture(Path("synthetic"))
                 self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
+
+        error = subprocess.CalledProcessError(
+            128, ["git"], stderr=b"fatal: unexpected failure PRIVATE_MARKER"
+        )
+        with patch("subprocess.run", side_effect=error), self.assertRaisesRegex(
+            AssertionError, "exit 128; unclassified Git clone failure"
+        ) as caught:
+            clone_fixture(Path("synthetic"))
+        self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
 
     @classmethod
     def setUpClass(cls) -> None:
