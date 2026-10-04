@@ -34,10 +34,12 @@
     "release/public-export.json",
     "release/v2.2.6-requirements.json",
     "tests/__init__.py",
+    "tests/test_metadata_projection.py",
     "tests/test_repository.py",
     "tools/check_audience.py",
     "tools/check_sensitive.py",
     "tools/export_public.py",
+    "tools/metadata_projection.py",
     "tools/v226_owner_baseline.py",
     "tools/v226_release_matrix.py"
   ]

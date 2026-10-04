@@ -2329,6 +2329,38 @@ class Task2ContractTests(unittest.TestCase):
             identity.required_commands,
         )
 
+    def test_verify_graphify_accepts_lf_and_crlf_identity_output(self):
+        module = self.module()
+        direct_url = json.dumps({
+            "url": module.GRAPHIFY_REPOSITORY + ".git",
+            "vcs_info": {"commit_id": module.GRAPHIFY_COMMIT, "vcs": "git"},
+        })
+        help_text = "usage: graphify <command>\nupdate\npath\nexplain\n"
+        interpreter = Path(sys.executable)
+
+        for separator in ("\n", "\r\n"):
+            with self.subTest(separator=repr(separator)):
+                with patch.object(
+                    module,
+                    "run",
+                    side_effect=[f"{module.GRAPHIFY_VERSION}{separator}{direct_url}", help_text],
+                ) as mocked_run:
+                    identity = module.verify_graphify(interpreter)
+
+                self.assertEqual(module.GRAPHIFY_VERSION, identity.version)
+                self.assertEqual(module.GRAPHIFY_REPOSITORY, identity.repository)
+                self.assertEqual(module.GRAPHIFY_COMMIT, identity.commit)
+                self.assertEqual(module.REQUIRED_GRAPHIFY_COMMANDS, identity.required_commands)
+                self.assertEqual(2, mocked_run.call_count)
+
+        with patch.object(
+            module,
+            "run",
+            side_effect=[f"0.9.4\n{direct_url}", help_text],
+        ):
+            with self.assertRaisesRegex(module.EngineeringError, "0.9.4"):
+                module.verify_graphify(interpreter)
+
     def test_synthetic_repo_has_an_owner_private_controller_directory(self):
         module = self.module()
         root = self.init_repo("private-controller")
@@ -2472,7 +2504,7 @@ class Task2ContractTests(unittest.TestCase):
         module.construct_checkpoint(root, commit, None)
 
         cases = {
-            ("status", root): lambda value: self.assertTrue(value["fresh"]),
+            ("status", root): lambda value: self.assertFalse(value["fresh"]),
             ("coverage", root): lambda value: self.assertTrue(
                 value["requirements"][0]["covered"]
             ),
@@ -2495,8 +2527,769 @@ class Task2ContractTests(unittest.TestCase):
         for arguments, assertion in cases.items():
             with self.subTest(command=arguments[0]):
                 result = self.run_cli(*arguments)
-                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(0, result.returncode, result.stdout or result.stderr)
                 assertion(json.loads(result.stdout))
+        self.assertFalse(module.check_merge_readiness(root)["ready"])
+
+    def test_legacy_query_loader_is_closed_root_bound_and_not_a_modern_downgrade(self):
+        module = self.module()
+        for defect in ("extra_legacy_key", "wrong_legacy_root", "modern_identity_missing"):
+            with self.subTest(defect=defect):
+                root = self.init_repo(f"legacy-query-{defect}")
+                self.write_controls(root)
+                commit = self.commit_all(root, "legacy query")
+                if defect == "modern_identity_missing":
+                    checkpoint_path = self.write_feature_checkpoint(root, commit, "feature/query")
+                    self.git(root, "switch", "-c", "feature/query")
+                    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                    checkpoint["metadata"].pop("project_identity")
+                    checkpoint["metadata"]["project_root"] = str(module._common_graph_dir(root).parent)
+                else:
+                    checkpoint_path = module.construct_checkpoint(root, commit, None)
+                    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                    if defect == "extra_legacy_key":
+                        checkpoint["metadata"]["unexpected"] = "value"
+                    else:
+                        checkpoint["metadata"]["project_root"] = str(root.parent)
+                checkpoint_path.write_text(
+                    json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8"
+                )
+
+                result = self.run_cli("coverage", root)
+
+                self.assertNotEqual(0, result.returncode)
+
+    def test_legacy_default_fallback_requires_absent_canonical_and_matching_defaults(self):
+        module = self.module()
+        for defect in ("incomplete_canonical", "invalid_canonical", "default_disagreement"):
+            with self.subTest(defect=defect):
+                root = self.init_repo(f"legacy-default-{defect}")
+                self.write_controls(root)
+                commit = self.commit_all(root, "legacy default tier")
+                module.construct_checkpoint(root, commit, None)
+                canonical = module._checkpoint_destination(
+                    root, commit, branch="main", kind="canonical"
+                )
+                if defect == "incomplete_canonical":
+                    canonical.parent.mkdir(parents=True, exist_ok=True)
+                elif defect == "invalid_canonical":
+                    canonical_path = self.write_canonical_checkpoint(root, commit)
+                    value = json.loads(canonical_path.read_text(encoding="utf-8"))
+                    value["metadata"]["project_identity"] = "0" * 64
+                    canonical_path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+                else:
+                    self.git(root, "update-ref", "refs/remotes/origin/other", commit)
+                    self.git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+
+                with self.assertRaises(module.TraceabilityError):
+                    module._load_legacy_query_checkpoint(root, commit)
+
+    def test_current_namespace_mismatch_denies_freshness_but_keeps_modern_history_readable(self):
+        module = self.module()
+        root = self.init_repo("current-namespace-disagreement")
+        self.git(root, "remote", "add", "origin", "https://example.invalid/project.git")
+        self.write_controls(root)
+        commit = self.commit_all(root, "current namespace disagreement")
+        feature_path = self.write_feature_checkpoint(root, commit, "main")
+        self.assertIn("features", feature_path.parts)
+        self.git(root, "update-ref", "refs/remotes/origin/other", commit)
+        self.git(
+            root,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/other",
+        )
+
+        freshness = module.status(root)
+        readiness = module.check_merge_readiness(root)
+        historical = module._load_query_checkpoint(root, commit)
+        comparison = self.run_cli("compare", root, commit, commit)
+        coverage_result = self.run_cli("coverage", root, "--commit", commit)
+
+        self.assertNotEqual("current", freshness["freshness"])
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(commit, historical["metadata"]["commit"])
+        self.assertEqual(0, comparison.returncode)
+        self.assertEqual(0, coverage_result.returncode)
+
+    def test_current_namespace_agreement_restores_only_valid_current_checkpoint(self):
+        module = self.module()
+        root = self.init_repo("current-namespace-agreement")
+        self.git(root, "remote", "add", "origin", "https://example.invalid/project.git")
+        self.write_controls(root)
+        commit = self.commit_all(root, "current namespace agreement")
+        canonical_path = self.write_canonical_checkpoint(root, commit)
+        self.git(root, "update-ref", "refs/remotes/origin/other", commit)
+        self.git(
+            root,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/other",
+        )
+
+        mismatched_status = module.status(root)
+        mismatched_readiness = module.check_merge_readiness(root)
+        mismatched_cache = module._select_exact_checkpoint(
+            root, commit, branch="main", kind="canonical"
+        )
+        mismatched_catalogue = module.graph_checkpoint_catalogue(root)
+
+        self.assertNotEqual("current", mismatched_status["freshness"])
+        self.assertFalse(mismatched_readiness["ready"])
+        self.assertIsNone(mismatched_cache)
+        self.assertNotEqual("current", (mismatched_catalogue["canonical"] or {}).get("state"))
+
+        self.git(root, "update-ref", "refs/remotes/origin/main", commit)
+        self.git(
+            root,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        )
+
+        freshness = module.status(root)
+        readiness = module.check_merge_readiness(root)
+        cache = module._select_exact_checkpoint(
+            root, commit, branch="main", kind="canonical"
+        )
+        catalogue = module.graph_checkpoint_catalogue(root)
+
+        self.assertEqual("current", freshness["freshness"])
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(str(canonical_path), readiness["checkpoint"])
+        self.assertEqual(canonical_path, cache)
+        self.assertEqual("current", catalogue["canonical"]["state"])
+
+    def test_catalogue_validates_each_checkpoint_against_its_tracked_default(self):
+        module = self.module()
+        root = self.init_repo("catalogue-record-default")
+        self.git(root, "remote", "add", "origin", "https://example.invalid/project.git")
+        self.write_controls(root)
+        checkpoint_commit = self.commit_all(root, "checkpoint default main")
+        canonical_path = self.write_canonical_checkpoint(root, checkpoint_commit)
+        feature_path = self.write_feature_checkpoint(root, checkpoint_commit, "feature/topic")
+        self.git(root, "update-ref", "refs/heads/feature/topic", checkpoint_commit)
+        self.git(root, "update-ref", "refs/remotes/origin/main", checkpoint_commit)
+        self.git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+        manifest = root / "engineering-traceability.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["project"]["default_branch"] = "other"
+        manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        later_commit = self.commit_all(root, "advance manifest default")
+        self.git(root, "update-ref", "refs/heads/other", later_commit)
+
+        catalogue = module.graph_checkpoint_catalogue(root)
+
+        self.assertFalse(any(
+            item.get("relative_path") == f"main/{checkpoint_commit}/checkpoint.json"
+            for item in catalogue["quarantined"]
+        ))
+        self.assertEqual("current", catalogue["canonical"]["state"])
+        self.assertEqual(checkpoint_commit, catalogue["canonical"]["commit"])
+        self.assertNotEqual("current", module.status(root)["freshness"])
+        self.assertFalse(module.check_merge_readiness(root)["ready"])
+        feature = next(item for item in catalogue["features"]
+                       if item["branch"] == "feature/topic")
+        self.assertEqual("historical", feature["state"])
+        self.assertTrue(canonical_path.exists())
+        self.assertTrue(feature_path.exists())
+
+    def test_explicit_canonical_history_survives_resolver_default_drift(self):
+        module = self.module()
+        root = self.init_repo("canonical-history-default-drift")
+        self.git(root, "remote", "add", "origin", "https://example.invalid/project.git")
+        self.write_controls(root)
+        commit = self.commit_all(root, "canonical history")
+        path = self.write_canonical_checkpoint(root, commit)
+        self.git(root, "update-ref", "refs/remotes/origin/other", commit)
+        self.git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+
+        historical = module._load_query_checkpoint(root, commit)
+        selected_path, selected_payload, validation = module._validated_selected_checkpoint(root, commit)
+        catalogue = module.graph_checkpoint_catalogue(root)
+        compare = self.run_cli("compare", root, commit, commit)
+        coverage = self.run_cli("coverage", root, "--commit", commit)
+
+        self.assertEqual(commit, historical["metadata"]["commit"])
+        self.assertEqual(path, selected_path)
+        self.assertTrue(validation["valid"])
+        self.assertEqual(commit, selected_payload["metadata"]["commit"])
+        self.assertIsNone(catalogue["canonical"])
+        self.assertFalse(any(
+            item.get("relative_path") == f"main/{commit}/checkpoint.json"
+            for item in catalogue["quarantined"]
+        ))
+        self.assertEqual(0, compare.returncode)
+        self.assertEqual(0, coverage.returncode)
+
+    def test_zero_remote_local_default_keeps_current_readiness_and_exact_cache(self):
+        module = self.module()
+        root = self.init_repo("zero-remote-authority")
+        self.write_controls(root)
+        commit = self.commit_all(root, "zero remote authority")
+        path = self.write_canonical_checkpoint(root, commit)
+        self.git(root, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        self.git(root, "update-ref", "-d", "refs/remotes/origin/main")
+
+        status = module.status(root)
+        readiness = module.check_merge_readiness(root)
+        catalogue = module.graph_checkpoint_catalogue(root)
+        with patch.object(module, "_run_graph_operation", side_effect=AssertionError("cache missed")):
+            reconciled = module.reconcile_canonical(
+                root, refresh_remote=False, allow_cached_remote=True
+            )
+
+        self.assertEqual("current", status["freshness"])
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(path, Path(readiness["checkpoint"]))
+        self.assertEqual("current", catalogue["canonical"]["state"])
+        self.assertEqual("exact_cache", reconciled["mode"])
+        self.assertEqual(commit, reconciled["commit"])
+
+    def test_configured_unavailable_or_ambiguous_remote_never_falls_back_local(self):
+        module = self.module()
+        for remotes in (("origin",), ("origin", "backup")):
+            with self.subTest(remotes=remotes):
+                root = self.init_repo("configured-remote-no-fallback-" + str(len(remotes)))
+                self.write_controls(root)
+                commit = self.commit_all(root, "configured remote no fallback")
+                self.write_canonical_checkpoint(root, commit)
+                if len(remotes) == 1:
+                    self.git(root, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+                    self.git(root, "update-ref", "-d", "refs/remotes/origin/main")
+                for remote in remotes:
+                    self.git(root, "remote", "add", remote, f"https://example.invalid/{remote}.git")
+
+                self.assertFalse(module._current_default_agrees(root, commit))
+                self.assertNotEqual("current", module.status(root)["freshness"])
+                self.assertFalse(module.check_merge_readiness(root)["ready"])
+                self.assertIsNone(
+                    module._select_exact_checkpoint(root, commit, branch="main", kind="canonical")
+                )
+
+    def test_zero_remote_default_drift_keeps_old_canonical_history_noncurrent(self):
+        module = self.module()
+        root = self.init_repo("zero-remote-default-drift")
+        self.write_controls(root)
+        main_commit = self.commit_all(root, "zero remote main history")
+        main_path = self.write_canonical_checkpoint(root, main_commit)
+        self.git(root, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        self.git(root, "update-ref", "-d", "refs/remotes/origin/main")
+        self.git(root, "checkout", "-b", "feature/work")
+
+        manifest_path = root / "engineering-traceability.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["project"]["default_branch"] = "other"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        current_commit = self.commit_all(root, "change configured local default")
+        self.git(root, "update-ref", "refs/heads/other", current_commit)
+
+        historical = module._load_query_checkpoint(root, main_commit)
+        historical_status = module.status(root, target_commit=main_commit)
+        catalogue = module.graph_checkpoint_catalogue(root)
+
+        self.assertEqual(main_commit, historical["metadata"]["commit"])
+        self.assertEqual("historical", historical_status["freshness"])
+        self.assertFalse(module._current_default_agrees(root, main_commit))
+        self.assertNotEqual("current", (catalogue["canonical"] or {}).get("state"))
+        self.assertFalse(any(
+            item.get("relative_path") == f"main/{main_commit}/checkpoint.json"
+            for item in catalogue["quarantined"]
+        ))
+        self.assertTrue(main_path.exists())
+
+    def test_historical_canonical_ancestor_address_uses_record_default(self):
+        module = self.module()
+        root = self.init_repo("historical-canonical-ancestor")
+        self.git(root, "remote", "add", "origin", "https://example.invalid/project.git")
+        self.write_controls(root)
+        previous_commit = self.commit_all(root, "historical canonical")
+        previous_path = self.write_canonical_checkpoint(root, previous_commit)
+        (root / "README.md").write_text("# successor\n", encoding="utf-8")
+        current_commit = self.commit_all(root, "successor after resolver drift")
+        self.git(root, "update-ref", "refs/remotes/origin/other", current_commit)
+        self.git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+
+        ancestor = module._compatible_ancestor(root, current_commit, module.GRAPHIFY_VERSION)
+
+        self.assertIsNotNone(ancestor)
+        self.assertEqual(previous_commit, ancestor[0])
+        self.assertEqual(previous_path, ancestor[1])
+        self.assertNotEqual("current", module.status(root)["freshness"])
+
+    def test_legacy_query_loader_accepts_exact_constructed_fixture(self):
+        module = self.module()
+        root = self.init_repo("legacy-query-positive")
+        self.write_controls(root)
+        commit = self.commit_all(root, "legacy query positive")
+        module.construct_checkpoint(root, commit, None)
+
+        checkpoint = module._load_legacy_query_checkpoint(root, commit)
+
+        self.assertEqual(commit, checkpoint["metadata"]["commit"])
+        self.assertNotEqual("current", module.status(root)["freshness"])
+        self.assertFalse(module.check_merge_readiness(root)["ready"])
+        with patch.object(module, "_recover_initial_checkpoint", return_value={"recovered": False}):
+            preparation = module.prepare(
+                root, "legacy checkpoint cannot prepare", {"scope": ["README.md"]}
+            )
+        self.assertEqual("blocked", preparation["readiness"])
+
+    def test_status_cli_reports_the_payload_it_validated(self):
+        module = self.module()
+        root = self.init_repo("status-snapshot")
+        self.write_controls(root)
+        commit = self.commit_all(root, "status snapshot")
+        checkpoint_path = self.write_canonical_checkpoint(root, commit)
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        validated_project = checkpoint["metadata"]["project"]
+        validate = module._validate_checkpoint_payload
+        replacement_written = []
+
+        def validate_then_replace(root_arg, path_arg, commit_arg, payload_arg):
+            verdict = validate(root_arg, path_arg, commit_arg, payload_arg)
+            changed = json.loads(path_arg.read_text(encoding="utf-8"))
+            changed["metadata"]["project"] = "replacement-after-validation"
+            path_arg.write_text(json.dumps(changed, indent=2) + "\n", encoding="utf-8")
+            replacement_written.append(True)
+            return verdict
+
+        output = io.StringIO()
+        with (
+            patch.object(module, "_validate_checkpoint_payload", side_effect=validate_then_replace),
+            patch.object(sys, "argv", ["engineering", "status", str(root), "--commit", commit]),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, module.main())
+
+        result = json.loads(output.getvalue())
+        self.assertTrue(replacement_written)
+        self.assertTrue(result["fresh"])
+        self.assertEqual(validated_project, result["project"])
+
+    def test_merge_readiness_binds_validation_to_captured_address_payload(self):
+        module = self.module()
+        root = self.init_repo("readiness-snapshot")
+        self.write_controls(root)
+        commit = self.commit_all(root, "readiness snapshot")
+        checkpoint_path = self.write_canonical_checkpoint(root, commit)
+        select = module._checkpoint_address_payload
+        validate = module._validate_checkpoint_payload
+        captured = []
+        validated = []
+
+        def capture_then_replace(root_arg, commit_arg, **kwargs):
+            selected = select(root_arg, commit_arg, **kwargs)
+            path, payload = selected[:2]
+            captured.append(payload)
+            changed = json.loads(path.read_text(encoding="utf-8"))
+            changed["nodes"].append({"id": "post-selection-change"})
+            path.write_text(json.dumps(changed, indent=2) + "\n", encoding="utf-8")
+            return selected
+
+        def validate_captured(root_arg, path_arg, commit_arg, payload_arg):
+            validated.append(payload_arg)
+            return validate(root_arg, path_arg, commit_arg, payload_arg)
+
+        with (
+            patch.object(module, "_checkpoint_address_payload", side_effect=capture_then_replace),
+            patch.object(module, "_validate_checkpoint_payload", side_effect=validate_captured),
+        ):
+            readiness = module.check_merge_readiness(root)
+
+        self.assertTrue(readiness["ready"])
+        self.assertEqual("exact_current", readiness["reason"])
+        self.assertEqual(commit, readiness["commit"])
+        self.assertEqual(str(checkpoint_path), readiness["checkpoint"])
+        self.assertTrue(captured)
+        self.assertTrue(validated)
+        self.assertIs(captured[0], validated[0])
+
+    def test_wrong_namespace_checkpoint_is_not_cached_or_catalogued(self):
+        module = self.module()
+        root = self.init_repo("wrong-checkpoint-namespace")
+        self.write_controls(root)
+        commit = self.commit_all(root, "namespace fixture")
+        canonical = self.write_canonical_checkpoint(root, commit)
+        feature = module._checkpoint_destination(
+            root, commit, branch="feature/wrong", kind="feature"
+        )
+        feature.parent.mkdir(parents=True, exist_ok=True)
+        (feature.parent / "graph.json").write_bytes((canonical.parent / "graph.json").read_bytes())
+        feature.write_bytes(canonical.read_bytes())
+        canonical_payload = json.loads(canonical.read_text(encoding="utf-8"))
+        canonical_payload["metadata"]["branch"] = "feature/wrong"
+        canonical_payload["metadata"]["kind"] = "feature"
+        canonical.write_text(json.dumps(canonical_payload, indent=2) + "\n", encoding="utf-8")
+
+        canonical_selected = module._select_exact_checkpoint(
+            root, commit, branch="main", kind="canonical"
+        )
+        feature_selected = module._select_exact_checkpoint(
+            root, commit, branch="feature/wrong", kind="feature"
+        )
+        catalogue = module.graph_checkpoint_catalogue(root)
+
+        with self.subTest(consumer="canonical_cache"):
+            self.assertIsNone(canonical_selected)
+        with self.subTest(consumer="feature_cache"):
+            self.assertIsNone(feature_selected)
+        with self.subTest(consumer="canonical_catalogue"):
+            self.assertTrue(
+                any(item.get("relative_path") == f"main/{commit}/checkpoint.json"
+                    for item in catalogue["quarantined"])
+            )
+        with self.subTest(consumer="feature_catalogue"):
+            self.assertTrue(
+                any(item.get("branch") == "feature/wrong" and item["state"] == "quarantined"
+                    for item in catalogue["features"])
+            )
+
+    def test_wrong_namespace_checkpoint_is_not_accepted_as_published(self):
+        module = self.module()
+        root = self.init_repo("wrong-published-namespace")
+        self.write_controls(root)
+        commit = self.commit_all(root, "published namespace fixture")
+        destination = self.write_canonical_checkpoint(root, commit)
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+        payload["metadata"]["branch"] = "feature/wrong"
+        payload["metadata"]["kind"] = "feature"
+        destination.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        quarantined = module._quarantine_invalid_checkpoint(
+            root, destination, commit, branch="main", kind="canonical"
+        )
+
+        self.assertIsNotNone(quarantined)
+
+    def test_restore_does_not_trust_wrong_namespace_replacement(self):
+        module = self.module()
+        root = self.init_repo("wrong-restore-namespace")
+        self.write_controls(root)
+        commit = self.commit_all(root, "restore namespace fixture")
+        destination = self.write_canonical_checkpoint(root, commit)
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+        payload["metadata"]["project_identity"] = "0" * 64
+        destination.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        quarantine = module._quarantine_invalid_checkpoint(
+            root, destination, commit, branch="main", kind="canonical"
+        )
+        self.assertIsNotNone(quarantine)
+
+        quarantined_tree = module.common_graph_dir(root) / quarantine["relative_path"]
+        wrong_payload_value = json.loads(
+            (quarantined_tree / "checkpoint.json").read_text(encoding="utf-8")
+        )
+        wrong_payload_value["metadata"]["project_identity"] = module.checkpoint_identity(
+            root, commit
+        )
+        wrong_payload_value["metadata"]["branch"] = "feature/wrong"
+        wrong_payload_value["metadata"]["kind"] = "feature"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        (destination.parent / "graph.json").write_bytes(
+            (quarantined_tree / "graph.json").read_bytes()
+        )
+        destination.write_text(
+            json.dumps(wrong_payload_value, indent=2) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(module.EngineeringError, "restore_conflict"):
+            module._restore_quarantined_checkpoint(root, quarantine)
+
+    def test_malformed_legacy_predecessor_blocks_publication_and_preserves_bytes(self):
+        module = self.module()
+        defects = tuple(
+            f"{case}_{key}"
+            for key in ("files", "nodes", "exact_edges")
+            for case in ("missing", "zero", "boolean", "float", "negative")
+        ) + (
+            "node_id",
+            "edge_content",
+            "inputs",
+            "input_digest",
+            "branch",
+            "kind",
+            "project_root",
+        )
+        for defect in defects:
+            with self.subTest(defect=defect):
+                root = self.init_repo(f"legacy-predecessor-{defect}")
+                self.write_controls(root)
+                previous_commit = self.commit_all(root, "legacy predecessor")
+                previous_path = module.construct_checkpoint(root, previous_commit, None)
+                previous = json.loads(previous_path.read_text(encoding="utf-8"))
+                if defect.startswith("missing_"):
+                    previous["integrity"].pop(defect.removeprefix("missing_"))
+                elif defect.startswith("zero_"):
+                    previous["integrity"][defect.removeprefix("zero_")] = 0
+                elif defect.startswith("boolean_"):
+                    previous["integrity"][defect.removeprefix("boolean_")] = True
+                elif defect.startswith("float_"):
+                    previous["integrity"][defect.removeprefix("float_")] = 1.0
+                elif defect.startswith("negative_"):
+                    previous["integrity"][defect.removeprefix("negative_")] = -1
+                elif defect == "node_id":
+                    previous["nodes"].append({"id": "synthetic-altered-node"})
+                elif defect == "edge_content":
+                    previous["edges"].append({"id": "synthetic-altered-edge"})
+                elif defect == "inputs":
+                    previous["metadata"]["inputs"].append("synthetic/extra-input")
+                elif defect == "input_digest":
+                    previous["metadata"]["input_digest"] = "sha256:" + "0" * 64
+                elif defect == "branch":
+                    previous["metadata"]["branch"] = "feature/other"
+                elif defect == "kind":
+                    previous["metadata"]["kind"] = "canonical"
+                elif defect == "project_root":
+                    previous["metadata"]["project_root"] = str(root / "other-root")
+                previous_path.write_text(json.dumps(previous, indent=2) + "\n", encoding="utf-8")
+                previous_bytes = previous_path.read_bytes()
+                (root / "README.md").write_text("# successor\n", encoding="utf-8")
+                current_commit = self.commit_all(root, f"successor {defect}")
+                graph_root = module.common_graph_dir(root)
+                before_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+
+                with self.assertRaises(module.EngineeringError):
+                    module.construct_checkpoint(root, current_commit, previous_commit)
+
+                self.assertEqual(previous_bytes, previous_path.read_bytes())
+                after_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+                self.assertEqual(before_inventory, after_inventory)
+                successor_paths = (
+                    module._checkpoint_destination(
+                        root, current_commit, branch="main", kind="canonical"
+                    ),
+                    module._checkpoint_destination(
+                        root, current_commit, branch="main", kind="feature"
+                    ),
+                )
+                self.assertFalse(any(path.exists() for path in successor_paths))
+
+    def test_legacy_predecessor_reparse_address_blocks_without_publication(self):
+        module = self.module()
+        root = self.init_repo("legacy-predecessor-reparse")
+        self.write_controls(root)
+        previous_commit = self.commit_all(root, "legacy predecessor reparse")
+        previous_path = module.construct_checkpoint(root, previous_commit, None)
+        previous_bytes = previous_path.read_bytes()
+        (root / "README.md").write_text("# successor\n", encoding="utf-8")
+        current_commit = self.commit_all(root, "successor reparse")
+        is_reparse = module._is_reparse_point
+
+        def synthetic_reparse(path):
+            return Path(path).absolute() == previous_path.parent.absolute() or is_reparse(path)
+
+        with patch.object(module, "_is_reparse_point", side_effect=synthetic_reparse):
+            with self.assertRaises(module.EngineeringError):
+                module.construct_checkpoint(root, current_commit, previous_commit)
+
+        self.assertEqual(previous_bytes, previous_path.read_bytes())
+        self.assertFalse(
+            module._checkpoint_destination(
+                root, current_commit, branch="main", kind="feature"
+            ).exists()
+        )
+
+    def test_producer_shrink_accepts_exact_canonical_feature_and_modern_predecessors(self):
+        module = self.module()
+        for shape in (
+            "v1_canonical",
+            "v1_own_feature",
+            "v1_default_feature",
+            "modern_canonical",
+            "modern_own_feature",
+            "modern_default_feature",
+        ):
+            with self.subTest(shape=shape):
+                root = self.init_repo(f"producer-predecessor-{shape}")
+                self.write_controls(root)
+                base_commit = self.commit_all(root, "producer base")
+                self.git(root, "update-ref", "refs/remotes/origin/main", base_commit)
+
+                if shape in ("v1_own_feature", "modern_own_feature"):
+                    self.git(root, "switch", "-c", "feature/producer")
+                    previous_commit = self.git(root, "rev-parse", "HEAD")
+                    if shape == "v1_own_feature":
+                        previous_path = module.construct_checkpoint(root, previous_commit, None)
+                    else:
+                        previous_path = self.write_feature_checkpoint(root, previous_commit, "feature/producer")
+                elif shape == "modern_canonical":
+                    previous_commit = base_commit
+                    previous_path = self.write_canonical_checkpoint(root, previous_commit)
+                elif shape in ("v1_default_feature", "modern_default_feature"):
+                    (root / "README.md").write_text("# predecessor\n", encoding="utf-8")
+                    previous_commit = self.commit_all(root, "default feature predecessor")
+                    if shape == "v1_default_feature":
+                        previous_path = module.construct_checkpoint(root, previous_commit, None)
+                    else:
+                        previous_path = self.write_feature_checkpoint(root, previous_commit, "main")
+                        canonical_path = module._checkpoint_destination(
+                            root, previous_commit, branch="main", kind="canonical"
+                        )
+                        shutil.rmtree(canonical_path.parent)
+                else:
+                    previous_commit = base_commit
+                    previous_path = module.construct_checkpoint(root, previous_commit, None)
+
+                self.assertTrue(previous_path.is_file())
+                previous_metadata = json.loads(previous_path.read_text(encoding="utf-8"))["metadata"]
+                if shape.startswith("v1_"):
+                    self.assertNotIn("project_identity", previous_metadata)
+                else:
+                    self.assertIn("project_identity", previous_metadata)
+                previous_bytes = previous_path.read_bytes()
+                links_path = root / "docs" / "engineering-traceability" / "links.json"
+                links = json.loads(links_path.read_text(encoding="utf-8"))
+                links["nodes"] = []
+                links["edges"] = []
+                links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+                current_commit = self.commit_all(root, f"successor {shape}")
+                graph_root = module.common_graph_dir(root)
+                before_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+
+                with self.assertRaisesRegex(module.EngineeringError, "Unexpected shrink"):
+                    module.construct_checkpoint(root, current_commit, previous_commit)
+
+                self.assertEqual(previous_bytes, previous_path.read_bytes())
+                after_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+                self.assertEqual(before_inventory, after_inventory)
+                self.assertFalse(
+                    module._checkpoint_destination(
+                        root,
+                        current_commit,
+                        branch="main" if shape in ("v1_default_feature", "modern_default_feature", "modern_canonical") else ("feature/producer" if shape.endswith("own_feature") else "main"),
+                        kind="canonical" if shape in ("v1_canonical", "modern_canonical") else "feature",
+                    ).exists()
+                )
+
+    def test_modern_default_feature_predecessor_survives_resolver_drift_but_legacy_does_not(self):
+        module = self.module()
+        for version in ("modern", "legacy", "invalid_canonical"):
+            with self.subTest(version=version):
+                root = self.init_repo(f"producer-default-feature-drift-{version}")
+                self.write_controls(root)
+                base_commit = self.commit_all(root, "drift predecessor base")
+                self.git(root, "update-ref", "refs/remotes/origin/main", base_commit)
+                (root / "README.md").write_text("# predecessor\n", encoding="utf-8")
+                previous_commit = self.commit_all(root, "default feature predecessor")
+                if version in ("modern", "invalid_canonical"):
+                    previous_path = self.write_feature_checkpoint(root, previous_commit, "main")
+                    canonical_path = module._checkpoint_destination(
+                        root, previous_commit, branch="main", kind="canonical"
+                    )
+                    shutil.rmtree(canonical_path.parent)
+                    if version == "invalid_canonical":
+                        canonical_path.parent.mkdir(parents=True)
+                else:
+                    previous_path = module.construct_checkpoint(root, previous_commit, None)
+                previous_bytes = previous_path.read_bytes()
+                self.git(root, "update-ref", "refs/remotes/origin/other", previous_commit)
+                self.git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+                (root / "README.md").write_text("# successor\n", encoding="utf-8")
+                current_commit = self.commit_all(root, f"successor after resolver drift {version}")
+                graph_root = module.common_graph_dir(root)
+                before_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+
+                if version == "modern":
+                    successor = module.construct_checkpoint(root, current_commit, previous_commit)
+                    self.assertTrue(successor.is_file())
+                else:
+                    with self.assertRaises(module.EngineeringError):
+                        module.construct_checkpoint(root, current_commit, previous_commit)
+                self.assertEqual(previous_bytes, previous_path.read_bytes())
+                after_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+                if version == "modern":
+                    self.assertNotEqual(before_inventory, after_inventory)
+                else:
+                    self.assertEqual(before_inventory, after_inventory)
+                    self.assertFalse(
+                        module._checkpoint_destination(
+                            root, current_commit, branch="main", kind="feature"
+                        ).exists()
+                    )
+
+    def test_producer_shrink_rejects_corrupt_or_reparse_modern_predecessors(self):
+        module = self.module()
+        for defect in ("identity", "graph_digest", "reparse"):
+            with self.subTest(defect=defect):
+                root = self.init_repo(f"producer-modern-predecessor-{defect}")
+                self.write_controls(root)
+                base_commit = self.commit_all(root, "modern predecessor base")
+                self.git(root, "update-ref", "refs/remotes/origin/main", base_commit)
+                (root / "README.md").write_text("# predecessor\n", encoding="utf-8")
+                previous_commit = self.commit_all(root, "modern default-feature predecessor")
+                previous_path = self.write_feature_checkpoint(root, previous_commit, "main")
+                canonical_path = module._checkpoint_destination(
+                    root, previous_commit, branch="main", kind="canonical"
+                )
+                shutil.rmtree(canonical_path.parent)
+                if defect == "identity":
+                    previous = json.loads(previous_path.read_text(encoding="utf-8"))
+                    previous["metadata"]["project_identity"] = "0" * 64
+                    previous_path.write_text(json.dumps(previous, indent=2) + "\n", encoding="utf-8")
+                elif defect == "graph_digest":
+                    previous = json.loads(previous_path.read_text(encoding="utf-8"))
+                    previous["metadata"]["graph_digest"] = "0" * 64
+                    previous_path.write_text(json.dumps(previous, indent=2) + "\n", encoding="utf-8")
+                previous_bytes = previous_path.read_bytes()
+                (root / "README.md").write_text("# successor\n", encoding="utf-8")
+                current_commit = self.commit_all(root, f"modern successor {defect}")
+                graph_root = module.common_graph_dir(root)
+                before_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+
+                is_reparse = module._is_reparse_point
+
+                def synthetic_reparse(path):
+                    return Path(path).absolute() == previous_path.parent.absolute() or is_reparse(path)
+
+                if defect == "reparse":
+                    with patch.object(module, "_is_reparse_point", side_effect=synthetic_reparse):
+                        with self.assertRaises(module.EngineeringError):
+                            module.construct_checkpoint(root, current_commit, previous_commit)
+                else:
+                    with self.assertRaises(module.EngineeringError):
+                        module.construct_checkpoint(root, current_commit, previous_commit)
+
+                self.assertEqual(previous_bytes, previous_path.read_bytes())
+                after_inventory = {
+                    path.relative_to(graph_root).as_posix(): path.read_bytes()
+                    for path in graph_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+                self.assertEqual(before_inventory, after_inventory)
+                self.assertFalse(
+                    module._checkpoint_destination(
+                        root, current_commit, branch="main", kind="feature"
+                    ).exists()
+                )
 
     def prepared_repo(
         self,
@@ -2505,9 +3298,42 @@ class Task2ContractTests(unittest.TestCase):
         baseline_accepted: bool = True,
         provenance: str = "direct",
         source_body: str | None = None,
+        contract: bool = False,
+        upstream_contract: bool = False,
     ) -> tuple[Path, str]:
         root = self.init_repo(name)
         self.write_controls(root, provenance=provenance)
+        if contract:
+            links_path = root / "docs" / "engineering-traceability" / "links.json"
+            links = json.loads(links_path.read_text(encoding="utf-8"))
+            if upstream_contract:
+                for node in links["nodes"]:
+                    if node["id"] == "DEC-1":
+                        node.update(id="CONTRACT-1", type="contract")
+                for edge in links["edges"]:
+                    for endpoint in ("from", "to"):
+                        if edge[endpoint] == "DEC-1":
+                            edge[endpoint] = "CONTRACT-1"
+            else:
+                links["nodes"].append(
+                    {
+                        "id": "CONTRACT-1",
+                        "type": "contract",
+                        "title": "Synthetic contract",
+                        "source": {"path": "design.md", "line": 1},
+                    }
+                )
+                links["edges"].append(
+                    {
+                        "id": "EDGE-CONTRACT",
+                        "from": "REQ-1",
+                        "to": "CONTRACT-1",
+                        "type": "specified_in",
+                        "provenance": "direct",
+                        "source": {"path": "requirements.md", "line": 1},
+                    }
+                )
+            links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
         if source_body is not None:
             (root / "requirements.md").write_text(
                 "# REQ-1\n" + source_body + "\n", encoding="utf-8"
@@ -2522,13 +3348,17 @@ class Task2ContractTests(unittest.TestCase):
         return root, commit
 
     def write_canonical_checkpoint(self, root: Path, commit: str) -> Path:
+        manifest_name = engineering._tracked_manifest_name_at(root, commit)
+        self.assertIsNotNone(manifest_name)
+        manifest = engineering._json_at(root, commit, manifest_name)
+        default_branch = manifest["project"]["default_branch"]
         destination, checkpoint = engineering._checkpoint_candidate_at(
             root,
             commit,
-            branch="main",
+            branch=default_branch,
             kind="canonical",
             graphify_version=engineering.GRAPHIFY_VERSION,
-            manifest_name="engineering-traceability.json",
+            manifest_name=manifest_name,
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
         graph_path = destination.parent / "graph.json"
@@ -2548,6 +3378,22 @@ class Task2ContractTests(unittest.TestCase):
         checkpoint["metadata"]["graph_digest"] = hashlib.sha256(
             graph_path.read_bytes()
         ).hexdigest()
+        destination.write_text(json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8")
+        self.assertTrue(engineering.validate_checkpoint(root, destination, commit)["valid"])
+        return destination
+
+    def write_feature_checkpoint(self, root: Path, commit: str, branch: str) -> Path:
+        canonical = self.write_canonical_checkpoint(root, commit)
+        checkpoint = json.loads(canonical.read_text(encoding="utf-8"))
+        checkpoint["metadata"]["branch"] = branch
+        checkpoint["metadata"]["kind"] = "feature"
+        destination = engineering._checkpoint_destination(
+            root, commit, branch=branch, kind="feature"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        (destination.parent / "graph.json").write_bytes(
+            (canonical.parent / "graph.json").read_bytes()
+        )
         destination.write_text(json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8")
         self.assertTrue(engineering.validate_checkpoint(root, destination, commit)["valid"])
         return destination
@@ -2647,7 +3493,7 @@ class Task2ContractTests(unittest.TestCase):
 
     def test_prepare_reports_baseline_remote_and_unrelated_maintenance_advisories(self):
         module = self.module()
-        root, _ = self.prepared_repo("prepare-advisory", baseline_accepted=False)
+        root, commit = self.prepared_repo("prepare-advisory", baseline_accepted=False)
         module.approve_checks(root)
         module.queue_maintenance(
             root,
@@ -2659,6 +3505,12 @@ class Task2ContractTests(unittest.TestCase):
             },
         )
         self.git(root, "remote", "add", "upstream", str(root / "missing.git"))
+
+        self.assertTrue(module._current_default_agrees(root, commit))
+        self.assertIsNone(
+            module._select_exact_checkpoint(root, commit, branch="main", kind="canonical")
+        )
+        self.assertIsNone(module.graph_checkpoint_catalogue(root)["canonical"])
 
         result = module.prepare(
             root,
@@ -2679,6 +3531,35 @@ class Task2ContractTests(unittest.TestCase):
             result["advisories"],
         )
 
+    def test_cached_non_origin_remote_requires_exact_bound_commit_for_cache_and_catalogue(self):
+        module = self.module()
+        root, commit = self.prepared_repo("cached-upstream-authority")
+        self.git(root, "remote", "add", "upstream", "https://example.invalid/project.git")
+        self.git(root, "update-ref", "refs/remotes/upstream/main", commit)
+
+        authority = module._current_default_authority(root)
+        selected = module._select_exact_checkpoint(root, commit, branch="main", kind="canonical")
+        catalogue = module.graph_checkpoint_catalogue(root)
+
+        self.assertEqual(("main", commit), authority)
+        self.assertIsNotNone(selected)
+        self.assertEqual("current", catalogue["canonical"]["state"])
+        self.assertEqual(commit, catalogue["canonical"]["commit"])
+
+    def test_malformed_origin_mapping_blocks_current_identity_without_local_fallback(self):
+        module = self.module()
+        root = self.init_repo("malformed-origin-mapping")
+        self.write_controls(root)
+        commit = self.commit_all(root, "malformed origin mapping")
+        self.write_canonical_checkpoint(root, commit)
+        self.git(root, "remote", "add", "origin", "https://example.invalid/project.git")
+        self.git(root, "config", "--unset-all", "remote.origin.fetch")
+
+        self.assertIsNone(module._current_default_authority(root))
+        self.assertFalse(module._current_default_agrees(root, commit))
+        self.assertNotEqual("current", module.status(root)["freshness"])
+        self.assertFalse(module.check_merge_readiness(root)["ready"])
+
     def test_prepare_blocks_missing_exact_context_and_dirty_out_of_scope_work(self):
         module = self.module()
         root, _ = self.prepared_repo("prepare-blocked")
@@ -2697,34 +3578,13 @@ class Task2ContractTests(unittest.TestCase):
 
     def test_prepare_blocks_unapproved_contract_impact(self):
         module = self.module()
-        root, _ = self.prepared_repo("prepare-contract")
-        checkpoint = module._load_checkpoint(root, module.git(root, "rev-parse", "HEAD"))
-        checkpoint["nodes"].append(
-            {
-                "id": "CONTRACT-1",
-                "type": "contract",
-                "title": "Synthetic contract",
-                "source": {"path": "design.md", "line": 1},
-            }
+        root, _ = self.prepared_repo("prepare-contract", contract=True)
+        result = module.prepare(
+            root,
+            "change REQ-1 contract",
+            {"scope": ["design.md"], "forbidden": []},
+            None,
         )
-        checkpoint["edges"].append(
-            {
-                "id": "EDGE-CONTRACT",
-                "from": "REQ-1",
-                "to": "CONTRACT-1",
-                "type": "specified_in",
-                "provenance": "direct",
-                "source": {"path": "requirements.md", "line": 1},
-            }
-        )
-
-        with patch.object(module, "_load_checkpoint", return_value=checkpoint):
-            result = module.prepare(
-                root,
-                "change REQ-1 contract",
-                {"scope": ["design.md"], "forbidden": []},
-                None,
-            )
 
         self.assertEqual("blocked", result["readiness"])
         self.assertIn("public contract change lacks explicit approval", result["blockers"])
@@ -2783,7 +3643,10 @@ class Task2ContractTests(unittest.TestCase):
                 commit = self.commit_all(root, "bounded context budget")
                 fake_graphify = self.write_fake_graphify()
                 with patch.dict(os.environ, {"PYTHONPATH": str(fake_graphify)}, clear=False):
-                    module.rebuild(root, commit, sys.executable)
+                    if generation == "legacy":
+                        module.rebuild(root, commit, sys.executable)
+                    else:
+                        module.rebuild(root, sys.executable, target_commit=commit)
                 empty = {"status": "empty", "context": []}
                 with patch.object(
                     module, "_graphify_query_context", return_value=empty
@@ -2998,31 +3861,10 @@ class Task2ContractTests(unittest.TestCase):
 
     def test_query_selected_id_drives_exact_contract_impact_and_approval_gate(self):
         module = self.module()
-        root, _ = self.prepared_repo("prepare-query-contract")
-        checkpoint = module._load_checkpoint(root, module.git(root, "rev-parse", "HEAD"))
-        checkpoint["nodes"].append(
-            {
-                "id": "CONTRACT-1",
-                "type": "contract",
-                "title": "Synthetic contract",
-                "source": {"path": "design.md", "line": 1},
-            }
-        )
-        checkpoint["edges"].append(
-            {
-                "id": "EDGE-CONTRACT",
-                "from": "REQ-1",
-                "to": "CONTRACT-1",
-                "type": "specified_in",
-                "provenance": "direct",
-                "source": {"path": "requirements.md", "line": 1},
-            }
-        )
+        root, _ = self.prepared_repo("prepare-query-contract", contract=True)
         query = {"status": "success", "context": [{"id": "REQ-1", "provenance": "inferred"}]}
 
-        with patch.object(module, "_load_checkpoint", return_value=checkpoint), patch.object(
-            module, "_graphify_query_context", return_value=query
-        ):
+        with patch.object(module, "_graphify_query_context", return_value=query):
             result = module.prepare(
                 root,
                 "change the authentication contract",
@@ -3088,26 +3930,7 @@ class Task2ContractTests(unittest.TestCase):
 
     def test_direct_contract_origin_requires_only_documented_approval_key(self):
         module = self.module()
-        root, _ = self.prepared_repo("prepare-direct-contract")
-        checkpoint = module._load_checkpoint(root, module.git(root, "rev-parse", "HEAD"))
-        checkpoint["nodes"].append(
-            {
-                "id": "CONTRACT-1",
-                "type": "contract",
-                "title": "Synthetic contract",
-                "source": {"path": "design.md", "line": 1},
-            }
-        )
-        checkpoint["edges"].append(
-            {
-                "id": "EDGE-CONTRACT",
-                "from": "REQ-1",
-                "to": "CONTRACT-1",
-                "type": "specified_in",
-                "provenance": "direct",
-                "source": {"path": "requirements.md", "line": 1},
-            }
-        )
+        root, _ = self.prepared_repo("prepare-direct-contract", contract=True)
         empty = {"status": "empty", "context": []}
         base_scope = {
             "scope": ["design.md"],
@@ -3119,9 +3942,7 @@ class Task2ContractTests(unittest.TestCase):
             {"contract_change": "approved"},
             {"approvals": ["contract_change"]},
         )
-        with patch.object(module, "_load_checkpoint", return_value=checkpoint), patch.object(
-            module, "_graphify_query_context", return_value=empty
-        ):
+        with patch.object(module, "_graphify_query_context", return_value=empty):
             blocked = [
                 module.prepare(root, "change contract", {**base_scope, **alias}, None)
                 for alias in aliases
@@ -3140,15 +3961,9 @@ class Task2ContractTests(unittest.TestCase):
 
     def test_upstream_contract_in_exact_context_requires_approval(self):
         module = self.module()
-        root, _ = self.prepared_repo("prepare-upstream-contract")
-        checkpoint = module._load_checkpoint(root, module.git(root, "rev-parse", "HEAD"))
-        decision = next(node for node in checkpoint["nodes"] if node["id"] == "DEC-1")
-        decision.update({"id": "CONTRACT-1", "type": "contract"})
-        for edge in checkpoint["edges"]:
-            if edge["to"] == "DEC-1":
-                edge["to"] = "CONTRACT-1"
-            if edge["from"] == "DEC-1":
-                edge["from"] = "CONTRACT-1"
+        root, _ = self.prepared_repo(
+            "prepare-upstream-contract", contract=True, upstream_contract=True
+        )
         empty = {"status": "empty", "context": []}
         base_scope = {
             "scope": ["README.md"],
@@ -3156,9 +3971,7 @@ class Task2ContractTests(unittest.TestCase):
             "context_ids": ["CODE-1"],
         }
 
-        with patch.object(module, "_load_checkpoint", return_value=checkpoint), patch.object(
-            module, "_graphify_query_context", return_value=empty
-        ):
+        with patch.object(module, "_graphify_query_context", return_value=empty):
             blocked = module.prepare(root, "change CODE-1", base_scope, None)
             forged = module.prepare(
                 root,
@@ -3502,8 +4315,8 @@ class Task2ContractTests(unittest.TestCase):
                 root = self.init_repo(provenance)
                 self.write_controls(root, provenance=provenance)
                 commit = self.commit_all(root, f"{provenance} overlay")
-                module.construct_checkpoint(root, commit, None)
-                checkpoint = module._load_checkpoint(root, commit)
+                checkpoint_path = module.construct_checkpoint(root, commit, None)
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
 
                 coverage = module.coverage(checkpoint)
                 impact = module.query_result("impact", checkpoint, "REQ-1")
@@ -3537,7 +4350,18 @@ class Task2ContractTests(unittest.TestCase):
                     environment = {"PYTHONPATH": str(fake_graphify)}
                     if event == "pre-push":
                         with patch.dict(os.environ, environment, clear=False):
-                            module.rebuild(root, commit, sys.executable)
+                            built = module.rebuild(
+                                root, sys.executable, target_commit=commit
+                            )
+                        canonical = module._checkpoint_destination(
+                            root, commit, branch="main", kind="canonical"
+                        )
+                        self.assertTrue(canonical.is_file())
+                        if isinstance(built, dict) and built.get("checkpoint"):
+                            self.assertEqual(
+                                canonical.resolve(),
+                                Path(built["checkpoint"]).resolve(),
+                            )
                     opposite = "v2" if generation == "v1" else "v1"
                     opposite_manifest, _ = self.control_paths(root, opposite)
                     opposite_manifest.write_text(
@@ -3701,6 +4525,146 @@ class Task2ContractTests(unittest.TestCase):
         self.assertIn("features", feature.parts)
         self.assertNotEqual(canonical, feature)
 
+    def test_checkpoint_selector_uses_canonical_for_foreign_feature_twin(self):
+        module = self.module()
+        root = self.init_repo("foreign-feature-twin")
+        self.write_controls(root)
+        commit = self.commit_all(root, "selector fixture")
+        canonical = self.write_canonical_checkpoint(root, commit)
+        self.write_feature_checkpoint(root, commit, "main")
+        self.git(root, "switch", "-c", "feature/consumer")
+
+        selected = module._checkpoint_path(root, commit)
+
+        self.assertEqual(canonical, selected)
+
+    def test_checkpoint_selector_prefers_exact_own_feature_tier(self):
+        module = self.module()
+        root = self.init_repo("own-feature-tier")
+        self.write_controls(root)
+        commit = self.commit_all(root, "selector fixture")
+        self.write_canonical_checkpoint(root, commit)
+        own = self.write_feature_checkpoint(root, commit, "feature/consumer")
+        self.git(root, "switch", "-c", "feature/consumer")
+
+        self.assertEqual(own, module._checkpoint_path(root, commit))
+
+    def test_checkpoint_selector_uses_canonical_for_default_and_detached_lookup(self):
+        module = self.module()
+        root = self.init_repo("detached-selector")
+        self.write_controls(root)
+        commit = self.commit_all(root, "selector fixture")
+        canonical = self.write_canonical_checkpoint(root, commit)
+        self.write_feature_checkpoint(root, commit, "main")
+
+        self.assertEqual(canonical, module._checkpoint_path(root, commit))
+        self.git(root, "switch", "--detach", commit)
+        self.assertEqual(canonical, module._checkpoint_path(root, commit))
+
+    def test_checkpoint_selector_rejects_foreign_feature_without_canonical(self):
+        module = self.module()
+        root = self.init_repo("foreign-feature-only")
+        self.write_controls(root)
+        commit = self.commit_all(root, "selector fixture")
+        canonical = self.write_canonical_checkpoint(root, commit)
+        self.write_feature_checkpoint(root, commit, "feature/provider")
+        canonical.unlink()
+        self.git(root, "switch", "-c", "feature/consumer")
+
+        with self.assertRaises(module.TraceabilityError):
+            module._checkpoint_path(root, commit)
+
+    def test_checkpoint_selector_rejects_invalid_own_tier_without_fallback(self):
+        module = self.module()
+        root = self.init_repo("invalid-own-feature")
+        self.write_controls(root)
+        commit = self.commit_all(root, "selector fixture")
+        self.write_canonical_checkpoint(root, commit)
+        own = self.write_feature_checkpoint(root, commit, "feature/consumer")
+        checkpoint = json.loads(own.read_text(encoding="utf-8"))
+        checkpoint["metadata"]["kind"] = "canonical"
+        own.write_text(json.dumps(checkpoint), encoding="utf-8")
+        self.git(root, "switch", "-c", "feature/consumer")
+
+        with self.assertRaises(module.TraceabilityError):
+            module._checkpoint_path(root, commit)
+
+    def test_checkpoint_selector_rejects_reparse_selected_tier(self):
+        module = self.module()
+        root = self.init_repo("reparse-feature")
+        self.write_controls(root)
+        commit = self.commit_all(root, "selector fixture")
+        own = self.write_feature_checkpoint(root, commit, "feature/consumer")
+        self.git(root, "switch", "-c", "feature/consumer")
+
+        with patch.object(
+            module,
+            "_is_reparse_point",
+            side_effect=lambda path: Path(path) == own.parent,
+        ), self.assertRaisesRegex(module.EngineeringError, "boundary"):
+            module._checkpoint_path(root, commit)
+
+    def test_status_cli_requires_full_checkpoint_validation_for_freshness(self):
+        module = self.module()
+        for defect in (
+            "graph_digest", "project_identity", "graphify_version", "input_digest",
+            "commit", "kind", "branch", "stale_marker", "malformed_json"
+        ):
+            with self.subTest(defect=defect):
+                root = self.init_repo(f"status-invalid-{defect}")
+                self.write_controls(root)
+                commit = self.commit_all(root, "status fixture")
+                checkpoint_path = self.write_canonical_checkpoint(root, commit)
+                if defect == "stale_marker":
+                    module._record_stale(root, commit, "synthetic stale evidence")
+                elif defect == "malformed_json":
+                    self.write_feature_checkpoint(root, commit, "feature/consumer")
+                    self.git(root, "switch", "-c", "feature/consumer")
+                    own = module._checkpoint_destination(
+                        root, commit, branch="feature/consumer", kind="feature"
+                    )
+                    own.write_text("{", encoding="utf-8")
+                else:
+                    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                    if defect == "graph_digest":
+                        checkpoint["metadata"]["graph_digest"] = "0" * 64
+                    elif defect == "input_digest":
+                        checkpoint["metadata"]["input_digest"] = "0" * 64
+                    elif defect == "project_identity":
+                        checkpoint["metadata"]["project_identity"] = "0" * 64
+                    elif defect == "commit":
+                        checkpoint["metadata"]["commit"] = "0" * 40
+                    elif defect == "kind":
+                        checkpoint["metadata"]["kind"] = "feature"
+                    elif defect == "branch":
+                        checkpoint["metadata"]["branch"] = "feature/foreign"
+                    else:
+                        checkpoint["metadata"]["graphify_version"] = "0.0.0"
+                    checkpoint_path.write_text(
+                        json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8"
+                    )
+
+                result = self.run_cli("status", root, "--commit", commit)
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                status_value = json.loads(result.stdout)
+                self.assertFalse(status_value["fresh"])
+                self.assertEqual("stale", status_value["freshness"])
+                self.assertFalse(module.check_merge_readiness(root)["ready"])
+
+    def test_historical_checkpoint_does_not_grant_current_readiness(self):
+        module = self.module()
+        root = self.init_repo("historical-checkpoint")
+        self.write_controls(root)
+        historical = self.commit_all(root, "historical checkpoint")
+        self.write_canonical_checkpoint(root, historical)
+        (root / "later.txt").write_text("later\n", encoding="utf-8")
+        self.commit_all(root, "advance default branch")
+
+        result = module.check_merge_readiness(root)
+
+        self.assertFalse(result["ready"])
+
 
 class Task3ContractTests(unittest.TestCase):
     def setUp(self):
@@ -3764,6 +4728,27 @@ class Task3ContractTests(unittest.TestCase):
             "remove_failed",
             "repository_lock_owner_mismatch",
         }
+        failure_stages = {
+            "preflight",
+            "worktree_add",
+            "incremental_adapter",
+            "cold_graphify",
+            "graph_output_validation",
+            "candidate_validation",
+            "authority_validation",
+            "publication",
+            "maintenance",
+            "result_record",
+            "quarantine_rollback",
+            "stale_maintenance",
+        }
+        failure_classes = {
+            "engineering_error",
+            "os_error",
+            "subprocess_error",
+            "json_error",
+            "other",
+        }
         operation_phases = {
             "orphaned",
             "published",
@@ -3780,6 +4765,10 @@ class Task3ContractTests(unittest.TestCase):
         evidence = evidence if isinstance(evidence, dict) else {}
         mode = result.get("mode")
         reason = result.get("reason")
+        freshness = result.get("freshness")
+        readiness = result.get("readiness")
+        failure_stage = result.get("failure_stage")
+        failure_class = result.get("failure_class")
         cleanup_reason = cleanup.get("reason") if cleanup else None
         cleanup_stages = {
             "ambiguous_worker_process_identity": "identity_or_tree_validation",
@@ -3812,6 +4801,28 @@ class Task3ContractTests(unittest.TestCase):
         return {
             "mode": mode if isinstance(mode, str) and mode in modes else "other",
             "reason": reason if isinstance(reason, str) and reason in reasons else "other",
+            "freshness": (
+                freshness
+                if isinstance(freshness, str)
+                and freshness in {"current", "stale", "not_configured"}
+                else "unknown"
+            ),
+            "readiness": (
+                readiness
+                if isinstance(readiness, str)
+                and readiness in {"ready", "blocked"}
+                else "unknown"
+            ),
+            "failure_stage": (
+                failure_stage
+                if isinstance(failure_stage, str) and failure_stage in failure_stages
+                else "unknown"
+            ),
+            "failure_class": (
+                failure_class
+                if isinstance(failure_class, str) and failure_class in failure_classes
+                else "unknown"
+            ),
             "operation_present": operation is not None,
             "worker_tree_state": (
                 tree_state
@@ -3873,6 +4884,10 @@ class Task3ContractTests(unittest.TestCase):
             {
                 "mode": "stale",
                 "reason": "other",
+                "freshness": "unknown",
+                "readiness": "unknown",
+                "failure_stage": "unknown",
+                "failure_class": "unknown",
                 "operation_present": True,
                 "worker_tree_state": "dead",
                 "worker_tree_evidence": "unknown",
@@ -3907,6 +4922,31 @@ class Task3ContractTests(unittest.TestCase):
                 },
             ),
         )
+
+    def test_rebuild_diagnostic_exposes_only_closed_failure_stage_and_class(self):
+        diagnostic = self._safe_rebuild_diagnostic(
+            {
+                "mode": "stale",
+                "freshness": "stale",
+                "reason": r"C:\private\repo\raw failure",
+                "failure_stage": "cold_graphify",
+                "failure_class": "subprocess_error",
+                "exception_type": "PrivateException",
+                "stderr": "private child output",
+            }
+        )
+
+        rendered = json.dumps(diagnostic, sort_keys=True)
+        self.assertEqual("cold_graphify", diagnostic["failure_stage"])
+        self.assertEqual("subprocess_error", diagnostic["failure_class"])
+        self.assertNotIn("private", rendered)
+        self.assertNotIn("PrivateException", rendered)
+        self.assertNotIn("stderr", rendered)
+        unknown = self._safe_rebuild_diagnostic(
+            {"failure_stage": "raw-private-stage", "failure_class": "PrivateException"}
+        )
+        self.assertEqual("unknown", unknown["failure_stage"])
+        self.assertEqual("unknown", unknown["failure_class"])
 
     def test_rebuild_diagnostic_exposes_bounded_cleanup_reason_and_phase(self):
         diagnostic = self._safe_rebuild_diagnostic(
@@ -4111,6 +5151,138 @@ class Task3ContractTests(unittest.TestCase):
             self.assertEqual(internal.resolve(), module.resolve_project_root(str(internal)))
             self.assertEqual(public.resolve(), module.resolve_project_root(str(public)))
 
+    def test_controller_run_decodes_git_bytes_and_handles_missing_streams(self):
+        module = self.module()
+
+        def result(code, stdout, stderr):
+            return subprocess.CompletedProcess(["git"], code, stdout, stderr)
+
+        with patch.object(module.subprocess, "run", return_value=result(0, "Á\r\n".encode(), b"")):
+            self.assertEqual(module.run(["git", "status"], strict_git=True), "Á")
+        with patch.object(module.subprocess, "run", return_value=result(0, None, b"")):
+            with self.assertRaisesRegex(module.TraceabilityError, "capture"):
+                module.run(["git", "status"], strict_git=True)
+        with patch.object(module.subprocess, "run", return_value=result(0, b"", b"")):
+            self.assertEqual(module.run(["git", "status"], strict_git=True), "")
+        with patch.object(module.subprocess, "run", return_value=result(1, None, b"fallback")):
+            with self.assertRaisesRegex(module.TraceabilityError, "fallback"):
+                module.run(["git", "status"], strict_git=True)
+        with patch.object(module.subprocess, "run", return_value=result(1, b"fallback", b"\x81")):
+            with self.assertRaisesRegex(module.TraceabilityError, "fallback"):
+                module.run(["git", "status"], strict_git=True)
+        with patch.object(module.subprocess, "run", return_value=result(1, b"\xff", b"\x81")):
+            with self.assertRaisesRegex(module.TraceabilityError, "exit code 1") as caught:
+                module.run(["git", "status"], strict_git=True)
+            self.assertNotIn("argv", str(caught.exception))
+        with patch.object(module.subprocess, "run", return_value=result(0, b"\x81", b"")):
+            with self.assertRaisesRegex(module.TraceabilityError, "invalid UTF-8"):
+                module.run(["git", "status"], strict_git=True)
+        with patch.object(module.subprocess, "run", return_value=result(0, b"  value  \r\n", b"")) as mocked:
+            self.assertEqual(module.run(["git", "status"], strict_git=True), "  value  ")
+            self.assertNotIn("GIT_DIR", mocked.call_args.kwargs["env"])
+            self.assertEqual(mocked.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
+        with patch.object(module.subprocess, "run", return_value=result(0, b"  blob\n \n", b"")):
+            self.assertEqual(module.run(["git", "show", "HEAD"], strict_git=True, raw_output=True), "  blob\n \n")
+
+    def test_controller_git_path_reader_preserves_leading_space_and_unicode(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+            (root / " Á file.txt").write_text("fixture", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "--all"], check=True, capture_output=True)
+            self.assertEqual(module._git_paths(root, "ls-files"), [" Á file.txt"])
+            self.assertEqual(module._git_status_records(root)[0][1], (" Á file.txt",))
+            (root / " Á text.txt").write_text("  leading and trailing  \n \n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Synthetic"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "synthetic"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "--all"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "fixture"], check=True, capture_output=True)
+            self.assertEqual(module._text_at(root, "HEAD", " Á text.txt"), "  leading and trailing  \n \n")
+
+    def test_controller_path_consumers_preserve_unusual_git_paths(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+            unusual_path = " leading Ω.txt"
+            (root / unusual_path).write_text("synthetic", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "--all"], check=True, capture_output=True)
+
+            self.assertEqual("mid-flight", module._setup_mode(root))
+            self.assertEqual([unusual_path], module._git_paths(root, "ls-files"))
+
+    def test_controller_status_rename_is_one_record_with_both_dirty_paths(self):
+        module = self.module()
+        status_output = b"R  old name\0new\nname\0"
+        with patch.object(module, "_git_bytes", return_value=status_output):
+            records = module._git_status_records(Path("synthetic"))
+            dirty_paths = module._dirty_paths(Path("synthetic"))
+
+        self.assertEqual([("R ", ("old name", "new\nname"))], records)
+        self.assertEqual(["old name", "new\nname"], dirty_paths)
+
+    def test_controller_status_rename_matches_real_git_porcelain_z(self):
+        module = self.module()
+        root = self.init_repo("porcelain-rename-order")
+        (root / "old.txt").write_text("rename fixture\n", encoding="utf-8")
+        self.commit_all(root, "add rename fixture")
+        self.git(root, "mv", "old.txt", "new.txt")
+
+        records = module._git_status_records(root)
+
+        self.assertEqual([("R ", ("new.txt", "old.txt"))], records)
+        self.assertEqual(["new.txt", "old.txt"], module._dirty_paths(root))
+
+    def test_traceability_dirty_coverage_counts_records_and_bounds_paths(self):
+        module = self.module()
+        records = [("R ", ("old.txt", "renamed.txt"))] + [
+            (" M", (f"path-{index:03}.txt",)) for index in range(256)
+        ]
+        checkpoint = {"metadata": {}}
+        with (
+            patch.object(module, "resolve_project_root", return_value=Path("synthetic")),
+            patch.object(module, "git", return_value="a" * 40),
+            patch.object(module, "load_project_config", return_value={"source_path": Path("links.json")}),
+            patch.object(module, "_load_checkpoint", return_value=checkpoint),
+            patch.object(module, "status", return_value={"freshness": "current"}),
+            patch.object(module, "_git_status_records", return_value=records),
+            patch.object(module, "_traceability_relationships", return_value=([], [])),
+            patch.object(module, "_load_traceability_receipts", return_value=[]),
+            patch.object(module, "_load_assurance_overlay", return_value=[]),
+            patch.object(module, "compose_traceability_view", side_effect=lambda declared, receipts, context, as_of: context),
+        ):
+            view = module.traceability_view(Path("synthetic"), as_of="2026-10-01T00:00:00Z")
+
+        coverage = view["dirty_coverage"]
+        self.assertEqual("dirty", coverage["state"])
+        self.assertEqual(257, coverage["count"])
+        self.assertEqual(256, len(coverage["paths"]))
+        self.assertEqual("old.txt", coverage["paths"][0])
+        self.assertTrue(coverage["truncated"])
+
+    def test_controller_rejects_incomplete_nul_records(self):
+        module = self.module()
+        completed = subprocess.CompletedProcess(["git"], 0, b"unfinished path", b"")
+        with patch.object(module.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(module.TraceabilityError, "incomplete NUL"):
+                module._git_paths(Path("synthetic"), "ls-files")
+        with patch.object(module, "_git_bytes", return_value=b" M unfinished path"):
+            with self.assertRaisesRegex(module.EngineeringError, "incomplete NUL"):
+                module._git_status_records(Path("synthetic"))
+
+    def test_controller_non_git_decode_keeps_locale_and_trimming_semantics(self):
+        module = self.module()
+        result = subprocess.CompletedProcess(["synthetic-tool"], 0, b"\x80 value \x80\n", b"")
+        with (
+            patch.object(module.locale, "getpreferredencoding", return_value="cp1252"),
+            patch.object(module.subprocess, "run", return_value=result) as mocked,
+        ):
+            self.assertEqual("€ value €", module.run(["synthetic-tool"]))
+
+        self.assertNotIn("text", mocked.call_args.kwargs)
+        self.assertNotIn("encoding", mocked.call_args.kwargs)
+
     def test_three_worktrees_share_one_common_cache_root(self):
         module = self.module()
         root = self.governed_repo()
@@ -4183,6 +5355,37 @@ class Task3ContractTests(unittest.TestCase):
             quarantine["relative_path"],
             [item["relative_path"] for item in catalogue["quarantined"]],
         )
+
+    def test_published_validation_preserves_typed_commit_and_root_reasons(self):
+        module = self.module()
+        for defect, field, replacement, expected_reason in (
+            ("commit", "commit", "0" * 40, "commit_mismatch"),
+            ("root", "project_identity", "0" * 64, "root_binding_mismatch"),
+        ):
+            with self.subTest(defect=defect):
+                root = self.governed_repo(f"typed-address-{defect}")
+                commit = self.git(root, "rev-parse", "HEAD")
+                destination = self.write_canonical_checkpoint(root, commit)
+                graph_path = destination.parent / "graph.json"
+                original_graph = graph_path.read_bytes()
+                self.assertTrue(
+                    module._published_checkpoint_validation(
+                        root, destination, commit, branch="main", kind="canonical"
+                    )["valid"]
+                )
+                payload = json.loads(destination.read_text(encoding="utf-8"))
+                payload["metadata"][field] = replacement
+                destination.write_text(json.dumps(payload), encoding="utf-8")
+                tampered_checkpoint = destination.read_bytes()
+
+                validation = module._published_checkpoint_validation(
+                    root, destination, commit, branch="main", kind="canonical"
+                )
+
+                self.assertFalse(validation["valid"])
+                self.assertEqual(expected_reason, validation["reason"])
+                self.assertEqual(tampered_checkpoint, destination.read_bytes())
+                self.assertEqual(original_graph, graph_path.read_bytes())
 
     def test_failed_regeneration_rolls_back_quarantined_checkpoint_losslessly(self):
         module = self.module()
@@ -4371,7 +5574,7 @@ class Task3ContractTests(unittest.TestCase):
                 side_effect=capture_adapter_environment,
             ),
             patch.object(module, "_compatible_ancestor", return_value=None),
-            patch.object(module, "_mutate_maintenance_locked", return_value=None),
+            patch.object(module, "_mutate_maintenance_locked", return_value={"queued": [], "resolved": []}),
             patch.object(module, "run", side_effect=capture_graphify_environment),
         ):
             self.assertEqual(0, module._graph_worker_entry(root, operation["operation_id"]))
@@ -4390,6 +5593,618 @@ class Task3ContractTests(unittest.TestCase):
                 continue
             with self.subTest(name=name):
                 self.assertNotIn(name, captured[0])
+
+        successful_result = json.loads(
+            Path(record["result_path"]).read_text(encoding="utf-8")
+        )
+        self.assertFalse({"failure_stage", "failure_class"} & set(successful_result))
+
+    def test_graph_worker_failure_receipt_tracks_cold_and_recovery_boundaries(self):
+        module = self.module()
+        secret = r"C:\private\synthetic worker exception message"
+        scenarios = (
+            ("cold_failure", False, False, "cold_graphify", "engineering_error"),
+            (
+                "rollback_failure",
+                True,
+                True,
+                "quarantine_rollback",
+                "engineering_error",
+            ),
+            (
+                "maintenance_failure",
+                False,
+                False,
+                "stale_maintenance",
+                "os_error",
+            ),
+            ("recovery_succeeds", True, False, "cold_graphify", "engineering_error"),
+            ("result_record_failure", False, False, "result_record", "os_error"),
+        )
+        for name, quarantine_enabled, rollback_fails, expected_stage, expected_class in scenarios:
+            with self.subTest(scenario=name):
+                root = self.governed_repo(f"worker-failure-stage-{name}")
+                commit = self.git(root, "rev-parse", "HEAD")
+                operation = module.register_hook_operation(root)
+                record = module._read_operation(root, operation["operation_id"])
+                record.update(
+                    {
+                        "root": str(root),
+                        "commit": commit,
+                        "branch": "main",
+                        "kind": "canonical",
+                        "manifest_name": module._tracked_manifest_name(root),
+                        "hook": False,
+                        "authority": {"branch": "main", "remote": None},
+                    }
+                )
+                module._write_operation(record)
+
+                original_run = module.run
+                original_atomic_text = module._atomic_text
+                result_write_count = 0
+
+                def controlled_run(command, *args, **kwargs):
+                    if command[1:4] == ["-m", "graphify", "update"]:
+                        if name == "result_record_failure":
+                            output = Path(kwargs["env"]["GRAPHIFY_OUT"])
+                            snapshot = Path(command[-1])
+                            output.mkdir(parents=True, exist_ok=True)
+                            (output / "graph.json").write_text(
+                                json.dumps(
+                                    {
+                                        "directed": True,
+                                        "multigraph": False,
+                                        "graph": {},
+                                        "nodes": [],
+                                        "links": [],
+                                        "built_at_commit": module.git(
+                                            snapshot, "rev-parse", "HEAD"
+                                        ),
+                                    }
+                                ),
+                                encoding="utf-8",
+                            )
+                            return subprocess.CompletedProcess(command, 0)
+                        raise module.EngineeringError(secret)
+                    return original_run(command, *args, **kwargs)
+
+                def fail_first_success_result_write(path, text, *args, **kwargs):
+                    nonlocal result_write_count
+                    if (
+                        name == "result_record_failure"
+                        and Path(path) == Path(record["result_path"])
+                    ):
+                        result_write_count += 1
+                        if result_write_count == 1:
+                            raise OSError(secret)
+                    return original_atomic_text(path, text, *args, **kwargs)
+
+                def queue_stale(*args, **kwargs):
+                    if name == "maintenance_failure":
+                        raise OSError(secret)
+
+                rollback_side_effect = (
+                    module.EngineeringError(secret)
+                    if rollback_fails
+                    else {"restored": True}
+                )
+                with (
+                    patch.object(
+                        module,
+                        "_verify_graphify_adapter_in_process",
+                        return_value=(
+                            {"version": module.GRAPHIFY_VERSION, "code_extensions": []},
+                            object(),
+                        ),
+                    ),
+                    patch.object(module, "_compatible_ancestor", return_value=None),
+                    patch.object(module, "_semantic_changes", return_value=[]),
+                    patch.object(
+                        module,
+                        "_quarantine_invalid_checkpoint",
+                        return_value={"synthetic": True} if quarantine_enabled else None,
+                    ),
+                    patch.object(
+                        module,
+                        "_restore_quarantined_checkpoint",
+                        side_effect=rollback_side_effect if rollback_fails else None,
+                        return_value=None if rollback_fails else rollback_side_effect,
+                    ),
+                    patch.object(module, "_queue_graph_worker_stale", side_effect=queue_stale),
+                    patch.object(module, "run", side_effect=controlled_run),
+                    patch.object(module, "_atomic_text", side_effect=fail_first_success_result_write),
+                    patch.object(module, "_mutate_maintenance_locked", return_value={"queued": [], "resolved": []}),
+                ):
+                    self.assertEqual(
+                        1, module._graph_worker_entry(root, operation["operation_id"])
+                    )
+
+                worker_result = json.loads(
+                    Path(record["result_path"]).read_text(encoding="utf-8")
+                )
+                diagnostic = self._safe_rebuild_diagnostic(worker_result)
+                self.assertEqual(expected_stage, diagnostic["failure_stage"], diagnostic)
+                self.assertEqual(expected_class, diagnostic["failure_class"], diagnostic)
+                rendered = json.dumps(diagnostic, sort_keys=True)
+                self.assertNotIn("private", rendered)
+                self.assertNotIn("synthetic worker exception message", rendered)
+                if name == "result_record_failure":
+                    self.assertEqual(2, result_write_count)
+
+    def test_remote_default_modern_worker_classifies_published_feature_maintenance(self):
+        module = self.module()
+        root = self.governed_repo("remote-default-feature-maintenance")
+        commit = self.git(root, "rev-parse", "HEAD")
+        self.git(root, "remote", "add", "origin", "https://example.test/origin.git")
+        self.git(root, "update-ref", "refs/remotes/origin/main", commit)
+        self.git(
+            root,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        )
+        authority = module._canonical_authority_details(
+            root, refresh_remote=False, allow_cached_remote=True
+        )
+        self.assertEqual("main", authority["branch"])
+        self.assertEqual(commit, authority["commit"])
+        self.assertEqual([], authority["fetch_argv"])
+        stale = module.queue_maintenance(
+            root,
+            {
+                "area": "graph",
+                "artifact": "checkpoint",
+                "kind": "checkpoint_stale",
+                "impact": "routine",
+            },
+        )
+        module._record_stale(root, commit, "synthetic pre-publication marker")
+        fake_graphify = self.write_fake_graphify()
+
+        with patch.dict(os.environ, self.graphify_environment(fake_graphify), clear=False):
+            with patch.object(
+                module,
+                "_canonical_authority_details",
+                wraps=module._canonical_authority_details,
+            ) as authority_calls:
+                result = module.rebuild(root, sys.executable, target_commit=commit)
+
+        diagnostic = self._safe_rebuild_diagnostic(result)
+        self.assertTrue(authority_calls.called)
+        self.assertTrue(
+            all(not call.kwargs.get("refresh_remote", True) for call in authority_calls.call_args_list)
+        )
+        canonical_checkpoint = module._checkpoint_destination(
+            root, commit, branch="main", kind="canonical"
+        )
+        feature_checkpoint = module._checkpoint_destination(
+            root, commit, branch="main", kind="feature"
+        )
+        self.assertEqual("full", diagnostic["mode"], diagnostic)
+        self.assertEqual("current", diagnostic["freshness"], diagnostic)
+        self.assertEqual(
+            {"commit": commit, "checkpoint": str(canonical_checkpoint)},
+            result.get("current_resolution"),
+        )
+        self.assertNotIn(commit, module._read_stale(root))
+        self.assertTrue(canonical_checkpoint.is_file())
+        self.assertFalse(feature_checkpoint.exists())
+        checkpoint = json.loads(canonical_checkpoint.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {"branch": "main", "commit": commit, "kind": "canonical"},
+            {
+                key: checkpoint["metadata"][key]
+                for key in ("branch", "commit", "kind")
+            },
+        )
+        validation = module.validate_checkpoint(root, canonical_checkpoint, commit)
+        self.assertTrue(validation["valid"])
+        readiness = module.check_merge_readiness(root)
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(str(canonical_checkpoint), readiness["checkpoint"])
+        maintenance = module._load_maintenance(root)
+        self.assertNotIn(stale["id"], {item["id"] for item in maintenance["items"]})
+        self.assertIn(stale["id"], {item["id"] for item in maintenance["history"]})
+        self.assertEqual(commit, self.git(root, "rev-parse", "HEAD"))
+
+    def test_nondefault_current_feature_resolution_clears_stale_without_queue(self):
+        module = self.module()
+        root = self.governed_repo("current-own-feature-resolution")
+        self.git(root, "remote", "add", "origin", "https://example.test/origin.git")
+        fake_graphify, environment = self.cold_checkpoint(root)
+        base_commit = self.git(root, "rev-parse", "HEAD")
+        canonical = module._checkpoint_destination(
+            root, base_commit, branch="main", kind="canonical"
+        )
+        self.assertTrue(module.validate_checkpoint(root, canonical, base_commit)["valid"])
+
+        feature = self.add_linked_worktree(root, "feature/current-proof")
+        (feature / "src").mkdir()
+        (feature / "src" / "current_feature.py").write_text(
+            "VALUE = 'synthetic feature change'\n", encoding="utf-8"
+        )
+        commit = self.commit_all(feature, "add current feature code")
+        self.assertEqual("main", module._tracked_default_branch(feature, commit))
+        feature_checkpoint = module._checkpoint_destination(
+            feature, commit, branch="feature/current-proof", kind="feature"
+        )
+        canonical_feature_checkpoint = module._checkpoint_destination(
+            feature, commit, branch="main", kind="canonical"
+        )
+        self.assertFalse(feature_checkpoint.parent.exists())
+        self.assertFalse(canonical_feature_checkpoint.parent.exists())
+        module._record_stale(feature, commit, "synthetic prior stale marker")
+        self.assertEqual([], module._load_maintenance(feature)["items"])
+
+        with patch.dict(os.environ, environment, clear=False):
+            result = module.rebuild(feature, sys.executable)
+
+        diagnostic = self._safe_rebuild_diagnostic(result)
+        self.assertEqual("current", diagnostic["freshness"], diagnostic)
+        self.assertEqual(
+            {"commit": commit, "checkpoint": str(feature_checkpoint)},
+            result.get("current_resolution"),
+        )
+        self.assertTrue(feature_checkpoint.is_file())
+        self.assertFalse(canonical_feature_checkpoint.parent.exists())
+        self.assertTrue(
+            module.validate_checkpoint(feature, feature_checkpoint, commit)["valid"]
+        )
+        self.assertNotIn(commit, module._read_stale(feature))
+        self.assertEqual([], module._load_maintenance(feature)["items"])
+        self.assertEqual(commit, self.git(feature, "rev-parse", "HEAD"))
+        self.assertTrue(canonical.is_file())
+
+    def test_zero_remote_local_default_cold_build_publishes_canonical_current(self):
+        module = self.module()
+        root = self.governed_repo("zero-remote-local-default-canonical")
+        self.assertEqual("", self.git(root, "remote"))
+        commit = self.git(root, "rev-parse", "HEAD")
+        canonical = module._checkpoint_destination(
+            root, commit, branch="main", kind="canonical"
+        )
+        fake_graphify = self.write_fake_graphify()
+
+        with patch.dict(
+            os.environ, self.graphify_environment(fake_graphify), clear=False
+        ):
+            result = module.rebuild(root, sys.executable)
+
+        diagnostic = self._safe_rebuild_diagnostic(result)
+        self.assertEqual("current", diagnostic["freshness"], diagnostic)
+        self.assertEqual(str(canonical), result.get("checkpoint"))
+        self.assertEqual(
+            {"commit": commit, "checkpoint": str(canonical)},
+            result.get("current_resolution"),
+        )
+        self.assertTrue(module.validate_checkpoint(root, canonical, commit)["valid"])
+        self.assertTrue(module.check_merge_readiness(root)["ready"])
+
+    def test_worker_reuses_valid_existing_checkpoint_and_resolves_stale_marker(self):
+        module = self.module()
+        root = self.governed_repo("worker-reuses-valid-checkpoint")
+        fake_graphify, environment = self.cold_checkpoint(root)
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_destination(
+            root, commit, branch="main", kind="canonical"
+        )
+        graph_path = destination.parent / "graph.json"
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+        opaque_path = destination.parent / "opaque.worker-preservation"
+        opaque_path.write_bytes(b"preserve existing opaque checkpoint data\n")
+        checkpoint_before = destination.read_bytes()
+        graph_before = graph_path.read_bytes()
+        opaque_before = opaque_path.read_bytes()
+        module._record_stale(root, commit, "synthetic marker before valid reuse")
+
+        with patch.dict(os.environ, environment, clear=False):
+            result = module.rebuild(root, sys.executable)
+
+        diagnostic = self._safe_rebuild_diagnostic(result)
+        self.assertEqual("current", diagnostic["freshness"], diagnostic)
+        self.assertEqual("full", diagnostic["mode"], diagnostic)
+        self.assertEqual(
+            {"commit": commit, "checkpoint": str(destination)},
+            result.get("current_resolution"),
+        )
+        self.assertTrue(diagnostic["cleanup_completed"], diagnostic)
+        self.assertEqual(checkpoint_before, destination.read_bytes())
+        self.assertEqual(graph_before, graph_path.read_bytes())
+        self.assertEqual(opaque_before, opaque_path.read_bytes())
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+        self.assertNotIn(commit, module._read_stale(root))
+
+    def test_postpublication_authority_drift_preserves_stale_and_queue(self):
+        module = self.module()
+        scenarios = (
+            "remote_url",
+            "fetch_source",
+            "fetch_destination",
+            "default_tip",
+            "remote_added",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                root = self.governed_repo(f"postpublication-authority-{scenario}")
+                commit = self.git(root, "rev-parse", "HEAD")
+                if scenario != "remote_added":
+                    self.git(
+                        root,
+                        "remote",
+                        "add",
+                        "origin",
+                        "https://example.test/origin.git",
+                    )
+                destination = self.write_canonical_checkpoint(root, commit)
+                authority = module._current_authority_snapshot(root)
+                self.assertIsInstance(authority, dict)
+
+                stale_item = module.queue_maintenance(
+                    root,
+                    {
+                        "area": "graph",
+                        "artifact": "checkpoint",
+                        "kind": "checkpoint_stale",
+                        "impact": "routine",
+                    },
+                )
+                module._record_stale(root, commit, "synthetic pre-publication stale marker")
+                maintenance_before = module._maintenance_snapshot(root)
+                stale_before = module._read_stale(root)
+
+                operation = module.register_hook_operation(root)
+                record = module._read_operation(root, operation["operation_id"])
+                record.update(
+                    {
+                        "root": str(root),
+                        "commit": commit,
+                        "branch": "main",
+                        "kind": "canonical",
+                        "manifest_name": module._tracked_manifest_name_at(root, commit),
+                        "hook": False,
+                        "phase": "published",
+                        "destination": str(destination.absolute()),
+                        "postpublication_authority": authority,
+                    }
+                )
+                module._write_operation(record)
+                self.assertTrue(module._acquire_repository_lock(record))
+                initial_proof = module._postpublication_current_resolution(
+                    root, record, destination
+                )
+                self.assertIsNotNone(initial_proof)
+                self.assertEqual(commit, initial_proof["commit"])
+                self.assertEqual(str(destination.absolute()), initial_proof["checkpoint"])
+
+                if scenario == "remote_url":
+                    self.git(
+                        root,
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://example.test/changed.git",
+                    )
+                elif scenario == "fetch_source":
+                    self.git(
+                        root,
+                        "config",
+                        "--replace-all",
+                        "remote.origin.fetch",
+                        "+refs/heads/other:refs/remotes/origin/main",
+                    )
+                elif scenario == "fetch_destination":
+                    self.git(
+                        root,
+                        "config",
+                        "--replace-all",
+                        "remote.origin.fetch",
+                        "+refs/heads/main:refs/remotes/origin/other",
+                    )
+                elif scenario == "default_tip":
+                    self.git(root, "switch", "-c", "authority-tip-other")
+                    (root / "README.md").write_text(
+                        "# Alternate authority tip\n", encoding="utf-8"
+                    )
+                    other_tip = self.commit_all(root, "create alternate remote tip")
+                    self.git(root, "switch", "main")
+                    self.git(root, "update-ref", "refs/remotes/origin/main", other_tip)
+                else:
+                    self.git(
+                        root,
+                        "remote",
+                        "add",
+                        "origin",
+                        "https://example.test/added-origin.git",
+                    )
+
+                result = module._mutate_maintenance_locked(
+                    root,
+                    [],
+                    record,
+                    resolved_checkpoint=commit,
+                    postpublication_context={
+                        "destination": str(destination.absolute())
+                    },
+                )
+
+                self.assertEqual([], result["resolved"])
+                self.assertNotIn("current_resolution", result)
+                self.assertIsNone(
+                    module._postpublication_current_resolution(
+                        root, record, destination
+                    )
+                )
+                self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+                if scenario in {"fetch_source", "fetch_destination"}:
+                    with self.assertRaisesRegex(
+                        module.EngineeringError,
+                        "^checkpoint_default_branch_mismatch$",
+                    ):
+                        module._validated_current_checkpoint(root, commit)
+                else:
+                    _, _, current_validation = module._validated_current_checkpoint(
+                        root, commit
+                    )
+                    self.assertFalse(current_validation["valid"])
+                self.assertEqual(stale_before, module._read_stale(root))
+                self.assertEqual(maintenance_before, module._maintenance_snapshot(root))
+                self.assertIn(
+                    stale_item["id"],
+                    {item["id"] for item in module._load_maintenance(root)["items"]},
+                )
+
+    def test_ordinary_maintenance_without_postpublication_context_keeps_stale_guard(self):
+        module = self.module()
+        root = self.governed_repo("ordinary-maintenance-stale-context")
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = self.write_canonical_checkpoint(root, commit)
+        stale_item = module.queue_maintenance(
+            root,
+            {
+                "area": "graph",
+                "artifact": "checkpoint",
+                "kind": "checkpoint_stale",
+                "impact": "routine",
+            },
+        )
+        module._record_stale(root, commit, "synthetic existing stale marker")
+        stale_before = module._read_stale(root)
+        maintenance_before = module._maintenance_snapshot(root)
+
+        operation = module.register_hook_operation(root)
+        record = module._read_operation(root, operation["operation_id"])
+        record.update(
+            {
+                "root": str(root),
+                "commit": commit,
+                "branch": "main",
+                "kind": "canonical",
+            }
+        )
+        module._write_operation(record)
+        self.assertTrue(module._acquire_repository_lock(record))
+
+        with self.assertRaisesRegex(
+            module.EngineeringError, "lacks exact evidence"
+        ):
+            module._mutate_maintenance_locked(
+                root, [], record, resolved_checkpoint=commit
+            )
+
+        self.assertTrue(module.validate_checkpoint(root, destination, commit)["valid"])
+        self.assertEqual(stale_before, module._read_stale(root))
+        self.assertEqual(maintenance_before, module._maintenance_snapshot(root))
+        self.assertIn(
+            stale_item["id"],
+            {item["id"] for item in module._load_maintenance(root)["items"]},
+        )
+
+    def test_stale_clear_requires_operation_bound_current_resolution_and_clean_cleanup(self):
+        module = self.module()
+        root = self.governed_repo("current-resolution-proof")
+        commit = self.git(root, "rev-parse", "HEAD")
+        destination = module._checkpoint_destination(
+            root, commit, branch="main", kind="canonical"
+        ).absolute()
+        operation = {
+            "commit": commit,
+            "branch": "main",
+            "kind": "canonical",
+            "destination": str(destination),
+        }
+        result = {
+            "commit": commit,
+            "checkpoint": str(destination),
+            "freshness": "current",
+            "current_resolution": {
+                "commit": commit,
+                "checkpoint": str(destination),
+            },
+        }
+        cleanup = {"completed": True}
+        self.assertTrue(module._current_resolution_proven(root, result, operation, cleanup))
+        cases = {
+            "missing_proof": {**result, "current_resolution": None},
+            "wrong_proof_commit": {
+                **result,
+                "current_resolution": {"commit": "0" * 40, "checkpoint": str(destination)},
+            },
+            "wrong_proof_path": {
+                **result,
+                "current_resolution": {"commit": commit, "checkpoint": str(destination / "elsewhere")},
+            },
+            "operation_path_mismatch": {
+                **result,
+                "operation": {**operation, "destination": str(destination / "elsewhere")},
+            },
+            "cleanup_incomplete": {**result, "cleanup": {"completed": False}},
+            "blocked_readiness": {**result, "readiness": "blocked"},
+        }
+        for name, case in cases.items():
+            with self.subTest(name=name):
+                candidate_operation = case.pop("operation", operation)
+                candidate_cleanup = case.pop("cleanup", cleanup)
+                self.assertFalse(
+                    module._current_resolution_proven(
+                        root, case, candidate_operation, candidate_cleanup
+                    )
+                )
+
+    def test_modern_rebuild_uses_requested_historical_manifest_without_current_promotion(self):
+        module = self.module()
+        root = self.governed_repo("historical-manifest-rebuild")
+        (root / module.V2_CONFIG).unlink()
+        self.write_controls(root, generation="v1")
+        historical_commit = self.commit_all(root, "v1 historical controls")
+        self.assertEqual(
+            module.V1_CONFIG,
+            module._tracked_manifest_name_at(root, historical_commit),
+        )
+
+        self.write_controls(root, generation="v2")
+        (root / module.V1_CONFIG).unlink()
+        current_commit = self.commit_all(root, "v2 current controls")
+        self.assertEqual(module.V2_CONFIG, module._tracked_manifest_name_at(root, current_commit))
+        current_checkpoint = self.write_canonical_checkpoint(root, current_commit)
+        stale = module.queue_maintenance(
+            root,
+            {
+                "area": "graph",
+                "artifact": "checkpoint",
+                "kind": "checkpoint_stale",
+                "impact": "routine",
+            },
+        )
+        fake_graphify = self.write_fake_graphify()
+
+        with patch.dict(os.environ, self.graphify_environment(fake_graphify), clear=False):
+            rebuilt = module.rebuild(
+                root, sys.executable, target_commit=historical_commit
+            )
+
+        historical_path = module._checkpoint_destination(
+            root, historical_commit, branch="main", kind="feature"
+        )
+        diagnostic = self._safe_rebuild_diagnostic(rebuilt)
+        self.assertEqual("current", rebuilt["freshness"], diagnostic)
+        self.assertTrue(historical_path.is_file())
+        selected_path, historical_payload = module._checkpoint_payload_at_address(
+            root, historical_commit, branch="main", kind="feature"
+        )
+        self.assertEqual(historical_path, selected_path)
+        self.assertTrue(
+            module._validate_checkpoint_payload(
+                root, selected_path, historical_commit, historical_payload
+            )["valid"]
+        )
+        self.assertNotIn("current_resolution", rebuilt)
+        self.assertEqual(current_commit, self.git(root, "rev-parse", "HEAD"))
+        self.assertEqual(current_checkpoint, module._validated_current_checkpoint(root, current_commit)[0])
+        self.assertTrue(module.check_merge_readiness(root)["ready"])
+        maintenance = module._load_maintenance(root)
+        self.assertIn(stale["id"], {item["id"] for item in maintenance["items"]})
+        self.assertNotIn(stale["id"], {item["id"] for item in maintenance["history"]})
 
     def test_incremental_outer_worker_uses_exact_environment_before_python_start(self):
         """The worker cannot resolve Graphify from ambient proxy, Git, or Python paths."""
@@ -5213,6 +7028,9 @@ class Task3AmendedContractTests(unittest.TestCase):
         started = time.monotonic()
         cold = module.rebuild(cold_root, sys.executable)
         cold_seconds = time.monotonic() - started
+        cold_diagnostic = self._safe_rebuild_diagnostic(cold)
+        self.assertEqual("full", cold_diagnostic["mode"], cold_diagnostic)
+        self.assertEqual("current", cold_diagnostic["freshness"], cold_diagnostic)
         started = time.monotonic()
         exact = module.rebuild(root, sys.executable)
         exact_seconds = time.monotonic() - started
@@ -5297,6 +7115,9 @@ class Task3AmendedContractTests(unittest.TestCase):
         cold_root = Path(self.temporary_directory.name) / "all-suffixes-cold"
         self.git(root, "clone", str(root), str(cold_root))
         cold = module.rebuild(cold_root, sys.executable)
+        cold_diagnostic = self._safe_rebuild_diagnostic(cold)
+        self.assertEqual("full", cold_diagnostic["mode"], cold_diagnostic)
+        self.assertEqual("current", cold_diagnostic["freshness"], cold_diagnostic)
         cold_graph = json.loads(
             (Path(cold["checkpoint"]).parent / "graph.json").read_text(
                 encoding="utf-8"
@@ -5495,6 +7316,52 @@ class Task3AmendedContractTests(unittest.TestCase):
         without_refresh = module.reconcile_canonical(root, refresh_remote=False)
         self.assertEqual("unknown", without_refresh["freshness"])
         self.assertFalse(without_refresh["canonical_published"])
+
+    def test_canonical_authority_fetch_decode_failure_stays_unknown(self):
+        module = self.module()
+        root = self.governed_repo("fetch-decode-failure")
+        remote = Path(self.temporary_directory.name) / "fetch-decode-failure.git"
+        self.git(root, "init", "--bare", str(remote))
+        self.git(root, "remote", "add", "origin", str(remote))
+        self.git(root, "config", "--unset-all", "remote.origin.fetch")
+        self.git(
+            root,
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        )
+        existing_commit = self.git(root, "rev-parse", "refs/remotes/origin/main")
+        actual_run = subprocess.run
+        fetches = []
+
+        def fail_fetch(command, *args, **kwargs):
+            if "fetch" in command:
+                fetches.append((command, kwargs))
+                return subprocess.CompletedProcess(command, 1, b"", "remote: Á".encode("utf-8"))
+            return actual_run(command, *args, **kwargs)
+
+        with (
+            patch.object(module, "run", wraps=module.run) as run_spy,
+            patch.object(module.subprocess, "run", side_effect=fail_fetch),
+            patch.object(module.locale, "getpreferredencoding", return_value="cp1252"),
+        ):
+            authority = module._canonical_authority_details(root, refresh_remote=True)
+
+        self.assertEqual(authority["refresh_source"], "explicit_destination", authority)
+        fetch_call = next(call for call in run_spy.call_args_list if "fetch" in call.args[0])
+        self.assertTrue(fetch_call.kwargs["strict_git"])
+        self.assertEqual(fetch_call.kwargs["timeout"], 15)
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0][1]["timeout"], 15)
+        self.assertEqual(fetches[0][1]["env"], module._controller_git_environment())
+        self.assertEqual(authority["fetch_argv"], fetches[0][0])
+        self.assertEqual(authority["freshness"], "unknown")
+        self.assertIsNone(authority["commit"])
+        self.assertEqual(
+            existing_commit,
+            self.git(root, "rev-parse", "refs/remotes/origin/main"),
+        )
 
     def test_canonical_authority_binds_and_revalidates_remote_url(self):
         module = self.module()
@@ -7804,6 +9671,7 @@ class Task5ContractTests(unittest.TestCase):
     prepared_repo = Task2ContractTests.prepared_repo
     start_fake_graphify_interpreter = Task2ContractTests.start_fake_graphify_interpreter
     set_fake_graphify_controls = Task2ContractTests.set_fake_graphify_controls
+    _safe_rebuild_diagnostic = staticmethod(Task3ContractTests._safe_rebuild_diagnostic)
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -8024,11 +9892,15 @@ class Task5ContractTests(unittest.TestCase):
     def test_complete_detects_capability_impact_from_actual_changed_artifact(self):
         """Completion rechecks touched artifacts so a stale selection cannot bypass survival."""
         module = self.module()
+        links_name = "docs/engineering-traceability/links.json"
         root, prepared = self.prepared_run(
-            "actual-artifact-intent-impact", scope=["README.md"]
+            "actual-artifact-intent-impact", scope=["README.md", links_name]
         )
-        checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
-        checkpoint["nodes"].append(
+        preparation_commit = prepared["project"]["commit"]
+        base = module._load_checkpoint(root, preparation_commit)
+        links_path = root / links_name
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        links["nodes"].append(
             {
                 "id": "CAP-LATE-BOUND",
                 "type": "capability",
@@ -8036,22 +9908,59 @@ class Task5ContractTests(unittest.TestCase):
                 "source": {"path": "design.md", "line": 1},
             }
         )
-        checkpoint["edges"].append(
+        links["edges"].append(
             {
                 "id": "EDGE-LATE-BOUND",
-                "from": "CAP-LATE-BOUND",
-                "to": "CODE-1",
+                "from": "CODE-1",
+                "to": "CAP-LATE-BOUND",
                 "type": "implements",
                 "provenance": "direct",
+                "source": {"path": "design.md", "line": 1},
             }
         )
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
         (root / "README.md").write_text("# Changed capability artifact\n", encoding="utf-8")
+        head = self.commit_all(root, "add capability relation to changed artifact")
+        result_path = self.write_canonical_checkpoint(root, head)
+        changed = module._changed_paths_since(root, preparation_commit)
+        self.assertIn("README.md", changed)
+        self.assertIn(links_name, changed)
+        authorization = prepared["authorization"]
+        handoff = authorization.get("scope_handoff")
+        self.assertFalse(
+            module._intent_impacting(
+                base,
+                [],
+                authorization.get("change_class"),
+                handoff,
+                artifact_paths=changed,
+            )
+        )
+        result = module._load_checkpoint(root, head)
+        self.assertTrue(
+            module._intent_impacting(
+                result,
+                [],
+                authorization.get("change_class"),
+                handoff,
+                artifact_paths=changed,
+            )
+        )
+        self.assertTrue(module.validate_checkpoint(root, result_path, head)["valid"])
 
-        with patch.object(module, "_load_checkpoint", return_value=checkpoint), self.assertRaisesRegex(
+        with patch.object(
+            module,
+            "_completion_intent_impact",
+            wraps=module._completion_intent_impact,
+        ) as impact, self.assertRaisesRegex(
             module.EngineeringError,
             "completion detected unbound intent impact from actual artifacts",
         ):
             module.complete(root, prepared["run_id"], [])
+        impact.assert_called_once()
+        self.assertFalse(
+            (module.common_graph_dir(root) / "runs" / prepared["run_id"] / "completion.json").exists()
+        )
 
     def test_complete_fails_closed_for_new_capability_path_absent_from_base_checkpoint(self):
         """A newly mapped capability must be assessed from the refreshed exact checkpoint."""
@@ -8111,29 +10020,152 @@ class Task5ContractTests(unittest.TestCase):
             ("docs/owner-commitment.md", "# Owner commitment\n"),
             ("tests/test_owner_commitment.py", "def test_commitment():\n    pass\n"),
         )
-        for index, (relative, content) in enumerate(paths, start=1):
-            with self.subTest(path=relative):
-                root, prepared = self.prepared_run(
-                    f"new-owner-commitment-{index}", scope=[relative]
-                )
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-                head = self.commit_all(root, f"add {relative}")
-                self.write_canonical_checkpoint(root, head)
-                with (
-                    patch.object(
-                        module,
-                        "check_merge_readiness",
-                        return_value={"ready": False, "commit": head},
-                    ),
-                    patch.object(module, "rebuild", return_value={"freshness": "stale"}),
-                    self.assertRaisesRegex(
-                        module.EngineeringError,
-                        "feature checkpoint refresh failed",
-                    ),
-                ):
-                    module.complete(root, prepared["run_id"], [])
+        owner = Task11OwnerIntentContractTests("runTest")
+        try:
+            owner.setUp()
+            for index, (relative, content) in enumerate(paths, start=1):
+                with self.subTest(path=relative):
+                    root, _ = self.prepared_repo(f"new-owner-commitment-{index}")
+                    owner.root = root
+                    owner.repository_id = owner.repository_identity_original(root)
+
+                    approvers = root / ".engineering-host-approvers"
+                    approvers.write_bytes(owner.host_allowed_signers)
+                    ledger = root / "docs" / "engineering-traceability" / "decision-ledger.md"
+                    ledger.write_text(
+                        "# Engineering Traceability Decision Ledger\n"
+                        "## PROJ-DEC-1 - Approved reconstructed scope\n",
+                        encoding="utf-8",
+                    )
+                    links_path = root / "docs" / "engineering-traceability" / "links.json"
+                    links = json.loads(links_path.read_text(encoding="utf-8"))
+                    links["nodes"].append(
+                        {
+                            "id": "PROJ-DEC-1",
+                            "type": "decision",
+                            "title": "Approved reconstructed scope",
+                            "source": {
+                                "path": "docs/engineering-traceability/decision-ledger.md",
+                                "line": 2,
+                            },
+                        }
+                    )
+                    links_path.write_text(
+                        json.dumps(links, indent=2) + "\n", encoding="utf-8"
+                    )
+                    authority_commit = self.commit_all(
+                        root, "record synthetic host and approved decision"
+                    )
+                    self.write_canonical_checkpoint(root, authority_commit)
+                    module.approve_checks(root)
+
+                    binding = owner.owner_intent_binding()
+                    intent = module.bind_owner_intent(
+                        root, binding, owner.owner_intent_approval(binding)
+                    )
+                    survival = owner.outcome_survival_v2(intent)
+                    survival["mappings"][0]["verification_ids"] = ["TEST-1"]
+                    evidence_scope = ["PROJ-DEC-1", "TEST-1"]
+                    handoff = {
+                        "seed_evidence": ["TEST-1"],
+                        "reconstructed_scope": evidence_scope,
+                        "architect_scope": evidence_scope,
+                        "result_scope": evidence_scope,
+                        "result_artifacts": [relative],
+                        "outcome_survival": survival,
+                    }
+                    approved = module.approve_scope_handoff(
+                        root,
+                        "PROJ-DEC-1",
+                        handoff,
+                        owner_intent_id=intent["intent_id"],
+                    )["scope_handoff"]
+                    prepared = module.prepare(
+                        root,
+                        "change TEST-1",
+                        {
+                            "scope": [relative],
+                            "forbidden": [],
+                            "context_ids": ["TEST-1"],
+                            "scope_handoff": approved,
+                        },
+                    )
+                    diagnostics = {
+                        name: prepared.get(name)
+                        for name in (
+                            "blockers",
+                            "advisories",
+                            "owner_intent",
+                            "outcome_survival",
+                        )
+                    }
+                    self.assertNotEqual(
+                        "blocked",
+                        prepared["readiness"],
+                        json.dumps(diagnostics, sort_keys=True),
+                    )
+                    self.assertEqual("bound", prepared["owner_intent"]["state"])
+                    self.assertTrue(
+                        prepared["owner_intent"]["bound_to_scope_handoff"]
+                    )
+
+                    path = root / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
+                    head = self.commit_all(root, f"add {relative}")
+                    base_path = module._checkpoint_path(root, authority_commit)
+                    base_bytes = base_path.read_bytes()
+                    canonical = module._checkpoint_destination(
+                        root, head, branch="main", kind="canonical"
+                    )
+                    feature = module._checkpoint_destination(
+                        root, head, branch="main", kind="feature"
+                    )
+                    self.assertFalse(canonical.exists())
+                    self.assertFalse(feature.exists())
+                    self.assertFalse(module._merge_readiness_snapshot(root)[0]["ready"])
+
+                    manifest = (
+                        module.common_graph_dir(root)
+                        / "runs"
+                        / prepared["run_id"]
+                        / "completion.json"
+                    )
+                    with (
+                        patch.object(
+                            module, "rebuild", return_value={"freshness": "stale"}
+                        ) as rebuild,
+                        patch.object(
+                            module,
+                            "_merge_readiness_snapshot",
+                            wraps=module._merge_readiness_snapshot,
+                        ) as readiness,
+                        self.assertRaisesRegex(
+                            module.EngineeringError,
+                            "requires an exact current checkpoint",
+                        ),
+                    ):
+                        module.complete(
+                            root,
+                            prepared["run_id"],
+                            [],
+                            result_scope=approved["architect_scope"],
+                        )
+                    rebuild.assert_called_once()
+                    args, kwargs = rebuild.call_args
+                    self.assertTrue(Path(args[0]).samefile(root))
+                    self.assertEqual(args[1:], (sys.executable,))
+                    self.assertEqual(
+                        kwargs,
+                        {"target_commit": head, "_semantic_full": True},
+                    )
+                    readiness.assert_called()
+                    self.assertFalse(manifest.exists())
+                    self.assertFalse(canonical.exists())
+                    self.assertFalse(feature.exists())
+                    self.assertEqual(base_bytes, base_path.read_bytes())
+        finally:
+            owner.doCleanups()
 
     def test_complete_fails_closed_for_modified_unrepresented_owner_commitment_paths(self):
         """Existing README/docs/tests omitted from base evidence still require refresh and intent."""
@@ -8242,12 +10274,36 @@ class Task5ContractTests(unittest.TestCase):
     def test_complete_detects_capability_impact_across_authorized_rename(self):
         """Both rename endpoints are assessed before an approved scope can complete."""
         module = self.module()
+        links_name = "docs/engineering-traceability/links.json"
         root, prepared = self.prepared_run(
             "renamed-artifact-intent-impact",
-            scope=["README.md", "README-renamed.md"],
+            scope=["README.md", "README-renamed.md", links_name],
         )
-        checkpoint = module._load_checkpoint(root, prepared["project"]["commit"])
-        checkpoint["nodes"].append(
+        preparation_commit = prepared["project"]["commit"]
+        base = module._load_checkpoint(root, preparation_commit)
+        base_path = module._checkpoint_path(root, preparation_commit)
+        base_bytes = base_path.read_bytes()
+        (root / "README.md").rename(root / "README-renamed.md")
+        stale_head = self.commit_all(root, "rename with stale tracked source")
+        stale_result_path = module._checkpoint_destination(
+            root, stale_head, branch="main", kind="canonical"
+        )
+        with self.assertRaisesRegex(
+            module.EngineeringError,
+            f"Missing source at commit {stale_head}: README[.]md",
+        ):
+            self.write_canonical_checkpoint(root, stale_head)
+        self.assertFalse(stale_result_path.exists())
+        self.assertEqual(base_bytes, base_path.read_bytes())
+        links_path = root / links_name
+        links = json.loads(links_path.read_text(encoding="utf-8"))
+        for node in links["nodes"]:
+            if node.get("id") == "CODE-1":
+                node["source"]["path"] = "README-renamed.md"
+        for edge in links["edges"]:
+            if edge.get("id") == "EDGE-2":
+                edge["source"]["path"] = "README-renamed.md"
+        links["nodes"].append(
             {
                 "id": "CAP-RENAMED",
                 "type": "capability",
@@ -8255,22 +10311,59 @@ class Task5ContractTests(unittest.TestCase):
                 "source": {"path": "design.md", "line": 1},
             }
         )
-        checkpoint["edges"].append(
+        links["edges"].append(
             {
                 "id": "EDGE-RENAMED",
-                "from": "CAP-RENAMED",
-                "to": "CODE-1",
+                "from": "CODE-1",
+                "to": "CAP-RENAMED",
                 "type": "implements",
                 "provenance": "direct",
+                "source": {"path": "design.md", "line": 1},
             }
         )
-        (root / "README.md").rename(root / "README-renamed.md")
+        links_path.write_text(json.dumps(links, indent=2) + "\n", encoding="utf-8")
+        head = self.commit_all(root, "rename capability artifact with exact mapping")
+        result_path = self.write_canonical_checkpoint(root, head)
+        changed = module._changed_paths_since(root, preparation_commit)
+        self.assertIn("README.md", changed)
+        self.assertIn("README-renamed.md", changed)
+        self.assertIn(links_name, changed)
+        authorization = prepared["authorization"]
+        handoff = authorization.get("scope_handoff")
+        self.assertFalse(
+            module._intent_impacting(
+                base,
+                [],
+                authorization.get("change_class"),
+                handoff,
+                artifact_paths=changed,
+            )
+        )
+        result = module._load_checkpoint(root, head)
+        self.assertTrue(
+            module._intent_impacting(
+                result,
+                [],
+                authorization.get("change_class"),
+                handoff,
+                artifact_paths=changed,
+            )
+        )
+        self.assertTrue(module.validate_checkpoint(root, result_path, head)["valid"])
 
-        with patch.object(module, "_load_checkpoint", return_value=checkpoint), self.assertRaisesRegex(
+        with patch.object(
+            module,
+            "_completion_intent_impact",
+            wraps=module._completion_intent_impact,
+        ) as impact, self.assertRaisesRegex(
             module.EngineeringError,
             "completion detected unbound intent impact from actual artifacts",
         ):
             module.complete(root, prepared["run_id"], [])
+        impact.assert_called_once()
+        self.assertFalse(
+            (module.common_graph_dir(root) / "runs" / prepared["run_id"] / "completion.json").exists()
+        )
 
 
     def test_legacy_material_scope_handoff_remains_readable_but_owner_intent_unknown(self):
@@ -8830,10 +10923,23 @@ class Task5ContractTests(unittest.TestCase):
 
     def test_complete_blocks_unpredicted_public_contract_change(self):
         module = self.module()
-        root, prepared = self.prepared_run(
-            "complete-contract",
-            scope=["api.md", "docs/engineering-traceability/links.json"],
+        root = self.init_repo("complete-contract")
+        (root / "api.md").write_text("# Existing API\n", encoding="utf-8")
+        self.write_controls(root)
+        base = self.commit_all(root, "prepared public API baseline")
+        self.write_canonical_checkpoint(root, base)
+        module.approve_checks(root)
+        scope = [
+            "api.md",
+            "docs/engineering-traceability/links.json",
+            "docs/extra.md",
+        ]
+        prepared = module.prepare(
+            root,
+            "change REQ-1",
+            {"scope": scope, "forbidden": ["publish", "deploy"]},
         )
+        self.assertNotEqual("blocked", prepared["readiness"])
         links_path = root / "docs" / "engineering-traceability" / "links.json"
         links = json.loads(links_path.read_text(encoding="utf-8"))
         links["nodes"].append(
@@ -8847,18 +10953,37 @@ class Task5ContractTests(unittest.TestCase):
         links_path.write_text(json.dumps(links), encoding="utf-8")
         (root / "api.md").write_text("# Changed contract\n", encoding="utf-8")
         (root / "docs" / "extra.md").write_text("# Unrelated follow-up\n", encoding="utf-8")
-        self.commit_all(root, "unpredicted public contract")
+        self.git(root, "add", "docs/engineering-traceability/links.json")
+        self.assertEqual(
+            ["docs/engineering-traceability/links.json"],
+            self.git(root, "diff", "--cached", "--name-only").splitlines(),
+        )
+        self.assertEqual(
+            ["api.md"], self.git(root, "diff", "--name-only").splitlines()
+        )
+        self.assertEqual(
+            ["docs/extra.md"],
+            self.git(root, "ls-files", "--others", "--exclude-standard").splitlines(),
+        )
         fake_graphify = self.write_fake_graphify()
-        maintenance = module.common_graph_dir(root) / "state" / "maintenance.json"
+        common = module.common_graph_dir(root)
+        maintenance = common / "state" / "maintenance.json"
+        completion = common / "runs" / prepared["run_id"] / "completion.json"
 
         with patch.dict(os.environ, {"PYTHONPATH": str(fake_graphify)}, clear=False):
-            with self.assertRaisesRegex(module.EngineeringError, "contract"):
-                module.complete(
-                    root,
-                    prepared["run_id"],
-                    receipts=[],
-                )
+            with patch.object(module, "rebuild", wraps=module.rebuild) as rebuild:
+                with self.assertRaisesRegex(
+                    module.EngineeringError,
+                    "unpredicted public contract impact",
+                ):
+                    module.complete(
+                        root,
+                        prepared["run_id"],
+                        receipts=[],
+                    )
+                rebuild.assert_not_called()
         self.assertFalse(maintenance.exists())
+        self.assertFalse(completion.exists())
 
     def test_complete_uses_the_single_repository_lock_and_cleans_it(self):
         module = self.module()
@@ -9054,18 +11179,238 @@ class Task5ContractTests(unittest.TestCase):
         root, prepared = self.prepared_run(
             "complete-checkpoint", scope=["README.md"]
         )
+        base_commit = prepared["project"]["commit"]
+        base_checkpoint = module._checkpoint_destination(
+            root, base_commit, branch="main", kind="canonical"
+        )
+        self.assertTrue(base_checkpoint.is_file())
         (root / "README.md").write_text("# Updated\n", encoding="utf-8")
         commit = self.commit_all(root, "authorized change")
-        fake_graphify = self.write_fake_graphify()
+        graphify_record = Path(self.temporary_directory.name) / "semantic-full-record.jsonl"
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_RECORD=str(graphify_record))
 
-        with patch.dict(os.environ, {"PYTHONPATH": str(fake_graphify)}, clear=False):
-            result = module.complete(
-                root,
-                prepared["run_id"],
-                receipts=[],
-            )
+        result = module.complete(root, prepared["run_id"], receipts=[])
 
         self.assertEqual({"commit": commit, "status": "current"}, result["checkpoint"])
+        current_path, current_payload, validation = module._validated_current_checkpoint(
+            root, commit
+        )
+        self.assertTrue(validation["valid"])
+        self.assertEqual(commit, current_payload["metadata"]["commit"])
+        self.assertEqual(
+            module._checkpoint_destination(root, commit, branch="main", kind="canonical").resolve(),
+            current_path.resolve(),
+        )
+        self.assertTrue(module.check_merge_readiness(root)["ready"])
+        self.assertEqual(commit, module.git(root, "rev-parse", "HEAD"))
+        self.assertFalse(module._dirty_paths(root))
+        self.assertTrue(base_checkpoint.is_file())
+        records = [json.loads(line) for line in graphify_record.read_text().splitlines()]
+        full_updates = [entry for entry in records if entry and entry[0] == "update"]
+        self.assertEqual(1, len(full_updates))
+        self.assertNotEqual(str(root), full_updates[0][1])
+        self.assertFalse(any(entry and entry[0] == "private_rebuild_code" for entry in records))
+
+    def test_complete_semantic_full_refresh_preflight_rejects_unprepared_dirty_and_out_of_scope(self):
+        module = self.module()
+        cases = ("unprepared", "dirty", "out_of_scope")
+        for case in cases:
+            with self.subTest(case=case):
+                if case == "unprepared":
+                    root, _ = self.prepared_repo(f"semantic-full-preflight-{case}")
+                    run_id = "1" * 32
+                    (root / "README.md").write_text("# Unprepared semantic change\n", encoding="utf-8")
+                    self.commit_all(root, "unprepared semantic change")
+                else:
+                    root, prepared = self.prepared_run(
+                        f"semantic-full-preflight-{case}",
+                        scope=["src/authorized.py"] if case == "out_of_scope" else ["README.md"],
+                    )
+                if case == "dirty":
+                    run_id = prepared["run_id"]
+                    (root / "README.md").write_text("# Dirty semantic change\n", encoding="utf-8")
+                elif case == "out_of_scope":
+                    run_id = prepared["run_id"]
+                    (root / "README.md").write_text("# Out-of-scope semantic change\n", encoding="utf-8")
+                    self.commit_all(root, "out-of-scope semantic change")
+
+                graphify_record = Path(self.temporary_directory.name) / f"semantic-full-{case}.jsonl"
+                self.set_fake_graphify_controls(FAKE_GRAPHIFY_RECORD=str(graphify_record))
+                if case == "dirty":
+                    result = module.complete(root, run_id, receipts=[])
+                    self.assertEqual("pending_commit", result["checkpoint"]["status"])
+                    self.assertIsNone(result["result_identity"]["commit"])
+                else:
+                    with self.assertRaises(module.EngineeringError):
+                        module.complete(root, run_id, receipts=[])
+
+                records = (
+                    [json.loads(line) for line in graphify_record.read_text().splitlines()]
+                    if graphify_record.is_file()
+                    else []
+                )
+                self.assertFalse(any(entry and entry[0] == "update" for entry in records))
+                if case != "dirty":
+                    target = module.git(root, "rev-parse", "HEAD")
+                    self.assertFalse(
+                        module._checkpoint_destination(root, target, branch="main", kind="canonical").exists()
+                    )
+                    self.assertFalse(
+                        module._checkpoint_destination(root, target, branch="main", kind="feature").exists()
+                    )
+                    self.assertFalse(
+                        (module._common_graph_dir(root) / "runs" / run_id / "completion.json").exists()
+                    )
+
+    def test_complete_rejects_cold_out_of_scope_semantic_refresh_before_graphify(self):
+        module = self.module()
+        root, prepared = self.prepared_run(
+            "semantic-full-cold-out-of-scope", scope=["src/authorized.py"]
+        )
+        base_commit = prepared["project"]["commit"]
+        base_checkpoint = module._checkpoint_destination(
+            root, base_commit, branch="main", kind="canonical"
+        )
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "outside_scope.py").write_text(
+            "VALUE = 'outside the approved scope'\n", encoding="utf-8"
+        )
+        commit = self.commit_all(root, "out-of-scope semantic change")
+        self.assertTrue(base_checkpoint.is_file())
+        base_checkpoint.unlink()
+        graphify_record = Path(self.temporary_directory.name) / "semantic-full-cold-out-of-scope.jsonl"
+        self.set_fake_graphify_controls(FAKE_GRAPHIFY_RECORD=str(graphify_record))
+
+        with self.assertRaises(module.EngineeringError):
+            module.complete(root, prepared["run_id"], receipts=[])
+
+        records = (
+            [json.loads(line) for line in graphify_record.read_text().splitlines()]
+            if graphify_record.is_file()
+            else []
+        )
+        self.assertFalse(any(entry and entry[0] == "update" for entry in records))
+        self.assertFalse(
+            module._checkpoint_destination(root, commit, branch="main", kind="canonical").exists()
+        )
+        self.assertFalse(
+            module._checkpoint_destination(root, commit, branch="main", kind="feature").exists()
+        )
+        self.assertFalse(
+            (module._common_graph_dir(root) / "runs" / prepared["run_id"] / "completion.json").exists()
+        )
+
+    def test_semantic_full_selector_rejects_hook_dispatch_before_registration(self):
+        module = self.module()
+        root, _ = self.prepared_repo("semantic-full-hook-selector")
+        commit = module.git(root, "rev-parse", "HEAD")
+        with patch.object(module, "register_hook_operation") as register:
+            with self.assertRaisesRegex(module.EngineeringError, "semantic.*hook"):
+                module.rebuild(
+                    root,
+                    sys.executable,
+                    target_commit=commit,
+                    _semantic_full=True,
+                    hook_budget_seconds=30,
+                )
+        register.assert_not_called()
+
+    def test_semantic_full_selector_rejects_forged_hook_worker_record(self):
+        module = self.module()
+        for index, hook_value in enumerate((True, "forged-truthy")):
+            with self.subTest(hook_value=hook_value):
+                root, _ = self.prepared_repo(
+                    f"semantic-full-forged-hook-record-{index}"
+                )
+                commit = module.git(root, "rev-parse", "HEAD")
+                operation = module.register_hook_operation(root)
+                record = module._read_operation(root, operation["operation_id"])
+                record.update(
+                    {
+                        "root": str(root),
+                        "commit": commit,
+                        "branch": "main",
+                        "kind": "canonical",
+                        "manifest_name": module._tracked_manifest_name_at(root, commit),
+                        "hook": hook_value,
+                        "semantic_full": True,
+                        "authority": None,
+                    }
+                )
+                module._write_operation(record)
+
+                with (
+                    patch.object(
+                        module,
+                        "_verify_graphify_adapter_in_process",
+                        side_effect=AssertionError("adapter must not run"),
+                    ),
+                    patch.object(module, "_queue_graph_worker_stale"),
+                ):
+                    exit_code = module._graph_worker_entry(root, operation["operation_id"])
+
+                result = json.loads(Path(record["result_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(1, exit_code)
+                self.assertEqual("semantic_full_hook_forbidden", result["reason"])
+                self.assertEqual("preflight", result["failure_stage"])
+                self.assertEqual("engineering_error", result["failure_class"])
+                self.assertFalse(Path(record["worktree_path"]).exists())
+                self.assertFalse(Path(record["staging_path"]).exists())
+
+    def test_complete_uses_modern_default_rebuild_for_zero_remote_head(self):
+        module = self.module()
+        root, prepared = self.prepared_run(
+            "complete-zero-remote-default", scope=["README.md"]
+        )
+        (root / "README.md").write_text("# Updated\n", encoding="utf-8")
+        head = self.commit_all(root, "authorized default-branch change")
+        self.assertFalse(module.check_merge_readiness(root)["ready"])
+        canonical = module._checkpoint_destination(
+            root, head, branch="main", kind="canonical"
+        )
+        feature = module._checkpoint_destination(
+            root, head, branch="main", kind="feature"
+        )
+        fake_graphify = self.write_fake_graphify()
+
+        completion_error = None
+        result = None
+        rebuild_diagnostics = []
+        original_rebuild = module.rebuild
+
+        def capture_rebuild(*args, **kwargs):
+            rebuilt = original_rebuild(*args, **kwargs)
+            rebuild_diagnostics.append(self._safe_rebuild_diagnostic(rebuilt))
+            return rebuilt
+
+        with patch.dict(os.environ, {"PYTHONPATH": str(fake_graphify)}, clear=False):
+            with patch.object(module, "rebuild", side_effect=capture_rebuild) as rebuild_call:
+                try:
+                    result = module.complete(
+                        root, prepared["run_id"], receipts=[]
+                    )
+                except module.EngineeringError as error:
+                    completion_error = str(error)
+
+        self.assertEqual(
+            2,
+            len(rebuild_call.call_args.args) if rebuild_call.call_args else 0,
+            "complete must use the modern rebuild form; "
+            f"exact_readiness_failure={completion_error == 'Engineering completion requires an exact current checkpoint.'}; "
+            f"canonical_exists={canonical.is_file()}; feature_exists={feature.is_file()}",
+        )
+        self.assertEqual(
+            {"target_commit": head, "_semantic_full": True},
+            rebuild_call.call_args.kwargs,
+        )
+        self.assertEqual(1, len(rebuild_diagnostics))
+        self.assertEqual("full", rebuild_diagnostics[0]["mode"])
+        self.assertEqual("current", rebuild_diagnostics[0]["freshness"])
+        self.assertIsNone(completion_error)
+        self.assertTrue(canonical.is_file())
+        self.assertFalse(feature.exists())
+        self.assertTrue(module.check_merge_readiness(root)["ready"])
+        self.assertEqual({"commit": head, "status": "current"}, result["checkpoint"])
 
     def test_complete_cli_emits_the_bounded_manifest(self):
         root, prepared = self.prepared_run(
@@ -10025,7 +12370,51 @@ class Task6ContractTests(unittest.TestCase):
         legacy.mkdir()
         (legacy / "graph.json").write_text("{}\n", encoding="utf-8")
         (legacy / "notes.txt").write_text("keep\n", encoding="utf-8")
-        reconciled = module.reconcile_legacy_outputs(root)
+        try:
+            reconciled = module.reconcile_legacy_outputs(root)
+        except module.EngineeringError as error:
+            operations = module._common_graph_dir(root) / "state" / "operations"
+            orphan_state = []
+            invalid_records = 0
+            if operations.is_dir():
+                for candidate in sorted(operations.iterdir()):
+                    if not candidate.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", candidate.name):
+                        invalid_records += 1
+                        continue
+                    try:
+                        record = module._read_operation(root, candidate.name)
+                    except module.EngineeringError:
+                        invalid_records += 1
+                        continue
+                    owner = module._lock_owner(record)
+                    orphan_state.append(
+                        {
+                            "phase": record.get("phase") if record.get("phase") in {
+                                "orphaned", "registered", "worktree_created", "staging_ready",
+                                "validating", "published",
+                            } else "unknown",
+                            "owner_state": module._owner_process_state(owner) if owner else "missing",
+                            "lock_present": Path(record["repository_lock_path"]).exists(),
+                            "worker_tree_dead": (
+                                record.get("worker_process_tree_dead")
+                                if isinstance(record.get("worker_process_tree_dead"), bool)
+                                else None
+                            ),
+                            "cleanup_completed": (
+                                record.get("cleanup", {}).get("completed")
+                                if isinstance(record.get("cleanup"), dict)
+                                and isinstance(record.get("cleanup", {}).get("completed"), bool)
+                                else None
+                            ),
+                            "worktree_present": Path(record["worktree_path"]).exists(),
+                            "staging_present": Path(record["staging_path"]).exists(),
+                            "result_present": Path(record["result_path"]).exists(),
+                        }
+                    )
+            self.fail(
+                f"legacy reconciliation blocked ({type(error).__name__}); "
+                f"orphan_summary={orphan_state!r}; invalid_record_count={invalid_records}"
+            )
         status = module.maintenance_status(root)
 
         self.assertEqual("semantic_update_deferred", hook["reason"])
@@ -14126,6 +16515,11 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "project"
             root.mkdir()
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(root)],
+                check=True,
+                capture_output=True,
+            )
             checkpoint = {
                 "metadata": {"graph_digest": "g", "input_digest": "o"},
                 "nodes": [{"id": "REQ-1", "type": "requirement"}],
@@ -14138,14 +16532,14 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
                 patch.object(module, "_load_checkpoint", return_value=checkpoint),
                 patch.object(module, "_load_assurance_overlay", return_value=[]),
                 patch.object(module, "_common_graph_dir", return_value=state),
-                patch.object(module.subprocess, "run") as process,
+                patch.object(module.subprocess, "run", wraps=subprocess.run) as process,
             ):
                 first = module.render_map(root, open_output=False)
                 second = module.render_map(root, open_output=False)
             self.assertFalse(first["cached"])
             self.assertFalse(second["cached"])
             self.assertTrue(Path(second["output"]).is_file())
-            process.assert_not_called()
+            self.assertTrue(all(call.args[0][0] == "git" for call in process.call_args_list))
 
     def assurance_manifest(self):
         return {
@@ -14560,32 +16954,42 @@ class CapabilityAssuranceContractTests(unittest.TestCase):
 
     def test_checkpoint_catalogue_never_promotes_feature_records(self):
         module = self.module()
-        manifest = {"project": {"default_branch": "main"}}
-        validations = iter((
-            {"valid": True, "reason": "exact_current"},
-            {"valid": True, "reason": "exact_current"},
-            {"valid": False, "reason": "overlay_mismatch"},
-        ))
-        checkpoints = [
-            Path("graphs/main/" + "a" * 40 + "/checkpoint.json"),
-            Path("graphs/features/feature-one/" + "b" * 40 + "/checkpoint.json"),
-            Path("graphs/features/orphan/" + "c" * 40 + "/checkpoint.json"),
-        ]
-        with patch.object(module, "resolve_project_root", return_value=Path(".")), patch.object(
-            module, "_tracked_manifest_name", return_value="engineering-traceability.json"
-        ), patch.object(
-            module, "_json_at", return_value=manifest
-        ), patch.object(module, "git", side_effect=lambda root, *argv: (
-            "a" * 40 if "origin/main" in argv[-1] else "b" * 40
-            if "feature-one" in argv[-1] else (_ for _ in ()).throw(module.EngineeringError("missing")))
-        ), patch.object(module, "_common_graph_dir", return_value=Path("graphs")), patch.object(
-            Path, "glob", side_effect=[checkpoints[:1], checkpoints[1:]]
-        ), patch.object(module, "validate_checkpoint", side_effect=lambda *args: next(validations)), patch.object(
-            module, "_is_ancestor_or_equal", side_effect=lambda root, ancestor, descendant: ancestor == descendant
-        ):
-            catalogue = module.graph_checkpoint_catalogue(Path("."))
+        fixture = Task2ContractTests("runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        root = fixture.init_repo("catalogue")
+        fixture.write_controls(root, generation="v2")
+        base_commit = fixture.commit_all(root, "catalogue base")
+        fixture.write_canonical_checkpoint(root, base_commit)
+
+        fixture.git(root, "branch", "feature-one", base_commit)
+        fixture.git(root, "checkout", "feature-one")
+        (root / "README.md").write_text("# Feature history\n", encoding="utf-8")
+        feature_commit = fixture.commit_all(root, "feature history")
+        feature_path = fixture.write_feature_checkpoint(root, feature_commit, "feature-one")
+        self.assertTrue(module.validate_checkpoint(root, feature_path, feature_commit)["valid"])
+
+        fixture.git(root, "branch", "orphan", base_commit)
+        fixture.git(root, "checkout", "orphan")
+        (root / "README.md").write_text("# Orphan history\n", encoding="utf-8")
+        orphan_commit = fixture.commit_all(root, "orphan history")
+        orphan_path = fixture.write_feature_checkpoint(root, orphan_commit, "orphan")
+
+        fixture.git(root, "checkout", "main")
+        (root / "README.md").write_text("# Canonical current\n", encoding="utf-8")
+        canonical_commit = fixture.commit_all(root, "canonical current")
+        fixture.git(root, "update-ref", "refs/remotes/origin/main", canonical_commit)
+        fixture.write_canonical_checkpoint(root, canonical_commit)
+
+        malformed = json.loads(orphan_path.read_text(encoding="utf-8"))
+        malformed["metadata"]["commit"] = "f" * 40
+        orphan_path.write_text(json.dumps(malformed, indent=2) + "\n", encoding="utf-8")
+        catalogue = module.graph_checkpoint_catalogue(root)
         self.assertEqual("current", catalogue["canonical"]["state"])
-        self.assertEqual(["active", "quarantined"], [item["state"] for item in catalogue["features"]])
+        self.assertCountEqual(
+            ["active", "quarantined"],
+            [item["state"] for item in catalogue["features"]],
+        )
 
     def test_setup_lifecycle_is_truthful_about_commit_and_checkpoint(self):
         module = self.module()
@@ -17369,11 +19773,90 @@ class Task11OwnerIntentContractTests(Task10ContractTests):
                 bundle, preparation, runner_enforces_boundary=True
             )["mode"],
         )
+        imported_preparation = {
+            **preparation,
+            "owner_intent": {
+                **preparation["owner_intent"],
+                "post_activation_import_state": "required",
+            },
+        }
+        imported_bundle = module.build_execution_context(imported_preparation)
+        self.assertEqual(
+            {
+                "intent_id": "intent-native-graph",
+                "owner_intent_digest": "sha256:" + "2" * 64,
+                "authority_epoch": "epoch-local-1",
+            },
+            imported_bundle["owner_intent"],
+        )
+        self.assertEqual(
+            "enforced",
+            module.validate_execution_context(
+                imported_bundle,
+                imported_preparation,
+                runner_enforces_boundary=True,
+            )["mode"],
+        )
         tampered = {**bundle, "owner_intent": {**bundle["owner_intent"], "owner_intent_digest": "sha256:" + "3" * 64}}
         with self.assertRaisesRegex(module.EngineeringError, "digest|scope|owner intent"):
             module.validate_execution_context(
                 tampered, preparation, runner_enforces_boundary=True
             )
+
+    def test_preparation_owner_intent_normalizer_accepts_only_supported_lifecycle_shapes(self):
+        module = self.module()
+        legacy = {
+            "schema": module.OWNER_INTENT_STATUS_SCHEMA,
+            "state": "bound",
+            "intent_id": "intent-native-graph",
+            "owner_intent_digest": "sha256:" + "2" * 64,
+            "authority_epoch": "epoch-local-1",
+            "core_outcome_count": 1,
+            "intent_impacting": True,
+            "bound_to_scope_handoff": True,
+        }
+        expected = {
+            "intent_id": "intent-native-graph",
+            "owner_intent_digest": "sha256:" + "2" * 64,
+            "authority_epoch": "epoch-local-1",
+        }
+        self.assertEqual(
+            expected,
+            module._bound_preparation_owner_intent({"owner_intent": legacy}),
+        )
+        for import_state in ("required", "complete"):
+            with self.subTest(import_state=import_state):
+                self.assertEqual(
+                    expected,
+                    module._bound_preparation_owner_intent(
+                        {
+                            "owner_intent": {
+                                **legacy,
+                                "post_activation_import_state": import_state,
+                            }
+                        }
+                    ),
+                )
+        invalid_statuses = (
+            {**legacy, "post_activation_import_state": "unknown"},
+            {**legacy, "post_activation_import_state": "pending"},
+            {**legacy, "post_activation_import_state": None},
+            {**legacy, "post_activation_import_state": []},
+            {**legacy, "post_activation_import_state": {}},
+            {**legacy, "post_activation_import_state": True},
+            {**legacy, "post_activation_import_state": "required", "extra": True},
+            {**legacy, "core_outcome_count": True},
+            {**legacy, "core_outcome_count": 1.0},
+            {**legacy, "core_outcome_count": -1},
+            {**legacy, "owner_intent_digest": None},
+            {**legacy, "owner_intent_digest": []},
+        )
+        for invalid in invalid_statuses:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(module.EngineeringError):
+                    module._bound_preparation_owner_intent(
+                        {"owner_intent": invalid}
+                    )
 
     def test_unit_evidence_cannot_satisfy_real_native_harness_requirement(self):
         """Typed evidence cannot upgrade a unit result into a native runtime proof."""

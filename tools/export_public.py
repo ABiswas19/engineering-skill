@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -18,6 +19,7 @@ class ExportError(RuntimeError):
 
 
 _AUDIENCE_MODULE: object | None = None
+_METADATA_MODULE: object | None = None
 
 
 def _audience_module():
@@ -39,6 +41,47 @@ def _audience_module():
         spec.loader.exec_module(module)
     _AUDIENCE_MODULE = module
     return module
+
+
+def _metadata_module():
+    global _METADATA_MODULE
+    if _METADATA_MODULE is not None:
+        return _METADATA_MODULE
+    try:
+        module = importlib.import_module("metadata_projection")
+    except ModuleNotFoundError as error:
+        if error.name != "metadata_projection":
+            raise
+        source = Path(__file__).resolve().with_name("metadata_projection.py")
+        for loaded in tuple(sys.modules.values()):
+            if getattr(loaded, "__file__", None) and Path(loaded.__file__).resolve() == source:
+                _METADATA_MODULE = loaded
+                return loaded
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export_metadata_projection", source
+        )
+        if spec is None or spec.loader is None:
+            raise ExportError("metadata receipt verifier cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    _METADATA_MODULE = module
+    return module
+
+
+def _origin_repository(root: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        capture_output=True,
+    )
+    if result.returncode:
+        return None
+    value = result.stdout.decode("utf-8", errors="strict").strip()
+    match = re.fullmatch(
+        r"(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match else None
 
 
 def _git_common(root: Path) -> Path:
@@ -346,6 +389,7 @@ def export_tree(
     source: Path,
     destination: Path,
     metadata: dict[str, object] | None = None,
+    metadata_bindings: dict[str, dict[str, object]] | None = None,
 ) -> dict:
     source = Path(source).resolve()
     destination = Path(destination).resolve()
@@ -389,9 +433,66 @@ def export_tree(
     audience_specific = _validate_audience_classification(
         source, files, destination=destination
     )
-    policy, policy_blockers = _audience_policy(
-        source, destination, files, metadata
-    )
+    snapshot_metadata = None
+    receipt_blockers: list[str] = []
+    metadata_receipts: dict[str, dict] = {}
+    if metadata is not None:
+        verifier = _metadata_module()
+        audiences = {"source", "distribution"}
+        if (not isinstance(metadata, dict) or set(metadata) != audiences
+                or not isinstance(metadata_bindings, dict) or set(metadata_bindings) != audiences):
+            receipt_blockers.append("metadata_receipt_unverified")
+        else:
+            try:
+                expected = {
+                    "source": (source, _source_commit(source)),
+                    "distribution": (destination, _source_commit(destination)),
+                }
+            except (OSError, subprocess.SubprocessError, ExportError):
+                expected = {}
+                receipt_blockers.append("metadata_receipt_unverified")
+            verified: dict[str, dict] = {}
+            for audience, (root, commit) in expected.items():
+                collection = metadata[audience]
+                repository = _origin_repository(root)
+                binding = metadata_bindings[audience]
+                if (
+                    repository is None
+                    or not isinstance(binding, dict)
+                    or set(binding) != {"pr", "head", "head_repository", "head_ref"}
+                    or not isinstance(binding.get("pr"), int)
+                    or isinstance(binding.get("pr"), bool)
+                    or not isinstance(binding.get("head"), str)
+                    or not isinstance(binding.get("head_repository"), str)
+                    or not isinstance(binding.get("head_ref"), str)
+                    or not verifier.verify_collection(
+                        collection, audience, repository, commit, binding["head"], binding["pr"],
+                        head_repository=binding["head_repository"], head_ref=binding["head_ref"],
+                        require_production=True,
+                    )
+                ):
+                    receipt_blockers.append("metadata_receipt_unverified")
+                    break
+                snapshot = verifier.consume_collection(
+                    collection, audience, repository, commit, binding["head"], binding["pr"],
+                    head_repository=binding["head_repository"], head_ref=binding["head_ref"],
+                    require_production=True,
+                )
+                if snapshot is None:
+                    receipt_blockers.append("metadata_receipt_unverified")
+                    break
+                verified[audience] = snapshot
+                metadata_receipts[audience] = json.loads(json.dumps(collection.receipt))
+            if not receipt_blockers and set(verified) == set(expected):
+                snapshot_metadata = verified
+            else:
+                receipt_blockers.append("metadata_receipt_unverified")
+    if receipt_blockers:
+        policy, policy_blockers = None, sorted(set(receipt_blockers))
+    else:
+        policy, policy_blockers = _audience_policy(
+            source, destination, files, snapshot_metadata
+        )
     audience_specific_files = _audience_specific_receipt(
         destination, audience_specific, policy
     )
@@ -464,8 +565,9 @@ def export_tree(
                     snapshot, sort_keys=True, separators=(",", ":")
                 ).encode("utf-8")
             ).hexdigest()
-            for audience, snapshot in sorted((metadata or {}).items())
+            for audience, snapshot in sorted((snapshot_metadata or {}).items())
         },
+        "metadata_collection_receipts": metadata_receipts,
     }
     _atomic_private_text(receipt_path, json.dumps(receipt, indent=2) + "\n")
     blockers = list(policy_blockers)
@@ -488,9 +590,48 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="export-public")
     parser.add_argument("source")
     parser.add_argument("destination")
+    parser.add_argument("--verified-account")
+    for audience in ("source", "distribution"):
+        parser.add_argument(f"--{audience}-pr", type=int)
+        parser.add_argument(f"--{audience}-head")
+        parser.add_argument(f"--{audience}-head-repository")
+        parser.add_argument(f"--{audience}-head-ref")
     arguments = parser.parse_args()
     try:
-        result = export_tree(Path(arguments.source), Path(arguments.destination))
+        bindings = {
+            audience: {
+                "pr": getattr(arguments, f"{audience}_pr"),
+                "head": getattr(arguments, f"{audience}_head"),
+                "head_repository": getattr(arguments, f"{audience}_head_repository"),
+                "head_ref": getattr(arguments, f"{audience}_head_ref"),
+            }
+            for audience in ("source", "distribution")
+        }
+        requested_metadata = arguments.verified_account is not None or any(
+            value is not None for binding in bindings.values() for value in binding.values()
+        )
+        if requested_metadata:
+            if (not arguments.verified_account
+                    or any(value is None for binding in bindings.values() for value in binding.values())):
+                raise ExportError("both audience bindings and verified account are required")
+            metadata_module = _metadata_module()
+            roots = {"source": Path(arguments.source).resolve(),
+                     "distribution": Path(arguments.destination).resolve()}
+            metadata = {}
+            for audience, root in roots.items():
+                repository = _origin_repository(root)
+                commit = _source_commit(root)
+                binding = bindings[audience]
+                if not repository or not commit:
+                    raise ExportError("audience repository identity is unavailable")
+                metadata[audience] = metadata_module.collect_authenticated_metadata(
+                    audience, repository, commit, binding["head"], binding["pr"],
+                    arguments.verified_account, binding["head_repository"], binding["head_ref"],
+                )
+            result = export_tree(roots["source"], roots["distribution"],
+                                 metadata=metadata, metadata_bindings=bindings)
+        else:
+            result = export_tree(Path(arguments.source), Path(arguments.destination))
     except (OSError, ValueError, subprocess.SubprocessError, ExportError) as error:
         print(f"ERROR: {error}")
         return 2

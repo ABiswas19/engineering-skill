@@ -16,6 +16,123 @@ from datetime import datetime, timedelta, timezone
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def clone_fixture(source: Path) -> None:
+    try:
+        subprocess.run(["git", "clone", "--quiet", "--local", str(ROOT), str(source)],
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or b"").decode("utf-8", errors="replace").lower()
+        cause = next((label for marker, label in (
+            ("not a git repository", "source is not a Git repository"),
+            ("permission denied", "permission denied"),
+            ("already exists", "destination already exists"),
+            ("filename too long", "path length exceeded"),
+            ("dubious ownership", "Git ownership check failed"),
+            ("invalid cross-device link", "cross-device clone failure"),
+            ("hardlink", "hardlink clone failure"),
+            ("access is denied", "access denied"),
+            ("no such file", "source or destination unavailable"),
+            ("unable to create", "Git could not create fixture files"),
+        ) if marker in stderr), "unclassified Git clone failure")
+        raise AssertionError(f"fixture clone failed (exit {error.returncode}; {cause})") from None
+
+
+def candidate_export_source_fixture(source: Path) -> str:
+    """Create a clean temporary source at the exact tracked candidate inputs."""
+    clone_fixture(source)
+    manifest = json.loads(
+        (ROOT / "release" / "public-export.json").read_text(encoding="utf-8")
+    )
+    files = manifest.get("files")
+    if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
+        raise AssertionError("candidate export manifest is invalid")
+    allowlisted = set(files) | {
+        "release/audience-classification.json",
+        "release/audience-isolation-policy.json",
+        "release/migration-receipt.json",
+    }
+    changed = subprocess.run(
+        ["git", "-C", str(ROOT), "diff", "HEAD", "--name-only", "-z"],
+        check=True,
+        capture_output=True,
+    ).stdout.decode("utf-8").split("\0")
+    candidate_paths = sorted(allowlisted.intersection(changed))
+    tracked = set(
+        subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        ).stdout.decode("utf-8").split("\0")
+    )
+    if not set(candidate_paths) <= tracked:
+        raise AssertionError("candidate export inputs must be tracked")
+    candidate_bytes: dict[str, bytes] = {}
+    for relative in candidate_paths:
+        original = ROOT / relative
+        if not original.is_file() or original.is_symlink():
+            raise AssertionError("candidate export input is unavailable")
+        value = original.read_bytes()
+        target = source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(value)
+        if target.read_bytes() != value:
+            raise AssertionError("candidate export input copy changed bytes")
+        candidate_bytes[relative] = value
+    if candidate_paths:
+        subprocess.run(
+            ["git", "-C", str(source), "add", "--", *candidate_paths],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=synthetic" + "@" + "example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "synthetic current candidate source",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    commit = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    for relative, value in candidate_bytes.items():
+        expected_blob = subprocess.run(
+            ["git", "-C", str(ROOT), "hash-object", f"--path={relative}", "--stdin"],
+            input=value,
+            check=True,
+            capture_output=True,
+        ).stdout.decode("ascii").strip()
+        actual_blob = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", f"{commit}:{relative}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if actual_blob != expected_blob:
+            raise AssertionError("synthetic source commit does not bind candidate bytes")
+    status = subprocess.run(
+        ["git", "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    if status:
+        raise AssertionError("synthetic candidate source fixture is not clean")
+    return commit
 SKILL_ROOT = ROOT / ".agents" / "skills" / "engineering"
 EXPECTED_SKILL_FILES = {
     "SKILL.md",
@@ -48,6 +165,21 @@ ABSOLUTE_USER_PATH = re.compile(
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_clone_fixture_reports_only_sanitized_cause(self) -> None:
+        for stderr, cause in (
+            (b"fatal: not a git repository: PRIVATE_MARKER", "source is not a Git repository"),
+            (b"fatal: detected dubious ownership in PRIVATE_MARKER", "Git ownership check failed"),
+            (b"fatal: invalid cross-device link PRIVATE_MARKER", "cross-device clone failure"),
+            (b"fatal: unable to create file PRIVATE_MARKER", "Git could not create fixture files"),
+        ):
+            with self.subTest(cause=cause):
+                error = subprocess.CalledProcessError(128, ["git"], stderr=stderr)
+                with patch("subprocess.run", side_effect=error), self.assertRaisesRegex(
+                    AssertionError, f"exit 128; {cause}"
+                ) as caught:
+                    clone_fixture(Path("synthetic"))
+                self.assertNotIn("PRIVATE_MARKER", str(caught.exception))
+
     def write_public_only_overlay(self, destination: Path) -> None:
         path = destination / "docs" / "public-contributing.md"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3023,6 +3155,8 @@ Residual risk: No repository-supported vulnerability intake is available.
             base = Path(temporary)
             primary = base / "public-primary"
             destination = base / "public-linked"
+            source = base / "source"
+            source_commit = candidate_export_source_fixture(source)
             subprocess.run(
                 ["git", "init", "--initial-branch=main", str(primary)],
                 check=True,
@@ -3074,9 +3208,10 @@ Residual risk: No repository-supported vulnerability intake is available.
             self.assertTrue((destination / ".git").is_file())
             self.write_public_only_overlay(destination)
 
-            result = module.export_tree(ROOT, destination)
+            result = module.export_tree(source, destination)
 
-            self.assertEqual(module._source_commit(ROOT), result["source_commit"])
+            self.assertEqual(source_commit, module._source_commit(source))
+            self.assertEqual(source_commit, result["source_commit"])
             self.assertTrue(
                 (primary / ".git" / "engineering-public-export.json").is_file()
             )
@@ -3090,7 +3225,10 @@ Residual risk: No repository-supported vulnerability intake is available.
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "public"
+            base = Path(temporary)
+            source = base / "source"
+            source_commit = candidate_export_source_fixture(source)
+            destination = base / "public"
             subprocess.run(
                 ["git", "init", "--initial-branch=main", str(destination)],
                 check=True,
@@ -3098,9 +3236,7 @@ Residual risk: No repository-supported vulnerability intake is available.
             )
             marker = destination / ".git" / "independent-marker"
             marker.write_text("retained\n", encoding="utf-8")
-            has_audience_policy = (
-                ROOT / "release" / "audience-isolation-policy.json"
-            ).is_file()
+            has_audience_policy = (source / "release" / "audience-isolation-policy.json").is_file()
             if has_audience_policy:
                 (destination / "SECURITY.md").write_text(
                     "# Security\n\nUse GitHub private\nvulnerability reporting at "
@@ -3109,7 +3245,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                 )
             self.write_public_only_overlay(destination)
 
-            result = module.export_tree(ROOT, destination)
+            result = module.export_tree(source, destination)
 
             self.assertTrue(marker.is_file())
             receipt = json.loads(
@@ -3119,7 +3255,7 @@ Residual risk: No repository-supported vulnerability intake is available.
             )
             self.assertEqual("engineering.public-export-receipt.v4", receipt["schema"])
             source_commit = subprocess.run(
-                ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -3135,7 +3271,7 @@ Residual risk: No repository-supported vulnerability intake is available.
             self.assertFalse(result["publication_ready"])
             expected_blockers = (
                 ["metadata_audit_unknown"]
-                if (ROOT / "release" / "audience-isolation-policy.json").is_file()
+                if (source / "release" / "audience-isolation-policy.json").is_file()
                 else ["audience_policy_unknown"]
             )
             self.assertEqual(expected_blockers, result["blockers"])
@@ -3148,7 +3284,7 @@ Residual risk: No repository-supported vulnerability intake is available.
             self.assertFalse((destination / ".github" / "ISSUE_TEMPLATE" / "bug-idea.yml").exists())
             self.assertFalse((destination / ".github" / "ISSUE_TEMPLATE" / "code-proposal.yml").exists())
             expected = set(
-                json.loads((ROOT / "release" / "public-export.json").read_text(encoding="utf-8"))["files"]
+                json.loads((source / "release" / "public-export.json").read_text(encoding="utf-8"))["files"]
             )
             actual = {
                 path.relative_to(destination).as_posix()
@@ -3162,7 +3298,7 @@ Residual risk: No repository-supported vulnerability intake is available.
             self.assertEqual(expected, actual_shared)
             for relative in expected:
                 self.assertEqual(
-                    module._git_blob_bytes(ROOT, source_commit, relative),
+                    module._git_blob_bytes(source, source_commit, relative),
                     (destination / relative).read_bytes(),
                     relative,
                 )
@@ -3252,19 +3388,51 @@ Residual risk: No repository-supported vulnerability intake is available.
                     text=True,
                 ).stdout.strip()
             verified = module.export_tree(
-                ROOT,
+                source,
                 destination,
                 metadata=verified_metadata,
             )
-            if has_audience_policy:
-                self.assertEqual([], verified["blockers"])
-            else:
-                self.assertEqual(["audience_policy_unknown"], verified["blockers"])
-            if has_audience_policy:
-                forged = json.loads(json.dumps(verified_metadata))
-                forged["source"]["source_commit"] = "c" * 40
-                rejected = module.export_tree(ROOT, destination, metadata=forged)
-                self.assertIn("metadata_snapshot_mismatch", rejected["blockers"])
+            self.assertIn("metadata_receipt_unverified", verified["blockers"])
+            forged = json.loads(json.dumps(verified_metadata))
+            forged["source"]["source_commit"] = "c" * 40
+            rejected = module.export_tree(source, destination, metadata=forged)
+            self.assertIn("metadata_receipt_unverified", rejected["blockers"])
+
+    def test_public_export_rejects_unverified_metadata_before_content_audit(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export_unverified_metadata",
+            ROOT / "tools" / "export_public.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            destination = base / "public"
+            clone_fixture(source)
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            has_policy = (source / "release" / "audience-isolation-policy.json").is_file()
+            if has_policy:
+                (destination / "SECURITY.md").write_text(
+                    "# Security\n\nUse GitHub private vulnerability reporting at "
+                    "https://example.invalid/security/advisories/new.\n",
+                    encoding="utf-8",
+                )
+            self.write_public_only_overlay(destination)
+
+            with patch.object(
+                module,
+                "_audience_policy",
+                side_effect=AssertionError("unverified metadata reached the content audit"),
+            ):
+                result = module.export_tree(source, destination, metadata={"source": {}, "distribution": {}})
+
+            self.assertFalse(result["publication_ready"])
+            self.assertIn("metadata_receipt_unverified", result["blockers"])
 
     def test_public_export_fails_closed_without_a_verified_security_overlay(self) -> None:
         if not (ROOT / "release" / "audience-isolation-policy.json").is_file():
@@ -3275,6 +3443,9 @@ Residual risk: No repository-supported vulnerability intake is available.
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            candidate_commit = candidate_export_source_fixture(source)
             destination = Path(temporary) / "public"
             subprocess.run(
                 ["git", "init", "--initial-branch=main", str(destination)],
@@ -3283,7 +3454,8 @@ Residual risk: No repository-supported vulnerability intake is available.
             )
             self.write_public_only_overlay(destination)
             with self.assertRaisesRegex(module.ExportError, "audience-specific security"):
-                module.export_tree(ROOT, destination)
+                module.export_tree(source, destination)
+            self.assertEqual(candidate_commit, module._source_commit(source))
 
     def test_public_export_requires_every_declared_public_only_destination_file(self) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -3321,6 +3493,8 @@ Residual risk: No repository-supported vulnerability intake is available.
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
+            source = base / "source"
+            candidate_export_source_fixture(source)
             destination = base / "public"
             subprocess.run(
                 ["git", "init", "--initial-branch=main", str(destination)],
@@ -3340,7 +3514,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     encoding="utf-8",
                 )
             self.write_public_only_overlay(destination)
-            module.export_tree(ROOT, destination)
+            module.export_tree(source, destination)
             self.assertEqual("keep\n", sentinel.read_text(encoding="utf-8"))
 
     def test_public_export_preserves_unverified_or_modified_relative_files(self) -> None:
@@ -3350,7 +3524,10 @@ Residual risk: No repository-supported vulnerability intake is available.
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "public"
+            base = Path(temporary)
+            source = base / "source"
+            candidate_export_source_fixture(source)
+            destination = base / "public"
             subprocess.run(
                 ["git", "init", "--initial-branch=main", str(destination)],
                 check=True,
@@ -3375,7 +3552,7 @@ Residual risk: No repository-supported vulnerability intake is available.
                     encoding="utf-8",
                 )
             self.write_public_only_overlay(destination)
-            module.export_tree(ROOT, destination)
+            module.export_tree(source, destination)
             self.assertEqual("keep\n", retained.read_text(encoding="utf-8"))
 
     def test_public_export_rejects_a_linked_destination_parent(self) -> None:
@@ -3411,8 +3588,13 @@ Residual risk: No repository-supported vulnerability intake is available.
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaises(module.ExportError):
-                module.export_tree(ROOT, destination)
+            source = base / "source"
+            candidate_commit = candidate_export_source_fixture(source)
+            self.assertEqual(candidate_commit, module._source_commit(source))
+            with self.assertRaisesRegex(
+                module.ExportError, r"^unsafe export destination: redirect/stale\.txt$"
+            ):
+                module.export_tree(source, destination)
 
     def test_public_export_rejects_a_broken_leaf_link(self) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -3433,8 +3615,20 @@ Residual risk: No repository-supported vulnerability intake is available.
                 target.symlink_to(base / "missing.txt")
             except OSError as error:
                 self.skipTest(f"file symlink unavailable: {error}")
-            with self.assertRaises(module.ExportError):
-                module.export_tree(ROOT, destination)
+            source = base / "source"
+            candidate_commit = candidate_export_source_fixture(source)
+            self.assertEqual(candidate_commit, module._source_commit(source))
+            if (source / "release" / "audience-isolation-policy.json").is_file():
+                (destination / "SECURITY.md").write_text(
+                    "Use GitHub private vulnerability reporting at "
+                    "https://example.invalid/security/advisories/new.\n",
+                    encoding="utf-8",
+                )
+            self.write_public_only_overlay(destination)
+            with self.assertRaisesRegex(
+                module.ExportError, r"^unsafe export destination: README\.md$"
+            ):
+                module.export_tree(source, destination)
 
     def test_public_export_rejects_a_hard_linked_leaf(self) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -3453,8 +3647,20 @@ Residual risk: No repository-supported vulnerability intake is available.
             external = base / "outside.txt"
             external.write_text("keep\n", encoding="utf-8")
             os.link(external, destination / "README.md")
-            with self.assertRaises(module.ExportError):
-                module.export_tree(ROOT, destination)
+            source = base / "source"
+            candidate_commit = candidate_export_source_fixture(source)
+            self.assertEqual(candidate_commit, module._source_commit(source))
+            if (source / "release" / "audience-isolation-policy.json").is_file():
+                (destination / "SECURITY.md").write_text(
+                    "Use GitHub private vulnerability reporting at "
+                    "https://example.invalid/security/advisories/new.\n",
+                    encoding="utf-8",
+                )
+            self.write_public_only_overlay(destination)
+            with self.assertRaisesRegex(
+                module.ExportError, r"^unsafe export destination: README\.md$"
+            ):
+                module.export_tree(source, destination)
             self.assertEqual("keep\n", external.read_text(encoding="utf-8"))
 
     def test_public_export_rejects_a_hard_linked_source(self) -> None:
@@ -3509,6 +3715,30 @@ Residual risk: No repository-supported vulnerability intake is available.
             (source / "README.md").write_text("modified\n", encoding="utf-8")
             with self.assertRaises(module.ExportError):
                 module._assert_clean_head_snapshot(source, ["README.md"])
+
+    def test_public_export_rejects_dirty_source_with_exact_guard(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export", ROOT / "tools" / "export_public.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            candidate_commit = candidate_export_source_fixture(source)
+            self.assertEqual(candidate_commit, module._source_commit(source))
+            destination = base / "public"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            with (source / "README.md").open("ab") as handle:
+                handle.write(b"dirty source marker\n")
+            with self.assertRaisesRegex(
+                module.ExportError, r"^export source worktree is not clean$"
+            ):
+                module.export_tree(source, destination)
 
     def test_public_export_identity_and_bytes_are_stable_across_checkout_eol(self) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -3634,8 +3864,21 @@ Residual risk: No repository-supported vulnerability intake is available.
                 encoding="utf-8",
             )
             os.link(external, destination / ".git" / "engineering-public-export.json")
-            with self.assertRaises(module.ExportError):
-                module.export_tree(ROOT, destination)
+            source = base / "source"
+            candidate_commit = candidate_export_source_fixture(source)
+            self.assertEqual(candidate_commit, module._source_commit(source))
+            if (source / "release" / "audience-isolation-policy.json").is_file():
+                (destination / "SECURITY.md").write_text(
+                    "Use GitHub private vulnerability reporting at "
+                    "https://example.invalid/security/advisories/new.\n",
+                    encoding="utf-8",
+                )
+            self.write_public_only_overlay(destination)
+            with self.assertRaisesRegex(
+                module.ExportError,
+                r"^unsafe export destination: engineering-public-export\.json$",
+            ):
+                module.export_tree(source, destination)
             self.assertEqual(
                 {"schema": "engineering.public-export-receipt.v2", "files": {}},
                 json.loads(external.read_text(encoding="utf-8")),

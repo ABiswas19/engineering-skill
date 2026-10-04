@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import html
 import json
+import locale
 import math
 import os
 from pathlib import Path, PosixPath, PurePosixPath
@@ -1148,15 +1149,49 @@ def run(
     *,
     env: dict[str, str] | None = None,
     timeout: int = 15,
+    strict_git: bool = False,
+    raw_output: bool = False,
 ) -> str:
     if env is None and command and Path(command[0]).name.casefold() in {"git", "git.exe"}:
         env = _controller_git_environment()
-    result = subprocess.run(
-        command, capture_output=True, text=True, timeout=timeout, env=env
-    )
+    result = subprocess.run(command, capture_output=True, timeout=timeout, env=env)
+    codec = "utf-8" if strict_git else locale.getpreferredencoding(False)
+
+    def decode(stream: bytes | str | None) -> str | None:
+        if stream is None:
+            return None
+        return stream.decode(codec, errors="strict") if isinstance(stream, bytes) else stream
+
     if result.returncode:
-        raise TraceabilityError(result.stderr.strip() or result.stdout.strip())
-    return result.stdout.strip()
+        if strict_git:
+            for stream in (result.stderr, result.stdout):
+                try:
+                    diagnostic = decode(stream)
+                except UnicodeDecodeError:
+                    continue
+                if diagnostic:
+                    message = next(
+                        (line.strip() for line in diagnostic.splitlines() if line.strip()),
+                        None,
+                    )
+                    if message:
+                        raise TraceabilityError(message)
+            raise TraceabilityError(f"Git command failed with exit code {result.returncode}.")
+        stderr, stdout = decode(result.stderr), decode(result.stdout)
+        raise TraceabilityError((stderr or "").strip() or (stdout or "").strip())
+    try:
+        stdout = decode(result.stdout)
+    except UnicodeDecodeError as error:
+        if strict_git:
+            raise TraceabilityError("Git command returned invalid UTF-8.") from error
+        raise
+    if stdout is None:
+        raise TraceabilityError("Command succeeded without captured stdout.")
+    if raw_output:
+        return stdout
+    if strict_git:
+        return stdout.removesuffix("\r\n").removesuffix("\n")
+    return stdout.strip()
 
 
 def _controller_git_environment() -> dict[str, str]:
@@ -1170,13 +1205,16 @@ def _controller_git_environment() -> dict[str, str]:
     return environment
 
 
-def git(root: Path, *arguments: str) -> str:
+def git(root: Path, *arguments: str, raw: bool = False) -> str:
     return run(
-        ["git", "-C", str(root), *arguments], env=_controller_git_environment()
+        ["git", "-C", str(root), *arguments],
+        env=_controller_git_environment(),
+        strict_git=True,
+        raw_output=raw,
     )
 
 
-def _identity_git(root: Path, *arguments: str) -> str:
+def _identity_git(root: Path, *arguments: str, raw: bool = False) -> str:
     """Run Git for trust decisions without caller-controlled Git state."""
     environment = _controller_git_environment()
     environment.update(
@@ -1190,7 +1228,32 @@ def _identity_git(root: Path, *arguments: str) -> str:
     return run(
         ["git", "--no-replace-objects", "-C", str(root), *arguments],
         env=environment,
+        strict_git=True,
+        raw_output=raw,
     )
+
+
+def _git_paths(root: Path, *arguments: str) -> list[str]:
+    args = list(arguments)
+    args.insert(args.index("--") if "--" in args else len(args), "-z")
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        env=_controller_git_environment(),
+    )
+    if result.returncode:
+        raise TraceabilityError(f"Git path query failed with exit code {result.returncode}.")
+    if result.stdout is None:
+        raise TraceabilityError("Git path query succeeded without captured stdout.")
+    try:
+        fields = result.stdout.decode("utf-8", errors="strict").split("\0")
+    except UnicodeDecodeError as error:
+        raise TraceabilityError("Git path query returned invalid UTF-8.") from error
+    if fields:
+        if fields[-1] != "":
+            raise TraceabilityError("Git path query returned an incomplete NUL record.")
+        fields.pop()
+    return fields
 
 
 def _host_trust_anchor(value: object) -> dict:
@@ -1508,6 +1571,7 @@ def verify_graphify(executable: Path | str) -> GraphifyIdentity:
         ) from error
 
     version, _, direct_url_text = distribution.partition("\n")
+    version = version.removesuffix("\r")
     try:
         direct_url = json.loads(direct_url_text)
         repository = direct_url["url"].removesuffix(".git")
@@ -2015,7 +2079,7 @@ def bootstrap(root: Path, graphify_version: str = GRAPHIFY_VERSION) -> dict:
 def _setup_mode(root: Path) -> str:
     tracked = [
         line
-        for line in git(root, "ls-files").splitlines()
+        for line in _git_paths(root, "ls-files")
         if line and line not in {"README.md", ".gitignore"}
     ]
     return "greenfield" if not tracked else "mid-flight"
@@ -2675,7 +2739,7 @@ def _json_at(root: Path, commit: str, path: str) -> dict:
         return value
     revision = f":{path}" if commit == "INDEX" else f"{commit}:{path}"
     try:
-        value = json.loads(git(root, "show", revision))
+        value = json.loads(git(root, "show", revision, raw=True))
     except (json.JSONDecodeError, TraceabilityError) as error:
         raise TraceabilityError(f"Invalid or untracked JSON input: {path}") from error
     if not isinstance(value, dict):
@@ -2695,7 +2759,7 @@ def _text_at(root: Path, commit: str, path: str) -> str:
             ) from error
     revision = f":{path}" if commit == "INDEX" else f"{commit}:{path}"
     try:
-        return git(root, "show", revision)
+        return git(root, "show", revision, raw=True)
     except TraceabilityError as error:
         raise TraceabilityError(f"Missing source at commit {commit}: {path}") from error
 
@@ -2939,39 +3003,385 @@ def common_graph_dir(root: Path) -> Path:
     return _common_graph_dir(resolve_project_root(str(root)))
 
 
+_LEGACY_QUERY_METADATA_KEYS = {
+    "project_root",
+    "project",
+    "branch",
+    "commit",
+    "kind",
+    "graphify_version",
+    "overlay_version",
+    "input_digest",
+    "inputs",
+    "generated_at",
+}
+
+
+def _tracked_default_branch(root: Path, revision: str) -> str:
+    project_root = resolve_project_root(str(root))
+    resolved = git(project_root, "rev-parse", revision)
+    manifest_name = _tracked_manifest_name_at(project_root, resolved)
+    if manifest_name is None:
+        raise TraceabilityError("Checkpoint address manifest is unavailable.")
+    manifest = _json_at(project_root, resolved, manifest_name)
+    project = manifest.get("project") if isinstance(manifest, dict) else None
+    branch = project.get("default_branch") if isinstance(project, dict) else None
+    if not isinstance(branch, str) or not branch:
+        raise TraceabilityError("Checkpoint address default branch is invalid.")
+    return branch
+
+
+def _checkpoint_address_payload(
+    root: Path,
+    commit: str,
+    *,
+    allow_legacy_query: bool = False,
+    _with_validation: bool = False,
+) -> tuple[Path, dict] | tuple[Path, dict, dict]:
+    project_root = resolve_project_root(str(root))
+    resolved_commit = git(project_root, "rev-parse", commit)
+    default = _tracked_default_branch(project_root, resolved_commit)
+    observed_branch = git(project_root, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = None if observed_branch == "HEAD" else observed_branch
+    graph_dir = _common_graph_dir(project_root).absolute()
+
+    selected_branch = default
+    selected_kind = "canonical"
+    destination = _checkpoint_destination(
+        project_root, resolved_commit, branch=default, kind="canonical"
+    )
+    if branch is not None and branch != default:
+        own_feature = _checkpoint_destination(
+            project_root, resolved_commit, branch=branch, kind="feature"
+        )
+        _reject_reparse_ancestors(own_feature.parent, graph_dir)
+        if own_feature.parent.exists():
+            destination = own_feature
+            selected_branch = branch
+            selected_kind = "feature"
+    if allow_legacy_query and branch == default:
+        try:
+            resolver_default = default_branch(project_root)
+        except EngineeringError:
+            resolver_default = None
+        canonical_directory = destination.parent
+        try:
+            _reject_reparse_ancestors(canonical_directory, graph_dir)
+        except EngineeringError as error:
+            raise TraceabilityError("Checkpoint address boundary is invalid.") from error
+        if (
+            default == resolver_default
+            and not canonical_directory.exists()
+        ):
+            destination = _checkpoint_destination(
+                project_root, resolved_commit, branch=default, kind="feature"
+            )
+            selected_branch = default
+            selected_kind = "feature"
+
+    try:
+        _reject_reparse_ancestors(destination, graph_dir)
+    except EngineeringError as error:
+        raise TraceabilityError("Checkpoint address boundary is invalid.") from error
+    if not destination.is_file():
+        raise TraceabilityError(
+            f"Expected one commit-bound checkpoint for {resolved_commit}."
+        )
+    try:
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TraceabilityError("Invalid checkpoint address metadata.") from error
+    validation = (
+        _validate_checkpoint_payload(project_root, destination, resolved_commit, payload)
+        if _with_validation
+        else None
+    )
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    try:
+        expected_identity = checkpoint_identity(project_root, resolved_commit)
+        expected_destination = _checkpoint_destination(
+            project_root,
+            resolved_commit,
+            branch=selected_branch,
+            kind=selected_kind,
+        )
+    except EngineeringError as error:
+        raise TraceabilityError("Invalid checkpoint address metadata.") from error
+    modern_identity = isinstance(metadata, dict) and metadata.get("project_identity") == expected_identity
+    legacy_query_identity = (
+        allow_legacy_query
+        and isinstance(metadata, dict)
+        and set(metadata) == _LEGACY_QUERY_METADATA_KEYS
+        and metadata.get("project_root") == str(_common_graph_dir(project_root).parent)
+    )
+    if legacy_query_identity:
+        canonical_directory = _checkpoint_destination(
+            project_root, resolved_commit, branch=default, kind="canonical"
+        ).parent
+        try:
+            resolver_default = default_branch(project_root)
+        except EngineeringError:
+            resolver_default = None
+        if (
+            branch != default
+            or resolver_default != default
+            or canonical_directory.exists()
+        ):
+            raise TraceabilityError("Legacy query checkpoint is outside its default namespace.")
+    if (
+        not isinstance(metadata, dict)
+        or destination != expected_destination
+        or metadata.get("commit") != resolved_commit
+        or metadata.get("branch") != selected_branch
+        or metadata.get("kind") != selected_kind
+        or not (modern_identity or legacy_query_identity)
+    ):
+        if validation is not None and not validation.get("valid"):
+            return destination, payload, validation
+        raise TraceabilityError("Checkpoint address does not match its bound metadata.")
+    if not isinstance(payload, dict) or set(payload) != {"metadata", "integrity", "nodes", "edges"}:
+        if validation is not None and not validation.get("valid"):
+            return destination, payload, validation
+        raise TraceabilityError("Checkpoint payload shape is invalid.")
+    if validation is not None:
+        return destination, payload, validation
+    return destination, payload
+
+
 def _checkpoint_path(root: Path, commit: str) -> Path:
-    matches = list(_common_graph_dir(root).glob(f"main/{commit}/checkpoint.json"))
-    matches += list(_common_graph_dir(root).glob(f"features/*/{commit}/checkpoint.json"))
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        branch = git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
-        selected, used, seen = [], 0, set()
-        for path in matches:
-            try:
-                metadata = json.loads(path.read_text(encoding="utf-8"))["metadata"]
-            except (OSError, json.JSONDecodeError, KeyError):
-                continue
-            if metadata.get("branch") == branch:
-                selected.append((path, metadata.get("kind")))
-        if len(selected) == 1:
-            return selected[0][0]
-        canonical = [path for path, kind in selected if kind == "canonical"]
-        if len(canonical) == 1:
-            return canonical[0]
-    if len(matches) != 1:
-        raise TraceabilityError(f"Expected one commit-bound checkpoint for {commit}.")
-    return matches[0]
+    return _checkpoint_address_payload(root, commit)[0]
+
+
+def _checkpoint_payload_at_address(
+    root: Path,
+    commit: str,
+    *,
+    branch: str,
+    kind: str,
+    _with_validation: bool = False,
+) -> tuple[Path, dict] | tuple[Path, dict, dict]:
+    project_root = resolve_project_root(str(root))
+    resolved_commit = git(project_root, "rev-parse", commit)
+    destination = _checkpoint_destination(
+        project_root, resolved_commit, branch=branch, kind=kind
+    ).absolute()
+    graph_dir = _common_graph_dir(project_root).absolute()
+    try:
+        _reject_reparse_ancestors(destination, graph_dir)
+    except EngineeringError as error:
+        raise TraceabilityError("Checkpoint address boundary is invalid.") from error
+    if not destination.is_file():
+        raise TraceabilityError("Expected one commit-bound checkpoint at its exact address.")
+    try:
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TraceabilityError("Invalid checkpoint address metadata.") from error
+    validation = (
+        _validate_checkpoint_payload(project_root, destination, resolved_commit, payload)
+        if _with_validation
+        else None
+    )
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    try:
+        expected_identity = checkpoint_identity(project_root, resolved_commit)
+    except EngineeringError as error:
+        raise TraceabilityError("Invalid checkpoint address metadata.") from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"metadata", "integrity", "nodes", "edges"}
+        or not isinstance(metadata, dict)
+        or destination != _checkpoint_destination(
+            project_root, resolved_commit, branch=branch, kind=kind
+        ).absolute()
+        or metadata.get("commit") != resolved_commit
+        or metadata.get("branch") != branch
+        or metadata.get("kind") != kind
+        or metadata.get("project_identity") != expected_identity
+    ):
+        if validation is not None and not validation.get("valid"):
+            return destination, payload, validation
+        raise TraceabilityError("Checkpoint address does not match its bound metadata.")
+    if validation is not None:
+        return destination, payload, validation
+    return destination, payload
 
 
 def _load_checkpoint(root: Path, commit: str) -> dict:
     try:
-        checkpoint = json.loads(_checkpoint_path(root, commit).read_text(encoding="utf-8"))
+        _, checkpoint = _checkpoint_address_payload(root, commit)
     except (OSError, json.JSONDecodeError) as error:
         raise TraceabilityError(f"Invalid checkpoint for {commit}.") from error
-    if checkpoint.get("metadata", {}).get("commit") != commit:
+    metadata = checkpoint.get("metadata", {})
+    if metadata.get("commit") != git(resolve_project_root(str(root)), "rev-parse", commit) or metadata.get("project_identity") != checkpoint_identity(root, commit):
         raise TraceabilityError(f"Checkpoint is not bound to commit {commit}.")
     return checkpoint
+
+
+def _load_legacy_query_checkpoint(root: Path, commit: str) -> dict:
+    """Load only the closed, root-bound legacy shape for read-only query commands."""
+    try:
+        _, payload = _checkpoint_address_payload(root, commit, allow_legacy_query=True)
+    except (OSError, json.JSONDecodeError) as error:
+        raise TraceabilityError(f"Invalid checkpoint for {commit}.") from error
+    metadata = payload["metadata"]
+    integrity = payload["integrity"]
+    if (
+        set(metadata) != _LEGACY_QUERY_METADATA_KEYS
+        or not isinstance(payload["nodes"], list)
+        or not isinstance(payload["edges"], list)
+        or not isinstance(integrity, dict)
+        or any(not isinstance(record, dict) for record in payload["nodes"] + payload["edges"])
+        or any(
+            not isinstance(metadata.get(key), str) or not metadata[key]
+            for key in ("project_root", "project", "branch", "commit", "kind", "graphify_version", "input_digest", "generated_at")
+        )
+        or isinstance(metadata.get("overlay_version"), bool)
+        or not isinstance(metadata.get("overlay_version"), int)
+        or not isinstance(metadata.get("inputs"), list)
+        or any(not isinstance(item, str) for item in metadata["inputs"])
+        or set(integrity) != {"files", "nodes", "edges", "exact_edges"}
+        or any(
+            isinstance(integrity[key], bool)
+            or not isinstance(integrity[key], int)
+            or integrity[key] < 0
+            for key in integrity
+        )
+    ):
+        raise TraceabilityError("Legacy query checkpoint shape is invalid.")
+    return payload
+
+
+def _load_query_checkpoint(root: Path, commit: str) -> dict:
+    try:
+        return _load_validated_selected_checkpoint(root, commit)
+    except TraceabilityError:
+        return _load_legacy_query_checkpoint(root, commit)
+
+
+def _load_previous_checkpoint_for_shrink(root: Path, commit: str) -> dict:
+    """Return only verified graph content for the producer's retention guard."""
+    project_root = resolve_project_root(str(root))
+    resolved_commit = git(project_root, "rev-parse", commit)
+    default = _tracked_default_branch(project_root, resolved_commit)
+    attached = git(project_root, "rev-parse", "--abbrev-ref", "HEAD")
+    attached = None if attached == "HEAD" else attached
+    graph_dir = _common_graph_dir(project_root).absolute()
+    canonical = _checkpoint_destination(
+        project_root, resolved_commit, branch=default, kind="canonical"
+    )
+    if attached is not None and attached != default:
+        feature = _checkpoint_destination(
+            project_root, resolved_commit, branch=attached, kind="feature"
+        )
+        _reject_reparse_ancestors(feature.parent, graph_dir)
+        if feature.parent.exists():
+            path, selected_branch, selected_kind = feature, attached, "feature"
+        elif canonical.parent.exists():
+            path, selected_branch, selected_kind = canonical, default, "canonical"
+        else:
+            raise TraceabilityError("Expected one exact predecessor checkpoint.")
+    elif canonical.parent.exists():
+        path, selected_branch, selected_kind = canonical, default, "canonical"
+    else:
+        path = _checkpoint_destination(
+            project_root, resolved_commit, branch=default, kind="feature"
+        )
+        _reject_reparse_ancestors(canonical.parent, graph_dir)
+        if canonical.parent.exists():
+            raise TraceabilityError("Expected one exact predecessor checkpoint.")
+        selected_branch, selected_kind = default, "feature"
+
+    try:
+        _reject_reparse_ancestors(path, graph_dir)
+        if not path.is_file():
+            raise TraceabilityError("Expected one exact predecessor checkpoint.")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TraceabilityError("Invalid predecessor checkpoint metadata.") from error
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"metadata", "integrity", "nodes", "edges"}
+        or not isinstance(metadata, dict)
+        or metadata.get("commit") != resolved_commit
+        or metadata.get("branch") != selected_branch
+        or metadata.get("kind") != selected_kind
+    ):
+        raise TraceabilityError("Predecessor checkpoint address does not match its metadata.")
+
+    if "project_identity" in metadata:
+        validation = _validate_checkpoint_payload(
+            project_root, path, resolved_commit, payload
+        )
+        if not validation["valid"]:
+            raise TraceabilityError("Previous checkpoint is not an exact validated snapshot.")
+        return {
+            "nodes": payload["nodes"],
+            "edges": payload["edges"],
+            "integrity": payload["integrity"],
+        }
+
+    if (
+        set(metadata) != _LEGACY_QUERY_METADATA_KEYS
+        or metadata.get("project_root") != str(_common_graph_dir(project_root).parent)
+    ):
+        raise TraceabilityError("Previous checkpoint is not an exact legacy snapshot.")
+    if selected_kind == "feature" and selected_branch == default:
+        try:
+            resolver_default = default_branch(project_root)
+        except EngineeringError:
+            resolver_default = None
+        if attached != default or resolver_default != default:
+            raise TraceabilityError("Legacy default-feature predecessor is outside its current namespace.")
+
+    if (
+        not isinstance(metadata.get("inputs"), list)
+        or any(not isinstance(item, str) for item in metadata["inputs"])
+        or not isinstance(metadata.get("input_digest"), str)
+        or not metadata["input_digest"]
+        or any(
+            not isinstance(metadata.get(key), str) or not metadata[key]
+            for key in ("project", "branch", "commit", "kind", "graphify_version", "generated_at")
+        )
+        or isinstance(metadata.get("overlay_version"), bool)
+        or not isinstance(metadata.get("overlay_version"), int)
+        or not isinstance(payload["nodes"], list)
+        or not isinstance(payload["edges"], list)
+        or not isinstance(payload["integrity"], dict)
+        or any(not isinstance(record, dict) for record in payload["nodes"] + payload["edges"])
+    ):
+        raise TraceabilityError("Previous legacy checkpoint shape is invalid.")
+    selected = _tracked_manifest_name_at(project_root, resolved_commit)
+    if selected is None:
+        raise TraceabilityError("Previous legacy checkpoint manifest is unavailable.")
+    config_path, links_path, _, _ = _project_paths_for_manifest(selected)
+    manifest = _json_at(project_root, resolved_commit, config_path)
+    links = _json_at(project_root, resolved_commit, links_path)
+    nodes, edges, integrity = _validate_overlay(
+        project_root, resolved_commit, manifest, links, manifest_name=config_path
+    )
+    expected_integrity = {
+        key: value for key, value in integrity.items()
+        if key not in {"input_digest", "inputs"}
+    }
+    required_counts = {"files", "nodes", "edges", "exact_edges"}
+    observed_integrity = payload["integrity"]
+    if (
+        set(observed_integrity) != required_counts
+        or any(
+            isinstance(observed_integrity[key], bool)
+            or not isinstance(observed_integrity[key], int)
+            or observed_integrity[key] < 0
+            for key in required_counts
+        )
+        or observed_integrity != expected_integrity
+        or payload["nodes"] != nodes
+        or payload["edges"] != edges
+        or metadata.get("inputs") != integrity["inputs"]
+        or metadata.get("input_digest") != integrity["input_digest"]
+    ):
+        raise TraceabilityError("Previous legacy checkpoint does not match its compiled overlay.")
+    return {"nodes": nodes, "edges": edges, "integrity": observed_integrity}
 
 
 def _identity(record: dict) -> dict:
@@ -3046,7 +3456,11 @@ def _checkpoint_candidate(
         ratio = manifest.get("integrity", {}).get("min_retained_ratio", 0.8)
         if not isinstance(ratio, (int, float)) or not 0 <= ratio <= 1:
             raise TraceabilityError("Integrity retention ratio must be between 0 and 1.")
-        _guard_previous(checkpoint, _load_checkpoint(root, previous_commit), float(ratio))
+        _guard_previous(
+            checkpoint,
+            _load_previous_checkpoint_for_shrink(root, previous_commit),
+            float(ratio),
+        )
     graph_dir = _common_graph_dir(root)
     if canonical:
         destination = graph_dir / "main" / commit / "checkpoint.json"
@@ -3132,7 +3546,9 @@ def _legacy_rebuild(
     if final_dir.exists():
         if (
             not destination.is_file()
-            or not validate_checkpoint(root, destination, commit)["valid"]
+            or not _published_checkpoint_validation(
+                root, destination, commit, branch=branch, kind="feature"
+            )["valid"]
         ):
             raise TraceabilityError(
                 f"Immutable checkpoint directory is incomplete: {final_dir}"
@@ -3173,7 +3589,8 @@ def _legacy_rebuild(
                 "--detach",
                 str(snapshot),
                 commit,
-            ]
+            ],
+            strict_git=True,
         )
         added = True
         if git(snapshot, "rev-parse", "HEAD") != commit:
@@ -3233,7 +3650,8 @@ def _legacy_rebuild(
                         "remove",
                         "--force",
                         str(snapshot),
-                    ]
+                    ],
+                    strict_git=True,
                 )
             except TraceabilityError:
                 pass
@@ -3419,15 +3837,11 @@ def _read_base_graph(path: Path) -> dict:
     return graph
 
 
-def validate_checkpoint(
-    root: Path, checkpoint: Path, expected_commit: str
+def _validate_checkpoint_payload(
+    root: Path, checkpoint: Path, expected_commit: str, payload: object
 ) -> dict:
     project_root = resolve_project_root(str(root))
     commit = git(project_root, "rev-parse", expected_commit)
-    try:
-        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {"valid": False, "reason": "invalid_json"}
     if not isinstance(payload, dict):
         return {"valid": False, "reason": "invalid_schema"}
     metadata = payload.get("metadata")
@@ -3501,6 +3915,136 @@ def validate_checkpoint(
         "checkpoint": str(checkpoint),
         "graph_digest": digest,
     }
+
+
+def validate_checkpoint(
+    root: Path, checkpoint: Path, expected_commit: str
+) -> dict:
+    try:
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"valid": False, "reason": "invalid_json"}
+    return _validate_checkpoint_payload(root, checkpoint, expected_commit, payload)
+
+
+def _validated_checkpoint_at_address(
+    root: Path, commit: str, *, branch: str, kind: str
+) -> tuple[Path, dict, dict]:
+    path, payload, validation = _checkpoint_payload_at_address(
+        root, commit, branch=branch, kind=kind, _with_validation=True
+    )
+    resolved_commit = git(resolve_project_root(str(root)), "rev-parse", commit)
+    if not validation.get("valid"):
+        return path, payload, validation
+    if resolved_commit in _read_stale(resolve_project_root(str(root))):
+        return path, payload, {"valid": False, "reason": "stale_marker"}
+    return path, payload, validation
+
+
+def _validated_selected_checkpoint(root: Path, commit: str) -> tuple[Path, dict, dict]:
+    path, payload, validation = _checkpoint_address_payload(
+        root, commit, _with_validation=True
+    )
+    project_root = resolve_project_root(str(root))
+    resolved_commit = git(project_root, "rev-parse", commit)
+    if not validation.get("valid"):
+        return path, payload, validation
+    if resolved_commit in _read_stale(project_root):
+        return path, payload, {"valid": False, "reason": "stale_marker"}
+    return path, payload, validation
+
+
+def _validated_current_checkpoint(root: Path, commit: str) -> tuple[Path, dict, dict]:
+    """Validate current authority only when tracked and resolved defaults agree."""
+    project_root = resolve_project_root(str(root))
+    resolved_commit = git(project_root, "rev-parse", commit)
+    if not _current_default_agrees(project_root, resolved_commit):
+        raise TraceabilityError("checkpoint_default_branch_mismatch")
+    return _validated_selected_checkpoint(project_root, resolved_commit)
+
+
+def _current_default_agrees(root: Path, commit: str) -> bool:
+    project_root = resolve_project_root(str(root))
+    try:
+        configured_default = _tracked_default_branch(project_root, commit)
+        authority = _current_default_authority(project_root)
+    except EngineeringError:
+        return False
+    return authority is not None and configured_default == authority[0]
+
+
+def _current_default_authority(root: Path) -> tuple[str, str | None] | None:
+    """Return default branch identity and an exact bound ref when available."""
+    project_root = resolve_project_root(str(root))
+    try:
+        remotes = [item for item in git(project_root, "remote").splitlines() if item]
+        if not remotes:
+            branch = _tracked_default_branch(project_root, "HEAD")
+            commit = git(project_root, "rev-parse", "--verify", f"refs/heads/{branch}")
+            return branch, commit
+        if len(remotes) != 1:
+            return None
+        remote = remotes[0]
+        if remote != "origin":
+            authority = _canonical_authority_details(
+                project_root, refresh_remote=False, allow_cached_remote=True
+            )
+            if (
+                not isinstance(authority.get("remote_url_digest"), str)
+                or not isinstance(authority.get("source"), str)
+                or not isinstance(authority.get("destination"), str)
+                or not isinstance(authority.get("branch"), str)
+            ):
+                return None
+            return authority["branch"], authority.get("commit")
+
+        branch = default_branch(project_root)
+        _bound_remote_url(project_root, remote)
+        mappings = git(
+            project_root, "config", "--get-all", f"remote.{remote}.fetch"
+        ).splitlines()
+        _, destination = _validated_fetch_mapping(remote, branch, mappings)
+        try:
+            commit = git(project_root, "rev-parse", "--verify", destination)
+        except EngineeringError:
+            return None
+        return branch, commit
+    except EngineeringError:
+        return None
+
+
+def _published_checkpoint_validation(
+    root: Path,
+    destination: Path,
+    commit: str,
+    *,
+    branch: str,
+    kind: str,
+) -> dict:
+    """Validate a published checkpoint at one exact address and payload snapshot."""
+    try:
+        bound_path, payload, validation = _checkpoint_payload_at_address(
+            root, commit, branch=branch, kind=kind, _with_validation=True
+        )
+        if Path(destination).absolute() != bound_path.absolute():
+            return {"valid": False, "reason": "checkpoint_address_mismatch"}
+        return validation
+    except (EngineeringError, OSError, json.JSONDecodeError) as error:
+        return {"valid": False, "reason": str(error)}
+
+
+def _load_validated_selected_checkpoint(root: Path, commit: str) -> dict:
+    path, payload, validation = _validated_selected_checkpoint(root, commit)
+    if not validation["valid"]:
+        raise TraceabilityError("Checkpoint is not an exact current snapshot.")
+    return payload
+
+
+def _load_validated_current_checkpoint(root: Path, commit: str) -> dict:
+    path, payload, validation = _validated_current_checkpoint(root, commit)
+    if not validation["valid"]:
+        raise TraceabilityError("Current checkpoint is not an exact validated snapshot.")
+    return payload
 
 
 def _checkpoint_destination(
@@ -3613,7 +4157,9 @@ def _quarantine_invalid_checkpoint(
         raise EngineeringError("checkpoint_quarantine_boundary_invalid")
     try:
         validation = (
-            validate_checkpoint(root, destination, commit)
+            _published_checkpoint_validation(
+                root, destination, commit, branch=branch, kind=kind
+            )
             if destination.is_file()
             else {"valid": False, "reason": "missing_checkpoint"}
         )
@@ -3750,7 +4296,9 @@ def _restore_quarantined_checkpoint(root: Path, record: dict) -> dict:
     ):
         raise EngineeringError("checkpoint_quarantine_record_invalid")
     if not quarantine.exists():
-        if destination.is_file() and validate_checkpoint(root, destination, commit)["valid"]:
+        if destination.is_file() and _published_checkpoint_validation(
+            root, destination, commit, branch=branch, kind=kind
+        )["valid"]:
             return {"restored": True, "already_regenerated": True}
         raise EngineeringError("checkpoint_quarantine_payload_missing")
     actual_digest, actual_file_count = _checkpoint_tree_digest(quarantine, graph_dir)
@@ -3759,7 +4307,9 @@ def _restore_quarantined_checkpoint(root: Path, record: dict) -> dict:
     if actual_file_count != record["file_count"]:
         raise EngineeringError("checkpoint_quarantine_file_count_mismatch")
     if original.exists():
-        if destination.is_file() and validate_checkpoint(root, destination, commit)["valid"]:
+        if destination.is_file() and _published_checkpoint_validation(
+            root, destination, commit, branch=branch, kind=kind
+        )["valid"]:
             return {"restored": False, "reason": "regenerated_checkpoint_present"}
         if original.is_dir() and not _is_reparse_point(original):
             try:
@@ -3883,12 +4433,28 @@ def _checkpoint_quarantine_records(root: Path) -> list[dict]:
 def _select_exact_checkpoint(
     root: Path, commit: str, *, branch: str, kind: str
 ) -> Path | None:
-    destination = _checkpoint_destination(
-        root, commit, branch=branch, kind=kind
-    )
-    if commit in _read_stale(root) or not destination.is_file():
+    project_root = resolve_project_root(str(root))
+    try:
+        resolved_commit = git(project_root, "rev-parse", commit)
+        authority = _current_default_authority(project_root)
+        if (
+            authority is None
+            or not _current_default_agrees(project_root, resolved_commit)
+            or (kind == "canonical" and (authority[1] is None or authority[1] != resolved_commit))
+            or (kind == "canonical" and authority[0] != branch)
+        ):
+            return None
+    except EngineeringError:
         return None
-    if not validate_checkpoint(root, destination, commit)["valid"]:
+    if resolved_commit in _read_stale(project_root):
+        return None
+    try:
+        destination, _, validation = _validated_checkpoint_at_address(
+            root, commit, branch=branch, kind=kind
+        )
+    except EngineeringError:
+        return None
+    if not validation["valid"]:
         return None
     return destination
 
@@ -3933,24 +4499,46 @@ def _checkpoint_candidate_at(
     return destination, checkpoint
 
 
+def _checkpoint_address_from_path(root: Path, path: Path) -> tuple[str, str, str]:
+    graph_dir = _common_graph_dir(resolve_project_root(str(root))).absolute()
+    candidate = Path(path).absolute()
+    try:
+        parts = candidate.relative_to(graph_dir).parts
+    except ValueError as error:
+        raise TraceabilityError("Checkpoint is outside its catalogue namespace.") from error
+    if len(parts) == 3 and parts[0] == "main" and parts[2] == "checkpoint.json":
+        kind = "canonical"
+        commit = parts[1]
+        branch = _tracked_default_branch(root, commit)
+    elif len(parts) == 4 and parts[0] == "features" and parts[3] == "checkpoint.json":
+        branch = unquote(parts[1])
+        if quote(branch, safe="") != parts[1]:
+            raise TraceabilityError("Checkpoint feature namespace is not canonical.")
+        kind = "feature"
+        commit = parts[2]
+    else:
+        raise TraceabilityError("Checkpoint namespace is invalid.")
+    _validate_checkpoint_address(commit, branch, kind)
+    return commit, branch, kind
+
+
 def _compatible_ancestor(
     root: Path, commit: str, graphify_version: str
 ) -> tuple[str, Path] | None:
     compatible: list[tuple[int, str, Path]] = []
     for path in _checkpoint_files(root):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
+            candidate, branch, kind = _checkpoint_address_from_path(root, path)
+            _, payload, validation = _validated_checkpoint_at_address(
+                root, candidate, branch=branch, kind=kind
+            )
+            if not validation["valid"]:
                 continue
-            candidate = payload["metadata"]["commit"]
             if payload["metadata"].get("graphify_version") != graphify_version:
-                continue
-            if not validate_checkpoint(root, path, candidate)["valid"]:
                 continue
             if subprocess.run(
                 ["git", "-C", str(root), "merge-base", "--is-ancestor", candidate, commit],
                 capture_output=True,
-                text=True,
                 env=_controller_git_environment(),
             ).returncode:
                 continue
@@ -5372,6 +5960,8 @@ def _worker_authority_valid(root: Path, authority: dict | None, commit: str) -> 
     remote = authority.get("remote")
     if remote is None:
         try:
+            if git(root, "remote").strip():
+                return False
             return (
                 git(root, "rev-parse", "--verify", f"refs/heads/{authority['branch']}")
                 == commit
@@ -5389,8 +5979,129 @@ def _worker_authority_valid(root: Path, authority: dict | None, commit: str) -> 
             and source == authority.get("source")
             and destination == authority.get("destination")
             and git(root, "rev-parse", "--verify", destination) == commit
+            and _current_default_authority(root)
+            == (authority.get("branch"), commit)
         )
     except EngineeringError:
+        return False
+
+
+def _current_authority_snapshot(root: Path) -> dict | None:
+    """Capture bounded cached default authority for post-publication validation."""
+    project_root = resolve_project_root(str(root))
+    try:
+        authority = _canonical_authority_details(
+            project_root, refresh_remote=False, allow_cached_remote=True
+        )
+        branch = authority.get("branch")
+        commit = authority.get("commit")
+        if (
+            not isinstance(branch, str)
+            or not isinstance(commit, str)
+            or authority.get("fetch_argv") != []
+            or _current_default_authority(project_root) != (branch, commit)
+            or _tracked_default_branch(project_root, commit) != branch
+        ):
+            return None
+        return {
+            "branch": branch,
+            "commit": commit,
+            "remote": authority.get("remote"),
+            "remote_url_digest": authority.get("remote_url_digest"),
+            "source": authority.get("source"),
+            "destination": authority.get("destination"),
+        }
+    except EngineeringError:
+        return None
+
+
+def _postpublication_current_resolution(
+    root: Path, record: dict, destination: Path
+) -> dict | None:
+    """Validate one just-published exact current checkpoint, ignoring only its old stale marker."""
+    project_root = resolve_project_root(str(root))
+    try:
+        commit = record.get("commit")
+        branch = record.get("branch")
+        kind = record.get("kind")
+        authority = record.get("postpublication_authority")
+        if (
+            record.get("phase") != "published"
+            or not isinstance(commit, str)
+            or not isinstance(branch, str)
+            or kind not in {"canonical", "feature"}
+            or not isinstance(authority, dict)
+            or record.get("destination") != str(Path(destination).absolute())
+            or commit != git(project_root, "rev-parse", "HEAD")
+            or branch
+            != git(project_root, "symbolic-ref", "--quiet", "--short", "HEAD")
+            or _tracked_default_branch(project_root, commit)
+            != authority.get("branch")
+            or not _worker_authority_valid(
+                project_root, authority, authority.get("commit", "")
+            )
+        ):
+            return None
+        if kind == "canonical":
+            if branch != authority.get("branch") or authority.get("commit") != commit:
+                return None
+        elif branch == authority.get("branch"):
+            return None
+
+        selected_path, payload = _checkpoint_address_payload(project_root, commit)
+        expected_destination = _checkpoint_destination(
+            project_root, commit, branch=branch, kind=kind
+        ).absolute()
+        if (
+            selected_path.absolute() != expected_destination
+            or expected_destination != Path(destination).absolute()
+        ):
+            return None
+        validation = _validate_checkpoint_payload(
+            project_root, selected_path, commit, payload
+        )
+        if not validation.get("valid"):
+            return None
+        return {
+            "commit": commit,
+            "checkpoint": str(expected_destination),
+            "payload": payload,
+            "validation": validation,
+        }
+    except (EngineeringError, OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _current_resolution_proven(
+    root: Path, result: dict, operation: dict, cleanup: dict
+) -> bool:
+    try:
+        commit = operation.get("commit")
+        branch = operation.get("branch")
+        kind = operation.get("kind")
+        if (
+            not isinstance(commit, str)
+            or not isinstance(branch, str)
+            or kind not in {"canonical", "feature"}
+        ):
+            return False
+        destination = str(
+            _checkpoint_destination(root, commit, branch=branch, kind=kind).absolute()
+        )
+        proof = result.get("current_resolution")
+        return (
+            result.get("freshness") == "current"
+            and result.get("commit") == commit
+            and result.get("checkpoint") == destination
+            and operation.get("destination") == destination
+            and isinstance(proof, dict)
+            and set(proof) == {"commit", "checkpoint"}
+            and proof.get("commit") == commit
+            and proof.get("checkpoint") == destination
+            and cleanup.get("completed") is True
+            and result.get("readiness") != "blocked"
+        )
+    except (EngineeringError, OSError, TypeError, ValueError):
         return False
 
 
@@ -5423,7 +6134,25 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
     quarantine_rollback = None
     cwd_before = Path.cwd()
     environment_before = dict(os.environ)
+    failure_stage = "preflight"
+    semantic_full = record.get("semantic_full", False)
+
+    def failure_class(error: Exception) -> str:
+        if isinstance(error, EngineeringError):
+            return "engineering_error"
+        if isinstance(error, json.JSONDecodeError):
+            return "json_error"
+        if isinstance(error, subprocess.SubprocessError):
+            return "subprocess_error"
+        if isinstance(error, OSError):
+            return "os_error"
+        return "other"
+
     try:
+        if not isinstance(semantic_full, bool):
+            raise EngineeringError("semantic_full_selector_invalid")
+        if semantic_full and record.get("hook"):
+            raise EngineeringError("semantic_full_hook_forbidden")
         graphify_environment = _graphify_environment(output=stage)
         os.environ.clear()
         os.environ.update(graphify_environment)
@@ -5435,7 +6164,8 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
         semantic = _semantic_changes(
             changed, adapter_details["code_extensions"], record["manifest_name"]
         )
-        if semantic:
+        semantic_full = bool(semantic and semantic_full)
+        if semantic and not semantic_full:
             _queue_graph_worker_stale(project_root, operation_id)
             _atomic_text(
                 result_path,
@@ -5475,6 +6205,8 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
             branch=record["branch"],
             kind=record["kind"],
         )
+        record["destination"] = str(destination.absolute())
+        _write_operation(record)
         quarantine = _quarantine_invalid_checkpoint(
             project_root,
             destination,
@@ -5482,6 +6214,7 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
             branch=record["branch"],
             kind=record["kind"],
         )
+        failure_stage = "worktree_add"
         run(
             [
                 "git",
@@ -5496,23 +6229,26 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                 commit,
             ],
             timeout=30,
+            strict_git=True,
         )
         record["phase"] = "worktree_created"
         _write_operation(record)
         stage.mkdir()
-        if ancestor:
+        if ancestor and not semantic_full:
             shutil.copytree(ancestor[1].parent, stage, dirs_exist_ok=True)
         record["phase"] = "staging_ready"
         _write_operation(record)
         try:
             os.chdir(worktree)
-            if ancestor:
+            if ancestor and not semantic_full:
+                failure_stage = "incremental_adapter"
                 if not adapter(
                     worktree,
                     changed_paths=[Path(path) for path in changed],
                 ):
                     raise EngineeringError("graphify_adapter_failed")
             else:
+                failure_stage = "cold_graphify"
                 command = (
                     str(Path(sys.executable).resolve()),
                     "-m",
@@ -5523,8 +6259,9 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                 run(list(command), env=_graphify_environment(output=stage), timeout=600)
         finally:
             os.chdir(cwd_before)
+        failure_stage = "graph_output_validation"
         graph_path = stage / "graph.json"
-        if ancestor:
+        if ancestor and not semantic_full:
             incremented_graph = _read_base_graph(graph_path)
             incremented_graph["built_at_commit"] = commit
             _atomic_text(
@@ -5535,6 +6272,7 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
         if graph.get("built_at_commit") != commit:
             raise EngineeringError("commit_mismatch")
         graph_digest = _graph_digest(graph_path)
+        failure_stage = "candidate_validation"
         destination, checkpoint = _checkpoint_candidate_at(
             project_root,
             commit,
@@ -5554,14 +6292,14 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
             previous_graph = _read_base_graph(ancestor[1].parent / "graph.json")
             deleted_sources = {
                 path.replace("\\", "/")
-                for path in git(
+                for path in _git_paths(
                     project_root,
                     "diff",
                     "--name-only",
                     "--diff-filter=D",
                     ancestor[0],
                     commit,
-                ).splitlines()
+                )
                 if path
             }
             _guard_base_graph(
@@ -5579,12 +6317,20 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
             project_root, stage / "checkpoint.json", commit
         )["valid"]:
             raise EngineeringError("candidate_checkpoint_invalid")
+        failure_stage = "authority_validation"
         if not _worker_authority_valid(
             project_root, record.get("authority"), commit
         ):
             raise EngineeringError("canonical_authority_changed")
+        failure_stage = "publication"
         if destination.parent.exists():
-            existing = validate_checkpoint(project_root, destination, commit)
+            existing = _published_checkpoint_validation(
+                project_root,
+                destination,
+                commit,
+                branch=record["branch"],
+                kind=record["kind"],
+            )
             if existing["valid"]:
                 shutil.rmtree(stage)
             else:
@@ -5594,17 +6340,20 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
             os.replace(stage, destination.parent)
         record["phase"] = "published"
         _write_operation(record)
-        _mutate_maintenance_locked(
+        failure_stage = "maintenance"
+        maintenance_result = _mutate_maintenance_locked(
             project_root,
             [],
             _read_operation(project_root, operation_id),
             resolved_checkpoint=commit,
+            postpublication_context={"destination": str(destination.absolute())},
         )
+        failure_stage = "result_record"
         _atomic_text(
             result_path,
             json.dumps(
                 {
-                    "mode": "changed_path_adapter" if ancestor else "full",
+                    "mode": "changed_path_adapter" if ancestor and not semantic_full else "full",
                     "freshness": "current",
                     "commit": commit,
                     "checkpoint": str(destination),
@@ -5616,6 +6365,11 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                     "detached_snapshot": True,
                     "staged_graphify_out": True,
                     "previous_checkpoint_preserved": ancestor is not None,
+                    **(
+                        {"current_resolution": maintenance_result["current_resolution"]}
+                        if isinstance(maintenance_result.get("current_resolution"), dict)
+                        else {}
+                    ),
                     "argv": [],
                     **({"quarantine": quarantine} if quarantine is not None else {}),
                 },
@@ -5625,6 +6379,7 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
         )
         return 0
     except Exception as error:
+        error_class = failure_class(error)
         if quarantine is not None:
             try:
                 quarantine_rollback = _restore_quarantined_checkpoint(
@@ -5632,10 +6387,14 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                 )
             except Exception as rollback_error:
                 error = EngineeringError("checkpoint_quarantine_rollback_failed")
+                failure_stage = "quarantine_rollback"
+                error_class = "engineering_error"
         try:
             _queue_graph_worker_stale(project_root, operation_id)
         except Exception as maintenance_error:
             error = maintenance_error
+            failure_stage = "stale_maintenance"
+            error_class = failure_class(error)
         _atomic_text(
             result_path,
             json.dumps(
@@ -5647,6 +6406,8 @@ def _graph_worker_entry(root: Path, operation_id: str) -> int:
                         if str(error)
                         else type(error).__name__
                     ),
+                    "failure_stage": failure_stage,
+                    "failure_class": error_class,
                     "commit": commit,
                     "previous_checkpoint_preserved": bool(
                         _compatible_ancestor(
@@ -5694,7 +6455,13 @@ def _run_graph_operation(
     timeout_seconds: float | None,
     cleanup_timeout_seconds: float,
     authority: dict | None = None,
+    postpublication_authority: dict | None = None,
+    semantic_full: bool = False,
 ) -> dict:
+    if not isinstance(semantic_full, bool):
+        raise EngineeringError("semantic_full_selector_invalid")
+    if semantic_full and hook:
+        raise EngineeringError("semantic_full_hook_forbidden")
     project_root = resolve_project_root(str(root))
     orphan = reconcile_orphaned_operations(
         project_root,
@@ -5740,6 +6507,8 @@ def _run_graph_operation(
             "manifest_name": manifest_name,
             "hook": hook,
             "authority": authority,
+            "postpublication_authority": postpublication_authority,
+            "semantic_full": semantic_full,
         }
     )
     _write_operation(record)
@@ -5898,9 +6667,9 @@ def _run_graph_operation(
     result["operation"] = record
     result["cleanup"] = cleanup
     result["orphan_reconciled_before_worker"] = bool(orphan["reconciled"])
-    if result.get("freshness") == "current":
+    if _current_resolution_proven(project_root, result, record, cleanup):
         _clear_stale(project_root, commit)
-    else:
+    elif result.get("freshness") != "current":
         _record_stale(project_root, commit, result["reason"])
     return result
 
@@ -5912,10 +6681,15 @@ def rebuild(
     manifest_name: str | None = None,
     *,
     target_commit: str | None = None,
+    _semantic_full: bool = False,
     hook_budget_seconds: float | None = None,
     cleanup_timeout_seconds: float = 5.0,
 ) -> dict | Path:
     """Build an exact target; retain the installed-v1 positional interface."""
+    if not isinstance(_semantic_full, bool):
+        raise EngineeringError("semantic_full_selector_invalid")
+    if _semantic_full and (graphify_python is not None or hook_budget_seconds is not None):
+        raise EngineeringError("semantic_full_hook_forbidden")
     if graphify_python is not None:
         return _legacy_rebuild(
             root,
@@ -5924,24 +6698,45 @@ def rebuild(
             manifest_name=manifest_name,
         )
     project_root = resolve_project_root(str(root))
-    selected = manifest_name or _tracked_manifest_name(project_root)
+    commit = git(project_root, "rev-parse", target_commit or "HEAD")
+    selected = (
+        manifest_name
+        if manifest_name is not None
+        else _tracked_manifest_name_at(project_root, commit)
+    )
     if selected is None:
         raise EngineeringError("manifest_not_tracked")
-    commit = git(project_root, "rev-parse", target_commit or "HEAD")
     _validate_project_controls(project_root, commit, selected)
     branch = git(project_root, "symbolic-ref", "--quiet", "--short", "HEAD")
     manifest = _json_at(project_root, commit, selected)
     configured_default = manifest["project"]["default_branch"]
     kind = "feature"
     authority = None
-    if not git(project_root, "remote").strip() and branch == configured_default and commit == git(
-        project_root, "rev-parse", f"refs/heads/{configured_default}"
+    remotes = [item for item in git(project_root, "remote").splitlines() if item]
+    if (
+        not remotes
+        and branch == configured_default
+        and commit == git(project_root, "rev-parse", f"refs/heads/{configured_default}")
     ):
         kind = "canonical"
-        authority = {
-            "branch": configured_default,
-            "remote": None,
-        }
+        authority = {"branch": configured_default, "remote": None}
+    elif remotes:
+        current_authority = _current_default_authority(project_root)
+        if (
+            branch == configured_default
+            and commit == git(project_root, "rev-parse", "HEAD")
+            and current_authority == (configured_default, commit)
+        ):
+            bound_authority = _canonical_authority_details(
+                project_root, refresh_remote=False, allow_cached_remote=True
+            )
+            if (
+                bound_authority.get("branch") == configured_default
+                and bound_authority.get("commit") == commit
+                and bound_authority.get("fetch_argv") == []
+            ):
+                kind = "canonical"
+                authority = bound_authority
     destination = _select_exact_checkpoint(
         project_root, commit, branch=branch, kind=kind
     )
@@ -5976,6 +6771,8 @@ def rebuild(
         timeout_seconds=hook_budget_seconds,
         cleanup_timeout_seconds=cleanup_timeout_seconds,
         authority=authority,
+        postpublication_authority=_current_authority_snapshot(project_root),
+        semantic_full=_semantic_full,
     )
 
 
@@ -6180,7 +6977,7 @@ def _canonical_authority_details(
         refspec,
     ]
     try:
-        run(argv, timeout=15)
+        run(argv, timeout=15, strict_git=True)
         if _bound_remote_url(project_root, remote)[1] != remote_url_digest:
             raise EngineeringError("remote authority changed during fetch")
         commit = git(project_root, "rev-parse", "--verify", destination)
@@ -6284,6 +7081,7 @@ def reconcile_canonical(
         timeout_seconds=hook_budget_seconds,
         cleanup_timeout_seconds=5.0,
         authority=authority,
+        postpublication_authority=_current_authority_snapshot(project_root),
     )
     result.update(
         {
@@ -6406,20 +7204,41 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
     manifest_name = _tracked_manifest_name(project_root)
     if manifest_name is None:
         return {"canonical": None, "features": [], "state": "unmanaged"}
-    manifest = _json_at(project_root, "HEAD", manifest_name)
-    default = manifest["project"]["default_branch"]
-    try:
-        canonical_commit = git(project_root, "rev-parse", f"refs/remotes/origin/{default}")
-    except EngineeringError:
-        canonical_commit = git(project_root, "rev-parse", f"refs/heads/{default}")
+    authority = _current_default_authority(project_root)
+    default, canonical_commit = authority if authority is not None else (None, None)
+
+    def record_default(commit: str) -> str | None:
+        try:
+            return _tracked_default_branch(project_root, commit)
+        except EngineeringError:
+            return None
+
     graph_dir = _common_graph_dir(project_root)
     current: dict | None = None
     features_by_commit: dict[str, dict] = {}
     quarantined = _checkpoint_quarantine_records(project_root)
     for checkpoint in sorted(graph_dir.glob("main/*/checkpoint.json")):
         commit = checkpoint.parent.name
-        validation = validate_checkpoint(project_root, checkpoint, commit)
-        item = {"commit": commit, "state": "current" if validation["valid"] and commit == canonical_commit else "historical"}
+        record_default_branch = record_default(commit)
+        try:
+            if record_default_branch is None:
+                raise EngineeringError("checkpoint_default_branch_unavailable")
+            _, _, validation = _validated_checkpoint_at_address(
+                project_root, commit, branch=record_default_branch, kind="canonical"
+            )
+        except EngineeringError:
+            validation = {"valid": False, "reason": "checkpoint_address_mismatch"}
+        item = {
+            "commit": commit,
+            "state": "current"
+            if (
+                default is not None
+                and record_default_branch == default
+                and validation["valid"]
+                and commit == canonical_commit
+            )
+            else "historical",
+        }
         if not validation["valid"]:
             item["state"] = "quarantined"
             item["reason"] = validation["reason"]
@@ -6430,13 +7249,23 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
     for checkpoint in sorted(graph_dir.glob("features/*/*/checkpoint.json")):
         commit, branch_token = checkpoint.parent.name, checkpoint.parent.parent.name
         branch = unquote(branch_token)
-        validation = validate_checkpoint(project_root, checkpoint, commit)
+        record_default_branch = record_default(commit)
+        try:
+            _, _, validation = _validated_checkpoint_at_address(
+                project_root, commit, branch=branch, kind="feature"
+            )
+        except EngineeringError:
+            validation = {"valid": False, "reason": "checkpoint_address_mismatch"}
         item = {"commit": commit, "branch": branch, "state": "archived"}
         if not validation["valid"]:
             item.update(state="quarantined", reason=validation["reason"])
             item["relative_path"] = checkpoint.relative_to(graph_dir).as_posix()
             quarantined.append(item)
-        elif _is_ancestor_or_equal(project_root, commit, canonical_commit):
+        elif default is None or record_default_branch != default:
+            item["state"] = "archived"
+        elif canonical_commit is not None and _is_ancestor_or_equal(
+            project_root, commit, canonical_commit
+        ):
             item["state"] = "historical"
         else:
             try:
@@ -6457,44 +7286,59 @@ def graph_checkpoint_catalogue(root: Path) -> dict:
     }
 
 
-def status(root: Path, *, target_commit: str | None = None) -> dict:
+def _status_snapshot(root: Path, *, target_commit: str | None = None) -> tuple[dict, dict | None]:
     project_root = resolve_project_root(str(root))
     commit = git(project_root, "rev-parse", target_commit or "HEAD")
+    current_commit = git(project_root, "rev-parse", "HEAD")
     if commit in _read_stale(project_root):
-        return {"commit": commit, "freshness": "stale"}
+        return {"commit": commit, "freshness": "stale", "reason": "stale_marker"}, None
     try:
-        checkpoint = _checkpoint_path(project_root, commit)
+        if commit == current_commit:
+            checkpoint, payload, validation = _validated_current_checkpoint(
+                project_root, commit
+            )
+        else:
+            checkpoint, payload, validation = _validated_selected_checkpoint(
+                project_root, commit
+            )
     except EngineeringError:
-        return {"commit": commit, "freshness": "stale"}
-    validation = validate_checkpoint(project_root, checkpoint, commit)
-    return {
+        return {"commit": commit, "freshness": "stale", "reason": "checkpoint_selection_invalid"}, None
+    result = {
         "commit": commit,
-        "freshness": "current" if validation["valid"] else "stale",
-        "reason": validation["reason"],
+        "freshness": (
+            "historical"
+            if commit != current_commit and validation["valid"]
+            else "current" if validation["valid"] else "stale"
+        ),
+        "reason": "historical_snapshot" if commit != current_commit and validation["valid"] else validation["reason"],
         "checkpoint": str(checkpoint),
     }
+    return result, payload if validation["valid"] else None
 
 
-def check_merge_readiness(root: Path) -> dict:
+def status(root: Path, *, target_commit: str | None = None) -> dict:
+    return _status_snapshot(root, target_commit=target_commit)[0]
+
+
+def _merge_readiness_snapshot(root: Path) -> tuple[dict, dict | None]:
     project_root = resolve_project_root(str(root))
     commit = git(project_root, "rev-parse", "HEAD")
     stale = _read_stale(project_root)
     if commit in stale:
-        return {"ready": False, "reason": "stale", "commit": commit}
+        return {"ready": False, "reason": "stale", "commit": commit}, None
     try:
-        path = _checkpoint_path(project_root, commit)
+        path, checkpoint, validation = _validated_current_checkpoint(project_root, commit)
     except EngineeringError:
-        return {"ready": False, "reason": "inexact", "commit": commit}
-    validation = validate_checkpoint(project_root, path, commit)
+        return {"ready": False, "reason": "inexact", "commit": commit}, None
     if not validation["valid"]:
         return {
             "ready": False,
             "reason": validation["reason"],
             "commit": commit,
-        }
+        }, None
     selected = _tracked_manifest_name(project_root)
     if selected is None:
-        return {"ready": False, "reason": "inexact", "commit": commit}
+        return {"ready": False, "reason": "inexact", "commit": commit}, None
     config_path, links_path, _, _ = _project_paths_for_manifest(selected)
     try:
         manifest = _json_at(project_root, commit, config_path)
@@ -6502,17 +7346,23 @@ def check_merge_readiness(root: Path) -> dict:
         _, _, integrity = _validate_overlay(
             project_root, commit, manifest, links, manifest_name=config_path
         )
-        checkpoint = json.loads(path.read_text(encoding="utf-8"))
     except (EngineeringError, OSError, json.JSONDecodeError):
-        return {"ready": False, "reason": "inexact", "commit": commit}
-    if checkpoint["metadata"].get("input_digest") != integrity["input_digest"]:
-        return {"ready": False, "reason": "inexact", "commit": commit}
+        return {"ready": False, "reason": "inexact", "commit": commit}, None
+    if (
+        checkpoint["metadata"].get("input_digest") != integrity["input_digest"]
+        or checkpoint["metadata"].get("inputs") != integrity["inputs"]
+    ):
+        return {"ready": False, "reason": "inexact", "commit": commit}, None
     return {
         "ready": True,
         "reason": "exact_current",
         "commit": commit,
         "checkpoint": str(path),
-    }
+    }, checkpoint
+
+
+def check_merge_readiness(root: Path) -> dict:
+    return _merge_readiness_snapshot(root)[0]
 
 
 def run_full_graph_maintenance(
@@ -6819,7 +7669,7 @@ def retrospective(
     ):
         raise EngineeringError("Engineering retrospective scope must stay inside the project.")
     universe = list(preview["finite_universe"])
-    readiness = check_merge_readiness(project_root)
+    readiness, checkpoint = _merge_readiness_snapshot(project_root)
     if not readiness["ready"]:
         return {
             "schema": "engineering.retrospective.v1",
@@ -6831,7 +7681,6 @@ def retrospective(
             "remediation": [{"action": "recover_canonical_checkpoint", "requires_authority": True}],
             "llm_reconciliation": {"status": "not_available_in_controller"},
         }
-    checkpoint = _load_checkpoint(project_root, commit)
     nodes = {node["id"]: node for node in checkpoint["nodes"]}
     inventory = _retrospective_inventory(manifest, checkpoint, set(universe))
     findings = [
@@ -8011,7 +8860,6 @@ def _path_exists_at_commit(root: Path, commit: str, path: str) -> bool:
         subprocess.run(
             ["git", "-C", str(root), "cat-file", "-e", f"{commit}:{path}"],
             capture_output=True,
-            text=True,
             env=_controller_git_environment(),
         ).returncode
         == 0
@@ -8067,7 +8915,7 @@ def _completion_intent_impact(
     path from evading the owner-intent fence while preserving ordinary
     documentation/test follow-ups and their existing scope/contract checks.
     """
-    base = _load_checkpoint(root, preparation_commit)
+    base = _load_validated_selected_checkpoint(root, preparation_commit)
     base_impact = _intent_impacting(
         base,
         [],
@@ -8095,7 +8943,7 @@ def _completion_intent_impact(
             raise EngineeringError("Engineering feature checkpoint refresh failed.")
         return base_impact
     try:
-        current = _load_checkpoint(root, head)
+        current = _load_validated_current_checkpoint(root, head)
     except (EngineeringError, TraceabilityError) as error:
         if requires_refreshed:
             raise EngineeringError(
@@ -8136,26 +8984,42 @@ def _require_completion_owner_intent(
     )
 
 
-def _dirty_paths(root: Path) -> list[str]:
-    output = subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain", "-z", "--untracked-files=all"],
-        capture_output=True,
-        check=True,
-        env=_controller_git_environment(),
-    ).stdout.decode("utf-8", errors="strict")
+def _git_status_records(root: Path) -> list[tuple[str, tuple[str, ...]]]:
+    try:
+        output = _git_bytes(
+            root, "status", "--porcelain", "-z", "--untracked-files=all"
+        ).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise EngineeringError("Git status returned invalid UTF-8.") from error
     fields = [field for field in output.split("\0") if field]
-    paths: list[str] = []
+    records: list[tuple[str, tuple[str, ...]]] = []
     index = 0
     while index < len(fields):
-        record = fields[index]
-        status, path = record[:2], record[3:]
-        paths.append(path.replace("\\", "/"))
+        field = fields[index]
+        if len(field) < 4:
+            raise EngineeringError("Invalid Git status record.")
+        status, path = field[:2], field[3:]
         index += 1
+        paths = (path,)
         if status[0] in "RC" or status[1] in "RC":
-            if index < len(fields):
-                paths.append(fields[index].replace("\\", "/"))
-                index += 1
-    return list(dict.fromkeys(paths))
+            if index >= len(fields):
+                raise EngineeringError("Invalid Git rename status record.")
+            paths = (path, fields[index])
+            index += 1
+        records.append((status, paths))
+    if output and not output.endswith("\0"):
+        raise EngineeringError("Git status returned an incomplete NUL record.")
+    return records
+
+
+def _dirty_paths(root: Path) -> list[str]:
+    return list(
+        dict.fromkeys(
+            path.replace("\\", "/")
+            for _, paths in _git_status_records(root)
+            for path in paths
+        )
+    )
 
 
 def _maintenance_pending(root: Path) -> bool:
@@ -8341,7 +9205,6 @@ def _is_ancestor_or_equal(
                 descendant,
             ],
             capture_output=True,
-            text=True,
             env=_controller_git_environment(),
         ).returncode
         == 0
@@ -8493,6 +9356,7 @@ def _mutate_maintenance_locked(
     operation: dict,
     *,
     resolved_checkpoint: str | None = None,
+    postpublication_context: dict | None = None,
 ) -> dict:
     project_root = resolve_project_root(str(root))
     _assert_maintenance_lock(project_root, operation)
@@ -8523,27 +9387,53 @@ def _mutate_maintenance_locked(
             changed = True
         results.append(dict(current))
     resolved = []
+    current_resolution = None
     if resolved_checkpoint is not None:
-        checkpoint = _checkpoint_path(project_root, resolved_checkpoint)
-        if not validate_checkpoint(project_root, checkpoint, resolved_checkpoint)["valid"]:
-            raise EngineeringError(
-                "Engineering checkpoint maintenance resolution lacks exact evidence."
+        can_resolve = True
+        if postpublication_context is None:
+            checkpoint_path, checkpoint, validation = _validated_current_checkpoint(
+                project_root, resolved_checkpoint
             )
-        publication = _checkpoint_target(
-            project_root, operation, resolved_checkpoint
-        )
+            if not validation["valid"]:
+                raise EngineeringError(
+                    "Engineering checkpoint maintenance resolution lacks exact evidence."
+                )
+        else:
+            destination = postpublication_context.get("destination")
+            proof = (
+                _postpublication_current_resolution(
+                    project_root, operation, Path(destination)
+                )
+                if isinstance(destination, str)
+                else None
+            )
+            can_resolve = (
+                proof is not None and proof.get("commit") == resolved_checkpoint
+            )
+            if can_resolve:
+                checkpoint_path = Path(proof["checkpoint"])
+                checkpoint = proof["payload"]
+                validation = proof["validation"]
+                current_resolution = {
+                    "commit": proof["commit"],
+                    "checkpoint": proof["checkpoint"],
+                }
+        if can_resolve:
+            publication = _checkpoint_target(
+                project_root, operation, resolved_checkpoint
+            )
+        else:
+            publication = None
         remaining = []
         for current in payload["items"]:
             target = current.get("target")
-            resolves = (
+            resolves = can_resolve and (
                 current["kind"] == "checkpoint_stale"
                 and current["artifact"] == "checkpoint"
                 and isinstance(target, dict)
                 and target.get("lineage") == publication["lineage"]
                 and _is_ancestor_or_equal(
-                    project_root,
-                    target.get("origin_commit"),
-                    resolved_checkpoint,
+                    project_root, target.get("origin_commit"), resolved_checkpoint
                 )
             )
             if resolves:
@@ -8559,7 +9449,10 @@ def _mutate_maintenance_locked(
     if changed:
         payload["items"].sort(key=lambda entry: entry["id"])
         _write_maintenance(project_root, payload)
-    return {"queued": results, "resolved": sorted(resolved)}
+    result = {"queued": results, "resolved": sorted(resolved)}
+    if current_resolution is not None:
+        result["current_resolution"] = current_resolution
+    return result
 
 
 def _prospective_maintenance_ids(
@@ -8916,16 +9809,16 @@ def prepare(
     advisory_codes: list[str] = []
     checkpoint: dict = {"nodes": [], "edges": []}
     checkpoint_path: Path | None = None
-    readiness = check_merge_readiness(project.root)
+    readiness, captured_checkpoint = _merge_readiness_snapshot(project.root)
     if readiness["ready"]:
         checkpoint_path = Path(readiness["checkpoint"])
-        checkpoint = _load_checkpoint(project.root, project.commit)
+        checkpoint = captured_checkpoint
     else:
         recovered = _recover_initial_checkpoint(project)
-        readiness = check_merge_readiness(project.root)
+        readiness, captured_checkpoint = _merge_readiness_snapshot(project.root)
         if readiness["ready"]:
             checkpoint_path = Path(readiness["checkpoint"])
-            checkpoint = _load_checkpoint(project.root, project.commit)
+            checkpoint = captured_checkpoint
             advisory_codes.append("checkpoint_recovered")
         else:
             blocker_codes.append("checkpoint_pending")
@@ -9887,7 +10780,7 @@ def _bound_preparation_owner_intent(preparation: object) -> dict | None:
     owner_intent = preparation.get("owner_intent")
     if owner_intent is None:
         return None
-    expected = {
+    legacy_fields = {
         "schema",
         "state",
         "intent_id",
@@ -9897,13 +10790,26 @@ def _bound_preparation_owner_intent(preparation: object) -> dict | None:
         "intent_impacting",
         "bound_to_scope_handoff",
     }
+    current_fields = legacy_fields | {"post_activation_import_state"}
     if (
         not isinstance(owner_intent, dict)
-        or set(owner_intent) != expected
+        or frozenset(owner_intent)
+        not in {frozenset(legacy_fields), frozenset(current_fields)}
         or owner_intent.get("schema") != OWNER_INTENT_STATUS_SCHEMA
         or owner_intent.get("state") != "bound"
         or owner_intent.get("intent_impacting") is not True
         or owner_intent.get("bound_to_scope_handoff") is not True
+        or (
+            set(owner_intent) == current_fields
+            and (
+                not isinstance(owner_intent.get("post_activation_import_state"), str)
+                or owner_intent["post_activation_import_state"]
+                not in {"required", "complete"}
+            )
+        )
+        or isinstance(owner_intent.get("core_outcome_count"), bool)
+        or not isinstance(owner_intent.get("core_outcome_count"), int)
+        or owner_intent.get("core_outcome_count") < 0
     ):
         raise EngineeringError("Engineering preparation owner intent is unknown or unbound.")
     try:
@@ -9914,7 +10820,7 @@ def _bound_preparation_owner_intent(preparation: object) -> dict | None:
         }
     except EngineeringError as error:
         raise EngineeringError("Engineering preparation owner intent is invalid.") from error
-    if not re.fullmatch(
+    if not isinstance(normalized["owner_intent_digest"], str) or not re.fullmatch(
         r"sha256:[0-9a-f]{64}", normalized["owner_intent_digest"]
     ):
         raise EngineeringError("Engineering preparation owner intent is invalid.")
@@ -10014,7 +10920,38 @@ def complete(
         and initial_head != preparation["project"]["commit"]
         and not check_merge_readiness(project.root)["ready"]
     ):
-        rebuild(project.root, initial_head, sys.executable)
+        semantic_full = False
+        preflight_state = None
+        manifest_name = _tracked_manifest_name_at(project.root, initial_head)
+        if manifest_name is not None:
+            changed_before_refresh, preflight_state = _stable_completion_snapshot(
+                project.root, preparation["project"]["commit"]
+            )
+            if preflight_state["head"] != initial_head or _dirty_paths(project.root):
+                raise EngineeringError(
+                    "Engineering completion authority changed before refresh."
+                )
+            scope = set(preparation["authorization"].get("scope", []))
+            allowed_refresh_paths = scope | {
+                path
+                for path in changed_before_refresh
+                if path.startswith(("docs/", "tests/"))
+            }
+            if not set(changed_before_refresh).issubset(allowed_refresh_paths):
+                raise EngineeringError(
+                    "Engineering completion refresh is outside the prepared scope."
+                )
+            semantic_full = True
+        if preflight_state is not None and _working_state_identity(project.root) != preflight_state:
+            raise EngineeringError(
+                "Engineering completion authority changed before refresh."
+            )
+        rebuild(
+            project.root,
+            sys.executable,
+            target_commit=initial_head,
+            _semantic_full=semantic_full,
+        )
 
     operation = _begin_completion(project.root, run_id)
     try:
@@ -10032,8 +10969,8 @@ def complete(
         }
         authorization = preparation["authorization"]
         scope_handoff = authorization.get("scope_handoff")
-        checkpoint_status = check_merge_readiness(project.root)
-        base_checkpoint = _load_checkpoint(
+        checkpoint_status, current_checkpoint = _merge_readiness_snapshot(project.root)
+        base_checkpoint = _load_validated_selected_checkpoint(
             project.root, preparation["project"]["commit"]
         )
         if _intent_impacting(
@@ -10153,10 +11090,14 @@ def complete(
                 raise EngineeringError("Engineering completion replay conflicts with current tree.")
             return {**retained, "manifest": str(manifest_path)}
 
-        checkpoint = _load_checkpoint(
-            project.root,
-            preparation["project"]["commit"] if dirty else head,
-        )
+        if dirty:
+            checkpoint = _load_validated_selected_checkpoint(
+                project.root, preparation["project"]["commit"]
+            )
+        else:
+            checkpoint = current_checkpoint
+            if checkpoint is None:
+                raise EngineeringError("Engineering completion requires an exact current checkpoint.")
         predicted_paths = {item["id"] for item in preparation["impact"]}
         contract_paths = {
             node["source"]["path"].replace("\\", "/")
@@ -10389,7 +11330,9 @@ def _validate_push_checkpoint(
 ) -> dict:
     commit = git(root, "rev-parse", "HEAD")
     try:
-        checkpoint = _load_checkpoint(root, commit)
+        checkpoint_path, checkpoint, validation = _validated_current_checkpoint(root, commit)
+        if commit in _read_stale(root) or not validation["valid"]:
+            raise TraceabilityError("Checkpoint is not current.")
     except TraceabilityError as error:
         raise TraceabilityError(
             f"No commit-bound graph for {commit}; run rebuild before push."
@@ -10404,11 +11347,14 @@ def _validate_push_checkpoint(
     _, _, integrity = _validate_overlay(
         root, commit, manifest, links, manifest_name=config_path
     )
-    if integrity["input_digest"] != checkpoint["metadata"]["input_digest"]:
+    if (
+        integrity["input_digest"] != checkpoint["metadata"]["input_digest"]
+        or integrity["inputs"] != checkpoint["metadata"]["inputs"]
+    ):
         raise TraceabilityError(
             f"Commit-bound graph for {commit} is stale; run rebuild before push."
         )
-    if not (_checkpoint_path(root, commit).parent / "graph.json").is_file():
+    if not (checkpoint_path.parent / "graph.json").is_file():
         raise TraceabilityError(
             f"Commit-bound graph for {commit} has no Graphify output."
         )
@@ -10473,14 +11419,16 @@ def dispatch_hook(
     if event == "post-checkout":
         commit = git(root, "rev-parse", "HEAD")
         try:
-            checkpoint = _load_checkpoint(root, commit)
+            checkpoint_path, checkpoint, validation = _validated_current_checkpoint(root, commit)
+            if not validation["valid"] or commit in _read_stale(root):
+                raise TraceabilityError("Checkpoint is not current.")
         except EngineeringError:
             return {"event": event, "action": "select", "selected": False}
         return {
             "event": event,
             "action": "select",
             "selected": True,
-            "checkpoint": str(_checkpoint_path(root, commit)),
+            "checkpoint": str(checkpoint_path),
             "kind": checkpoint["metadata"]["kind"],
         }
     if event == "pre-push":
@@ -10540,7 +11488,7 @@ def handle_hook(
 
 
 def _worktree_roots(root: Path) -> list[Path]:
-    output = git(root, "worktree", "list", "--porcelain")
+    output = git(root, "worktree", "list", "--porcelain", raw=True)
     return [
         Path(line.removeprefix("worktree ")).resolve()
         for line in output.splitlines()
@@ -11661,17 +12609,15 @@ def traceability_view(
     declared = config.get("assurance")
     if declared is None:
         declared = {"schema": ASSURANCE_SCHEMA, "capabilities": [], "cells": [], "obligations": []}
-    checkpoint = _load_checkpoint(project_root, target_commit)
-    current_status = status(project_root, target_commit=target_commit)
+    current_status, checkpoint = _status_snapshot(project_root, target_commit=target_commit)
+    if checkpoint is None:
+        checkpoint = {"metadata": {}, "nodes": [], "edges": [], "integrity": {}}
     metadata = checkpoint.get("metadata", {})
     assurance_digest = _json_digest(declared)
-    status_lines = git(project_root, "status", "--porcelain", "--untracked-files=all").splitlines()
+    status_records = _git_status_records(project_root)
     dirty_paths = []
-    for line in status_lines[:256]:
-        path = line[3:] if len(line) >= 4 else line
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        dirty_paths.append(path.replace("\\", "/"))
+    for _, paths in status_records[:256]:
+        dirty_paths.append(paths[0].replace("\\", "/"))
     context = {
         "project": {"identity": metadata.get("project_identity", metadata.get("project", "unknown"))},
         "worktree": {"branch": metadata.get("branch", "unknown")},
@@ -11680,7 +12626,7 @@ def traceability_view(
         "graphify": {"version": GRAPHIFY_VERSION, "commit": GRAPHIFY_COMMIT, "status": "pinned"},
         "overlay": {"digest": metadata.get("input_digest", "unknown")},
         "assurance": {"digest": assurance_digest},
-        "dirty_coverage": {"state": "dirty" if status_lines else "clean", "count": len(status_lines), "paths": dirty_paths, "truncated": len(status_lines) > len(dirty_paths)},
+        "dirty_coverage": {"state": "dirty" if status_records else "clean", "count": len(status_records), "paths": dirty_paths, "truncated": len(status_records) > len(dirty_paths)},
         "authority": {"state": "unknown", "reasons": ["query_does_not_grant_live_authority"]},
         "freshness": current_status.get("freshness", "unknown"),
         "paths": [str(config["source_path"].name).replace("\\", "/")],
@@ -11753,41 +12699,9 @@ def build_execution_context(
         "assertions": normalized_assertions,
         "forbidden_ids": forbidden,
     }
-    owner_intent = preparation.get("owner_intent")
+    owner_intent = _bound_preparation_owner_intent(preparation)
     if owner_intent is not None:
-        expected_owner_intent = {
-            "schema",
-            "state",
-            "intent_id",
-            "owner_intent_digest",
-            "authority_epoch",
-            "core_outcome_count",
-            "intent_impacting",
-            "bound_to_scope_handoff",
-        }
-        if (
-            not isinstance(owner_intent, dict)
-            or set(owner_intent) != expected_owner_intent
-            or owner_intent.get("schema") != OWNER_INTENT_STATUS_SCHEMA
-            or owner_intent.get("state") != "bound"
-            or owner_intent.get("intent_impacting") is not True
-            or owner_intent.get("bound_to_scope_handoff") is not True
-        ):
-            raise EngineeringError(
-                "Engineering execution context owner intent is unknown or unbound."
-            )
-        try:
-            bundle["owner_intent"] = {
-                "intent_id": _assurance_id(owner_intent["intent_id"], "execution owner intent"),
-                "owner_intent_digest": owner_intent["owner_intent_digest"],
-                "authority_epoch": _assurance_id(owner_intent["authority_epoch"], "execution owner intent epoch"),
-            }
-        except EngineeringError as error:
-            raise EngineeringError("Engineering execution context owner intent is invalid.") from error
-        if not re.fullmatch(
-            r"sha256:[0-9a-f]{64}", bundle["owner_intent"]["owner_intent_digest"]
-        ):
-            raise EngineeringError("Engineering execution context owner intent is invalid.")
+        bundle["owner_intent"] = owner_intent
     if not isinstance(bundle["project"]["root_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", bundle["project"]["root_digest"]) or not isinstance(bundle["project"]["commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", bundle["project"]["commit"]):
         raise EngineeringError("Engineering execution context project is invalid.")
     return {**bundle, "digest": _json_digest(bundle)}
@@ -15005,7 +15919,7 @@ def _project_contribution_digest(root: Path) -> str:
         raise EngineeringError("Engineering project Git common directory is invalid.")
     if _identity_git(root, "rev-parse", "--is-shallow-repository") != "false":
         raise EngineeringError("Engineering project Git lineage is shallow or ambiguous.")
-    if _identity_git(root, "for-each-ref", "--format=%(refname)", "refs/replace").strip():
+    if _identity_git(root, "for-each-ref", "--format=%(refname)", "refs/replace", raw=True).strip():
         raise EngineeringError("Engineering project Git lineage contains replace state.")
     graft = Path(_identity_git(root, "rev-parse", "--git-path", "info/grafts"))
     if not graft.is_absolute():
@@ -15067,7 +15981,7 @@ def _terminal_completion(root: Path, completion_id: str) -> tuple[dict, str]:
             completion.get("scope_result"),
             completion.get("scope_result_artifacts"),
         )
-        _load_checkpoint(root, checkpoint["commit"])
+        _load_validated_current_checkpoint(root, checkpoint["commit"])
         valid = (
             completion == expected
             and _successful_check_evidence(preparation["required_checks"], checks)
@@ -16089,7 +17003,7 @@ def _bundle_files(source: Path) -> tuple[list[Path], dict, str, str]:
         repository = _expand_install_path(git(source, "rev-parse", "--show-toplevel")).resolve()
         commit = git(source, "rev-parse", "HEAD")
         relative_source = source.relative_to(repository).as_posix()
-        tracked = git(repository, "ls-files", "--", relative_source).splitlines()
+        tracked = _git_paths(repository, "ls-files", "--", relative_source)
     except (EngineeringError, ValueError) as error:
         raise EngineeringError("Engineering bundle requires an exact Git source commit.") from error
     if git(
@@ -18029,7 +18943,6 @@ def inventory_legacy_outputs(root: Path) -> list[dict]:
                     "graphify-out",
             ],
             capture_output=True,
-            text=True,
             env=_controller_git_environment(),
         ).returncode
             == 0
@@ -18083,7 +18996,6 @@ def clean_legacy_output(root: Path, candidate_path: Path) -> bool:
                     "graphify-out",
                 ],
                 capture_output=True,
-                text=True,
                 env=_controller_git_environment(),
             ).returncode
             != 0
@@ -19132,26 +20044,31 @@ def main() -> int:
                 return 1
         elif arguments.command == "compare":
             result = compare_checkpoints(
-                _load_checkpoint(root, git(root, "rev-parse", arguments.commit_a)),
-                _load_checkpoint(root, git(root, "rev-parse", arguments.commit_b)),
+                _load_query_checkpoint(root, git(root, "rev-parse", arguments.commit_a)),
+                _load_query_checkpoint(root, git(root, "rev-parse", arguments.commit_b)),
             )
         elif arguments.command not in {"maintain", "orphan-status", "orphan-reap"}:
             commit = git(root, "rev-parse", arguments.commit or "HEAD")
-            checkpoint = _load_checkpoint(root, commit)
             if arguments.command == "status":
-                config_path, links_path, _, _ = _project_paths(root)
-                manifest = _json_at(root, commit, config_path)
-                links = _json_at(root, commit, links_path)
-                _, _, integrity = _validate_overlay(root, commit, manifest, links)
-                result = {
-                    "project": checkpoint["metadata"]["project"],
-                    "branch": checkpoint["metadata"]["branch"],
-                    "commit": commit,
-                    "checkpoint_kind": checkpoint["metadata"]["kind"],
-                    "fresh": integrity["input_digest"] == checkpoint["metadata"]["input_digest"],
-                    "integrity": checkpoint["integrity"],
-                }
+                freshness, checkpoint = _status_snapshot(root, target_commit=commit)
+                if freshness["freshness"] != "current":
+                    result = {
+                        "commit": commit,
+                        "fresh": False,
+                        "freshness": "stale",
+                        "reason": freshness.get("reason", "checkpoint_stale"),
+                    }
+                else:
+                    result = {
+                        "project": checkpoint["metadata"]["project"],
+                        "branch": checkpoint["metadata"]["branch"],
+                        "commit": commit,
+                        "checkpoint_kind": checkpoint["metadata"]["kind"],
+                        "fresh": True,
+                        "integrity": checkpoint["integrity"],
+                    }
             else:
+                checkpoint = _load_query_checkpoint(root, commit)
                 result = query_result(
                     arguments.command, checkpoint, getattr(arguments, "identifier", None)
                 )
