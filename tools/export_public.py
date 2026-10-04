@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -16,11 +18,70 @@ class ExportError(RuntimeError):
     pass
 
 
+_AUDIENCE_MODULE: object | None = None
+_METADATA_MODULE: object | None = None
+
+
 def _audience_module():
+    global _AUDIENCE_MODULE
+    if _AUDIENCE_MODULE is not None:
+        return _AUDIENCE_MODULE
     try:
-        return importlib.import_module("check_audience")
-    except ModuleNotFoundError:
-        return importlib.import_module("tools.check_audience")
+        module = importlib.import_module("check_audience")
+    except ModuleNotFoundError as error:
+        if error.name != "check_audience":
+            raise
+        source = Path(__file__).resolve().with_name("check_audience.py")
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export_audience_guard", source
+        )
+        if spec is None or spec.loader is None:
+            raise ExportError("audience guard cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    _AUDIENCE_MODULE = module
+    return module
+
+
+def _metadata_module():
+    global _METADATA_MODULE
+    if _METADATA_MODULE is not None:
+        return _METADATA_MODULE
+    try:
+        module = importlib.import_module("metadata_projection")
+    except ModuleNotFoundError as error:
+        if error.name != "metadata_projection":
+            raise
+        source = Path(__file__).resolve().with_name("metadata_projection.py")
+        for loaded in tuple(sys.modules.values()):
+            if getattr(loaded, "__file__", None) and Path(loaded.__file__).resolve() == source:
+                _METADATA_MODULE = loaded
+                return loaded
+        spec = importlib.util.spec_from_file_location(
+            "engineering_public_export_metadata_projection", source
+        )
+        if spec is None or spec.loader is None:
+            raise ExportError("metadata receipt verifier cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    _METADATA_MODULE = module
+    return module
+
+
+def _origin_repository(root: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        capture_output=True,
+    )
+    if result.returncode:
+        return None
+    value = result.stdout.decode("utf-8", errors="strict").strip()
+    match = re.fullmatch(
+        r"(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match else None
 
 
 def _git_common(root: Path) -> Path:
@@ -81,6 +142,10 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _bytes_digest(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
 def _source_commit(root: Path) -> str:
     result = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -92,6 +157,36 @@ def _source_commit(root: Path) -> str:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ExportError("source commit is invalid")
     return commit
+
+
+def _source_tree(root: Path, commit: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{commit}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tree = result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        raise ExportError("source tree is invalid")
+    return tree
+
+
+def _git_blob_bytes(root: Path, commit: str, relative: str) -> bytes:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", commit)
+        or not relative
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+    ):
+        raise ExportError("source Git object identity is invalid")
+    result = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "blob", f"{commit}:{relative}"],
+        capture_output=True,
+    )
+    if result.returncode:
+        raise ExportError("source Git object is unavailable")
+    return result.stdout
 
 
 def _assert_clean_head_snapshot(root: Path, files: list[str]) -> None:
@@ -144,7 +239,20 @@ def _tree_digest(root: Path, files: list[str]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _validate_audience_classification(source: Path, shared_files: list[str]) -> set[str]:
+def _git_tree_digest(root: Path, commit: str, files: list[str]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(files):
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(_git_blob_bytes(root, commit, relative) + b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
+def _validate_audience_classification(
+    source: Path,
+    shared_files: list[str],
+    *,
+    destination: Path,
+) -> set[str]:
     path = source / "release" / "audience-classification.json"
     if not path.exists():
         return set()
@@ -200,6 +308,10 @@ def _validate_audience_classification(source: Path, shared_files: list[str]) -> 
     for relative in public:
         if os.path.lexists(source / relative):
             raise ExportError("public-only file is present in the canonical source")
+        try:
+            _safe_file(destination, relative)
+        except ExportError as error:
+            raise ExportError("public-only destination file is unavailable") from error
     return audience_specific
 
 
@@ -277,13 +389,14 @@ def export_tree(
     source: Path,
     destination: Path,
     metadata: dict[str, object] | None = None,
+    metadata_bindings: dict[str, dict[str, object]] | None = None,
 ) -> dict:
     source = Path(source).resolve()
     destination = Path(destination).resolve()
     destination_git = destination / ".git"
     if (
         not (source / ".git").exists()
-        or not destination_git.is_dir()
+        or not (destination_git.is_dir() or destination_git.is_file())
         or destination_git.is_symlink()
         or bool(
             getattr(destination_git.lstat(), "st_file_attributes", 0)
@@ -291,8 +404,19 @@ def export_tree(
         )
     ):
         raise ExportError("source and destination must be independent Git repositories")
-    if _git_common(source) == _git_common(destination):
+    source_common = _git_common(source)
+    destination_common = _git_common(destination)
+    if source_common == destination_common:
         raise ExportError("public export must use independent Git history")
+    if (
+        not destination_common.is_dir()
+        or destination_common.is_symlink()
+        or bool(
+            getattr(destination_common.lstat(), "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
+    ):
+        raise ExportError("public export destination Git directory is unsafe")
     manifest_path = source / "release" / "public-export.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if (
@@ -305,17 +429,83 @@ def export_tree(
     files = manifest["files"]
     _assert_clean_head_snapshot(source, files)
     source_commit = _source_commit(source)
-    audience_specific = _validate_audience_classification(source, files)
-    policy, policy_blockers = _audience_policy(
-        source, destination, files, metadata
+    source_git_tree = _source_tree(source, source_commit)
+    audience_specific = _validate_audience_classification(
+        source, files, destination=destination
     )
+    snapshot_metadata = None
+    receipt_blockers: list[str] = []
+    metadata_receipts: dict[str, dict] = {}
+    if metadata is not None:
+        verifier = _metadata_module()
+        audiences = {"source", "distribution"}
+        if (not isinstance(metadata, dict) or set(metadata) != audiences
+                or not isinstance(metadata_bindings, dict) or set(metadata_bindings) != audiences):
+            receipt_blockers.append("metadata_receipt_unverified")
+        else:
+            try:
+                expected = {
+                    "source": (source, _source_commit(source)),
+                    "distribution": (destination, _source_commit(destination)),
+                }
+            except (OSError, subprocess.SubprocessError, ExportError):
+                expected = {}
+                receipt_blockers.append("metadata_receipt_unverified")
+            verified: dict[str, dict] = {}
+            for audience, (root, commit) in expected.items():
+                collection = metadata[audience]
+                repository = _origin_repository(root)
+                binding = metadata_bindings[audience]
+                if (
+                    repository is None
+                    or not isinstance(binding, dict)
+                    or set(binding) != {"pr", "head", "head_repository", "head_ref"}
+                    or not isinstance(binding.get("pr"), int)
+                    or isinstance(binding.get("pr"), bool)
+                    or not isinstance(binding.get("head"), str)
+                    or not isinstance(binding.get("head_repository"), str)
+                    or not isinstance(binding.get("head_ref"), str)
+                    or not verifier.verify_collection(
+                        collection, audience, repository, commit, binding["head"], binding["pr"],
+                        head_repository=binding["head_repository"], head_ref=binding["head_ref"],
+                        require_production=True,
+                    )
+                ):
+                    receipt_blockers.append("metadata_receipt_unverified")
+                    break
+                snapshot = verifier.consume_collection(
+                    collection, audience, repository, commit, binding["head"], binding["pr"],
+                    head_repository=binding["head_repository"], head_ref=binding["head_ref"],
+                    require_production=True,
+                )
+                if snapshot is None:
+                    receipt_blockers.append("metadata_receipt_unverified")
+                    break
+                verified[audience] = snapshot
+                metadata_receipts[audience] = json.loads(json.dumps(collection.receipt))
+            if not receipt_blockers and set(verified) == set(expected):
+                snapshot_metadata = verified
+            else:
+                receipt_blockers.append("metadata_receipt_unverified")
+    if receipt_blockers:
+        policy, policy_blockers = None, sorted(set(receipt_blockers))
+    else:
+        policy, policy_blockers = _audience_policy(
+            source, destination, files, snapshot_metadata
+        )
     audience_specific_files = _audience_specific_receipt(
         destination, audience_specific, policy
     )
     sources = {relative: _safe_file(source, relative) for relative in files}
-    source_tree_digest = _tree_digest(source, files)
+    source_blobs = {
+        relative: _git_blob_bytes(source, source_commit, relative)
+        for relative in files
+    }
+    source_tree_digest = _git_tree_digest(source, source_commit, files)
     source_snapshot_digest = _snapshot_digest(source_commit, source_tree_digest)
-    receipt_path = _safe_destination(destination_git, "engineering-public-export.json")
+    receipt_path = _safe_destination(
+        destination_common, "engineering-public-export.json"
+    )
     previous = {}
     if receipt_path.is_file():
         retained = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -325,6 +515,7 @@ def export_tree(
             in {
                 "engineering.public-export-receipt.v2",
                 "engineering.public-export-receipt.v3",
+                "engineering.public-export-receipt.v4",
             }
             and isinstance(retained.get("files"), dict)
         ):
@@ -347,17 +538,25 @@ def export_tree(
         target = _safe_destination(destination, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
         target = _safe_destination(destination, relative)
-        shutil.copy2(source_path, target)
+        target.write_bytes(source_blobs[relative])
+        shutil.copymode(source_path, target)
     destination_tree_digest = _tree_digest(destination, files)
     if destination_tree_digest != source_tree_digest:
         raise ExportError("same-snapshot byte parity failed")
     receipt = {
-        "schema": "engineering.public-export-receipt.v3",
+        "schema": "engineering.public-export-receipt.v4",
         "files": {relative: _file_digest(destination / relative) for relative in files},
         "source_commit": source_commit,
+        "source_git_tree": source_git_tree,
         "tree_digest": destination_tree_digest,
         "source_snapshot_digest": source_snapshot_digest,
-        "manifest_digest": _file_digest(manifest_path),
+        "manifest_digest": _bytes_digest(
+            _git_blob_bytes(
+                source,
+                source_commit,
+                "release/public-export.json",
+            )
+        ),
         "audience_specific_files": audience_specific_files,
         "metadata_snapshot_digests": {
             audience: "sha256:"
@@ -366,8 +565,9 @@ def export_tree(
                     snapshot, sort_keys=True, separators=(",", ":")
                 ).encode("utf-8")
             ).hexdigest()
-            for audience, snapshot in sorted((metadata or {}).items())
+            for audience, snapshot in sorted((snapshot_metadata or {}).items())
         },
+        "metadata_collection_receipts": metadata_receipts,
     }
     _atomic_private_text(receipt_path, json.dumps(receipt, indent=2) + "\n")
     blockers = list(policy_blockers)
@@ -378,6 +578,7 @@ def export_tree(
         "schema": "engineering.public-export-result.v1",
         "tree_digest": destination_tree_digest,
         "source_commit": source_commit,
+        "source_git_tree": source_git_tree,
         "source_snapshot_digest": source_snapshot_digest,
         "file_count": len(files),
         "publication_ready": not blockers,
@@ -389,9 +590,48 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="export-public")
     parser.add_argument("source")
     parser.add_argument("destination")
+    parser.add_argument("--verified-account")
+    for audience in ("source", "distribution"):
+        parser.add_argument(f"--{audience}-pr", type=int)
+        parser.add_argument(f"--{audience}-head")
+        parser.add_argument(f"--{audience}-head-repository")
+        parser.add_argument(f"--{audience}-head-ref")
     arguments = parser.parse_args()
     try:
-        result = export_tree(Path(arguments.source), Path(arguments.destination))
+        bindings = {
+            audience: {
+                "pr": getattr(arguments, f"{audience}_pr"),
+                "head": getattr(arguments, f"{audience}_head"),
+                "head_repository": getattr(arguments, f"{audience}_head_repository"),
+                "head_ref": getattr(arguments, f"{audience}_head_ref"),
+            }
+            for audience in ("source", "distribution")
+        }
+        requested_metadata = arguments.verified_account is not None or any(
+            value is not None for binding in bindings.values() for value in binding.values()
+        )
+        if requested_metadata:
+            if (not arguments.verified_account
+                    or any(value is None for binding in bindings.values() for value in binding.values())):
+                raise ExportError("both audience bindings and verified account are required")
+            metadata_module = _metadata_module()
+            roots = {"source": Path(arguments.source).resolve(),
+                     "distribution": Path(arguments.destination).resolve()}
+            metadata = {}
+            for audience, root in roots.items():
+                repository = _origin_repository(root)
+                commit = _source_commit(root)
+                binding = bindings[audience]
+                if not repository or not commit:
+                    raise ExportError("audience repository identity is unavailable")
+                metadata[audience] = metadata_module.collect_authenticated_metadata(
+                    audience, repository, commit, binding["head"], binding["pr"],
+                    arguments.verified_account, binding["head_repository"], binding["head_ref"],
+                )
+            result = export_tree(roots["source"], roots["distribution"],
+                                 metadata=metadata, metadata_bindings=bindings)
+        else:
+            result = export_tree(Path(arguments.source), Path(arguments.destination))
     except (OSError, ValueError, subprocess.SubprocessError, ExportError) as error:
         print(f"ERROR: {error}")
         return 2

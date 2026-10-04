@@ -1,0 +1,314 @@
+{
+  "schema": "engineering.v2.2.6-owner-requirements.v2",
+  "requirements": [
+    {
+      "id": "complete_owner_obligation_ledger",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Complete generic obligation DAG"},
+      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "_normalize_registry"},
+      "runtime_behavior": "Require every inherited and post-activation owner obligation, dependency, disposition, acceptance criterion, and dispatch gate without embedding populated outcomes.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_requirement_registry_has_complete_generic_obligation_dag"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v226_requirement_registry_has_complete_generic_obligation_dag", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "authenticated_execution_envelopes",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Authenticated host execution envelopes"},
+      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "_host_execution_envelope"},
+      "runtime_behavior": "Resolve a native-host-authenticated external envelope, exact UTF-8 meta and log bytes, argv, cwd, role, pre/post artifact, exit, parsed counts, incidents, and distinct independent audits.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_release_matrix_rejects_fabricated_native_evidence"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v226_release_matrix_rejects_fabricated_native_evidence", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "deterministic_release_matrix",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Generated matrix and evidence gates"},
+      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "generate_matrix"},
+      "runtime_behavior": "Generate complete exact-artifact rows and fail closed for omission, Unknown, or insufficient proxy evidence.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_release_matrix_is_exact_complete_and_fail_closed"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v226_release_matrix_is_exact_complete_and_fail_closed", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "exact_release_install_binding",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Exact release and installation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "install_bundle"},
+      "runtime_behavior": "Bind token, authorization, copied source, commit, tree, digest, receipt, install, and rollback to one exact artifact.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_actual_install_receipt_reconciles_the_signed_source_bundle"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_actual_install_receipt_reconciles_the_signed_source_bundle", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "external_owner_authority",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "External owner authority"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_active_owner_intent"},
+      "runtime_behavior": "Resolve owner authority only from authenticated host-owned state; Engineering cannot mint approval.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_owner_intent_requires_external_host_signature"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_owner_intent_requires_external_host_signature", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "external_owner_source_projection",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-audit10-semantic-repair.md", "section": "External owner-source semantics"},
+      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "_validate_native_decision_source_receipt"},
+      "runtime_behavior": "Require a host-signed exact source kind and complete requirement/obligation mapping; a native decision receipt binds immutable proposal and approval records plus exactly nine safeguard mappings. Candidate projection, omission, substitution, or conflict fails closed.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_native_decision_source_rejects_changed_native_evidence"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v226_native_decision_source_rejects_changed_native_evidence", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "git_object_byte_identity",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Exact release and installation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_git_blob_bytes"},
+      "runtime_behavior": "Derive bundle and export identity and copied bytes from exact Git objects across checkout EOL settings.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_bundle_identity_and_install_bytes_are_stable_across_checkout_eol"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_bundle_identity_and_install_bytes_are_stable_across_checkout_eol", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "host_private_postactivation_trust",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Non-circular bootstrap and host trust"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_host_v226_bootstrap_authorization"},
+      "runtime_behavior": "Keep post-activation trust and intent state at a host-owned private boundary outside candidate Git and preserve restart state.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_bound_owner_intent_stays_in_private_controller_state"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_bound_owner_intent_stays_in_private_controller_state", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "hostile_git_environment",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Isolation and paired distribution"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_controller_git_environment"},
+      "runtime_behavior": "Ignore ambient GIT routing substitution while preserving the intended repository identity.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_controller_git_and_project_resolution_ignore_hostile_git_routing"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_controller_git_and_project_resolution_ignore_hostile_git_routing", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "independent_equivalence",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Predecessor and survival completeness"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_outcome_survival_v2"},
+      "runtime_behavior": "Require an external owner exception or distinct independent equivalence evidence for non-included outcomes.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_replacement_requires_an_independent_equivalence_reviewer"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_replacement_requires_an_independent_equivalence_reviewer", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "independent_exact_artifact_acceptance",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Typed evidence and independent acceptance"},
+      "contract": {"path": "tools/v226_release_matrix.py", "symbol": "_independent_audit"},
+      "runtime_behavior": "Require fresh distinct semantic and technical-security host audit receipts for the exact artifact; product tests and implementer self-report cannot satisfy acceptance.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_release_matrix_is_exact_complete_and_fail_closed"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "external-signed-audits:semantic+technical_security", "environment": "fresh_exact_artifact_independent_audit"}
+    },
+    {
+      "id": "intent_digest_continuity",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Refreshed intent impact and continuity"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "complete"},
+      "runtime_behavior": "Carry the exact owner-intent digest through execution, handoffs, completion, and compaction and reject tampering.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_execution_context_carries_owner_intent_digest_and_rejects_tampering"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_execution_context_carries_owner_intent_digest_and_rejects_tampering", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "model_routing_disclosure",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Native outcome and routing proof"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_delivery_evaluation_path"},
+      "runtime_behavior": "Retain typed model, reasoning, owner override, execution target, and scope with provider-neutral Unknown handling.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_delivery_evaluation_requires_typed_provider_neutral_routing_disclosure"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "unit", "interface": "python-unittest-selector:test_delivery_evaluation_requires_typed_provider_neutral_routing_disclosure", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "native_harness_real_outcome_gate",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Native outcome and routing proof"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_evidence_satisfies_requirements"},
+      "runtime_behavior": "Require proven Codex and Claude native end-to-end execution rather than hooks, MCP, unit, or proxy inference.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_unit_evidence_cannot_satisfy_real_native_harness_requirement"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome", "interface": "native-codex-and-claude-harness", "environment": "installed_v2.2.6_real_one_declaration_execution"}
+    },
+    {
+      "id": "noncircular_bootstrap",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Non-circular bootstrap and host trust"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "v226_bootstrap_handoff_status"},
+      "runtime_behavior": "Authorize the first v2.2.6 delivery from v2.2.5, recorded owner approval, and two exact audits without calling the future gate.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_v226_bootstrap_acceptance_does_not_call_postactivation_trust"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v226_bootstrap_acceptance_does_not_call_postactivation_trust", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "outcome_survival_baseline",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Predecessor and survival completeness"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_outcome_survival_v2"},
+      "runtime_behavior": "Inject the controller outcome baseline and reject missing mappings, candidate self-exclusion, or unauthorized deferral.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_outcome_survival_lists_each_missing_baseline_mapping"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_outcome_survival_lists_each_missing_baseline_mapping", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "postactivation_all_outcomes_binding",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Post-activation all-outcome binding"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "dependent_dispatch_status"},
+      "runtime_behavior": "Block every downstream product or accepted-owner-outcome lane until all recorded categories are imported and completeness-bound after activation.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_postactivation_import_is_required_before_successor_or_frontend_dispatch"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome", "interface": "host-private-owner-intent-completeness", "environment": "activated_v2.2.6_before_downstream_dispatch"}
+    },
+    {
+      "id": "per_outcome_dispatch_mapping",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-audit10-semantic-repair.md", "section": "Per-outcome dependent-dispatch completeness"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_owner_intent_import"},
+      "runtime_behavior": "Require every active later outcome to bind its design, contract, runtime behavior, negative test, native or served evidence contract, and exact artifact before any dependent dispatch.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_postactivation_import_requires_complete_per_outcome_design_evidence_mapping"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_postactivation_import_requires_complete_per_outcome_design_evidence_mapping", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "readme_native_observability_truth",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-audit10-semantic-repair.md", "section": "Native observability truthfulness"},
+      "contract": {"path": "README.md", "symbol": "Native observability and limits"},
+      "runtime_behavior": "Disclose actual project-local evidence capabilities and explicit telemetry, dashboard, token/cost, projection, and authority limits before adjacent-tool comparisons.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_readme_native_observability_is_truthful_and_precedes_comparisons"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_readme_native_observability_is_truthful_and_precedes_comparisons", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "predecessor_disposition",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Predecessor and survival completeness"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_active_owner_intent"},
+      "runtime_behavior": "Reject a successor binding unless every active predecessor outcome has explicit carry-forward or disposition semantics.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_owner_intent_successor_requires_explicit_complete_predecessor_dispositions"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_owner_intent_successor_requires_explicit_complete_predecessor_dispositions", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "public_sanitized_parity",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Isolation and paired distribution"},
+      "contract": {"path": "tools/export_public.py", "symbol": "export_tree"},
+      "runtime_behavior": "Preserve exact shared-byte parity and require declared audience-specific and public-only destination artifacts.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_public_export_requires_every_declared_public_only_destination_file"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_public_export_requires_every_declared_public_only_destination_file", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "refreshed_intent_impact",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Refreshed intent impact and continuity"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_intent_impacting"},
+      "runtime_behavior": "Use base plus refreshed/current exact checkpoints and fail closed for new or unrepresented material paths.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_existing_unrepresented_governance_and_unknown_paths_require_refresh"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_existing_unrepresented_governance_and_unknown_paths_require_refresh", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "transactional_install_preimages",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Exact release and installation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_remove_install_path"},
+      "runtime_behavior": "Revalidate exact or absent source and target preimages plus lexical reparse ancestors at every bounded replace, removal, cleanup, install, and rollback effect.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_transaction_cleanup_preserves_a_substituted_published_target"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_transaction_cleanup_preserves_a_substituted_published_target", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "typed_evidence_hierarchy",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Typed evidence and independent acceptance"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "_evidence_satisfies_requirements"},
+      "runtime_behavior": "Prevent lower evidence classes from satisfying higher owner-required evidence classes or environments.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_unit_evidence_cannot_satisfy_real_native_harness_requirement"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "unit", "interface": "python-unittest-selector:test_unit_evidence_cannot_satisfy_real_native_harness_requirement", "environment": "isolated_exact_git_contract_fixture"}
+    },
+    {
+      "id": "external_consumer_authority",
+      "lifecycle_state": "post_activation_required",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "External consumer authority and non-impersonation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "dependent_dispatch_status"},
+      "runtime_behavior": "Keep external-consumer authority and acceptance in an external owner receipt; Engineering may validate the receipt but cannot impersonate or mint that consumer decision.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_external_consumer_authority_remains_external_and_unbound"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome", "interface": "decision-studio-external-owner-receipt", "environment": "activated_v2.2.6_host_boundary"}
+    },
+    {
+      "id": "graph_execution_semantics",
+      "lifecycle_state": "post_activation_required",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Graph execution truth obligations"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "dependent_dispatch_status"},
+      "runtime_behavior": "Bind false-edge rejection, Amdahl-aware parallelism, fresh-verifier enforcement, and graph-derived critical-path proof as separate post-activation outcomes.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_graph_semantic_owner_obligations_are_explicit_and_unbound"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome", "interface": "native-graph-execution-receipts", "environment": "activated_v2.2.6_exact_project_graph"}
+    },
+    {
+      "id": "graph_one_writer_enforcement",
+      "lifecycle_state": "post_activation_required",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Graph execution truth obligations"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "dependent_dispatch_status"},
+      "runtime_behavior": "Enforce one writer for every mutable resource across the full admitted graph, not only the current process or scalar task summary.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_graph_one_writer_is_full_graph_and_postactivation"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome", "interface": "full-graph-resource-lease-receipts", "environment": "activated_v2.2.6_multi_lane_graph"}
+    },
+    {
+      "id": "named_consumer_contract_correction",
+      "lifecycle_state": "post_activation_required",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "External consumer authority and non-impersonation"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "dependent_dispatch_status"},
+      "runtime_behavior": "Keep the named direct-consumer correction as its own owner-approved dependency before broader consumer integration or frontend release.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_named_consumer_correction_is_a_separate_downstream_gate"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome", "interface": "named-direct-consumer-capability-contract", "environment": "served_synthetic_and_disposable_read_only_live_data"}
+    },
+    {
+      "id": "adjacent_tool_comparison_gate",
+      "lifecycle_state": "post_activation_required",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "Adjacent orchestrator comparison gate"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "dependent_dispatch_status"},
+      "runtime_behavior": "Require a factual current LangGraph and Langfuse capability/dependency comparison before any adjacent dependency is proposed, while keeping both absent or deferred by default.",
+      "negative_test": {"path": "tests/test_repository.py", "selector": "test_v226_adjacent_tool_comparison_is_factual_and_dependency_scanned"},
+      "native_evidence": {"gate": "post_activation", "minimum_class": "real_outcome", "interface": "adjacent-tool-comparison-and-dependency-scan", "environment": "current_authoritative_sources_and_exact_runtime_dependencies"}
+    },
+    {
+      "id": "v060_incident_regression",
+      "lifecycle_state": "implemented",
+      "design": {"path": "docs/specs/engineering-v2.2.6-release-traceability.md", "section": "v0.6.0 incident regression"},
+      "contract": {"path": ".agents/skills/engineering/scripts/engineering.py", "symbol": "release_gate"},
+      "runtime_behavior": "Reject a policy-kernel/unit-only candidate that excludes required executable native graph and autonomous no-steering outcomes.",
+      "negative_test": {"path": ".agents/skills/engineering/tests/test_engineering.py", "selector": "test_v060_proxy_only_self_exclusion_cannot_receive_release_token"},
+      "native_evidence": {"gate": "artifact_acceptance", "minimum_class": "integration", "interface": "python-unittest-selector:test_v060_proxy_only_self_exclusion_cannot_receive_release_token", "environment": "isolated_exact_git_contract_fixture"}
+    }
+  ],
+  "obligations": [
+    {"id":"graphify_base_checkpoint","category":"graphify_overlay","phase":"inherited","dependencies":[],"disposition":{"state":"included","reason":"Canonical default-branch Graphify evidence remains the base graph."},"acceptance_criteria":{"evidence_class":"integration","interface":"graphify update/query checkpoint","environment":"exact project default-branch checkpoint","fail_closed":true},"dispatch_gate":"checkpoint_identity_current"},
+    {"id":"deterministic_engineering_overlay","category":"graphify_overlay","phase":"inherited","dependencies":["graphify_base_checkpoint"],"disposition":{"state":"included","reason":"Verified Engineering links and decisions remain separate from generated Graphify output."},"acceptance_criteria":{"evidence_class":"integration","interface":"Engineering overlay catalogue","environment":"exact project and Git common directory","fail_closed":true},"dispatch_gate":"overlay_integrity_current"},
+    {"id":"trace_coverage_impact_why_views","category":"trace_coverage_impact_why","phase":"inherited","dependencies":["deterministic_engineering_overlay"],"disposition":{"state":"included","reason":"Trace, coverage, impact, and why views survive as explicit controller outcomes."},"acceptance_criteria":{"evidence_class":"integration","interface":"trace coverage impact why commands","environment":"exact checkpoint plus overlay","fail_closed":true},"dispatch_gate":"traceability_resolved"},
+    {"id":"project_setup_preview_authority","category":"setup_checkpoint_completion","phase":"inherited","dependencies":["graphify_base_checkpoint"],"disposition":{"state":"included","reason":"Setup stays preview-first and separately authorized."},"acceptance_criteria":{"evidence_class":"integration","interface":"setup preview and approve-setup","environment":"unmanaged and managed project fixtures","fail_closed":true},"dispatch_gate":"setup_authority_current"},
+    {"id":"checkpoint_integrity","category":"setup_checkpoint_completion","phase":"inherited","dependencies":["project_setup_preview_authority"],"disposition":{"state":"included","reason":"Preparation and completion bind canonical checkpoint identity and integrity."},"acceptance_criteria":{"evidence_class":"integration","interface":"prepare and checkpoint catalogue","environment":"clean exact Git commit","fail_closed":true},"dispatch_gate":"checkpoint_integrity_current"},
+    {"id":"completion_outcome_survival","category":"setup_checkpoint_completion","phase":"inherited","dependencies":["checkpoint_integrity","trace_coverage_impact_why_views"],"disposition":{"state":"included","reason":"Completion compares refreshed impact and outcome survival rather than task status."},"acceptance_criteria":{"evidence_class":"end_to_end","interface":"complete and outcome-survival.v2","environment":"base plus refreshed exact checkpoints","fail_closed":true},"dispatch_gate":"outcome_survival_complete"},
+    {"id":"authority_persistence","category":"authority_persistence","phase":"inherited","dependencies":["project_setup_preview_authority"],"disposition":{"state":"included","reason":"Exact authority persists only across unchanged retries and epochs."},"acceptance_criteria":{"evidence_class":"integration","interface":"owner intent and approval receipts","environment":"host-owned private controller boundary","fail_closed":true},"dispatch_gate":"authority_scope_current"},
+    {"id":"bounded_maintenance","category":"maintenance","phase":"inherited","dependencies":["checkpoint_integrity","authority_persistence"],"disposition":{"state":"included","reason":"Maintenance remains one bounded foreground pass over mechanically verified work."},"acceptance_criteria":{"evidence_class":"integration","interface":"maintenance queue pass","environment":"project-local queue and one writer","fail_closed":true},"dispatch_gate":"maintenance_scope_admitted"},
+    {"id":"semantic_traceability_matrices","category":"semantic_matrices","phase":"inherited","dependencies":["completion_outcome_survival"],"disposition":{"state":"included","reason":"Semantic traceability and release matrices are deterministic and exact-artifact bound."},"acceptance_criteria":{"evidence_class":"integration","interface":"release matrix and semantic trace rows","environment":"exact Git object bytes plus authenticated host evidence","fail_closed":true},"dispatch_gate":"semantic_matrix_complete"},
+    {"id":"capability_assurance","category":"capability_assurance","phase":"inherited","dependencies":["semantic_traceability_matrices"],"disposition":{"state":"included","reason":"Capability assurance distinguishes source, activation, interfaces, and verified-current evidence."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"capability ledger","environment":"intended active runtime and interface","fail_closed":true},"dispatch_gate":"capability_ledger_complete"},
+    {"id":"project_local_learning","category":"learning","phase":"inherited","dependencies":["bounded_maintenance"],"disposition":{"state":"included","reason":"Learning remains project-local until independent cross-project proof and owner promotion."},"acceptance_criteria":{"evidence_class":"integration","interface":"learning contribution queue","environment":"project-local retained evidence","fail_closed":true},"dispatch_gate":"learning_scope_verified"},
+    {"id":"project_identity_binding","category":"project_identity","phase":"inherited","dependencies":["checkpoint_integrity"],"disposition":{"state":"included","reason":"Every controller and release effect binds the exact intended repository identity."},"acceptance_criteria":{"evidence_class":"integration","interface":"repository identity and Git object binding","environment":"hostile routing environment","fail_closed":true},"dispatch_gate":"project_identity_exact"},
+    {"id":"measurement_truth","category":"measurement","phase":"inherited","dependencies":["project_identity_binding"],"disposition":{"state":"included","reason":"Measurements derive from privacy-safe native receipts and retain Unknown facts."},"acceptance_criteria":{"evidence_class":"integration","interface":"delivery evaluation receipt","environment":"native host receipt boundary","fail_closed":true},"dispatch_gate":"measurement_evidence_resolved"},
+    {"id":"first_pass_incident_preservation","category":"first_pass","phase":"inherited","dependencies":["measurement_truth"],"disposition":{"state":"included","reason":"Observed first-pass losses and later failures remain durable exact-role incidents."},"acceptance_criteria":{"evidence_class":"integration","interface":"authenticated incident envelope","environment":"exact log and meta bytes","fail_closed":true},"dispatch_gate":"incident_history_reconciled"},
+    {"id":"false_acceptance_prevention","category":"false_acceptance","phase":"inherited","dependencies":["semantic_traceability_matrices","first_pass_incident_preservation"],"disposition":{"state":"included","reason":"Proxy, self-report, missing, stale, and role-conflicted evidence cannot create acceptance."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"independent exact-artifact acceptance gate","environment":"distinct semantic and technical auditors","fail_closed":true},"dispatch_gate":"independent_acceptance_current"},
+    {"id":"graph_engineering_contract","category":"graph_engineering","phase":"inherited","dependencies":["deterministic_engineering_overlay","false_acceptance_prevention"],"disposition":{"state":"included","reason":"Graph engineering remains deterministic, project-bound, and outcome-survival checked."},"acceptance_criteria":{"evidence_class":"integration","interface":"Graphify plus Engineering controller contract","environment":"exact graph checkpoint and overlay","fail_closed":true},"dispatch_gate":"graph_engineering_current"},
+    {"id":"graph_false_edge_rejection","category":"graph_execution_truth","phase":"post_activation","dependencies":["graph_engineering_contract"],"disposition":{"state":"included","reason":"Execution graphs must reject unsupported dependency edges instead of manufacturing parallelism or completion paths."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"native graph edge provenance receipt","environment":"activated v2.2.6 exact project graph","fail_closed":true},"dispatch_gate":"graph_edges_semantically_verified"},
+    {"id":"graph_amdahl_parallelism_semantics","category":"graph_execution_truth","phase":"post_activation","dependencies":["graph_false_edge_rejection"],"disposition":{"state":"included","reason":"Parallelism claims must retain serial work and use measured Amdahl-aware semantics."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"native fan-out fan-in timing receipt","environment":"measured exact execution DAG","fail_closed":true},"dispatch_gate":"parallelism_measurement_truth_verified"},
+    {"id":"graph_fresh_verifier_enforcement","category":"graph_execution_truth","phase":"post_activation","dependencies":["graph_false_edge_rejection"],"disposition":{"state":"included","reason":"Acceptance must use a fresh verifier that did not author or execute the candidate result."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"independent verifier identity and freshness receipt","environment":"exact current graph artifact","fail_closed":true},"dispatch_gate":"fresh_verifier_current"},
+    {"id":"graph_critical_path_enforcement","category":"graph_execution_truth","phase":"post_activation","dependencies":["graph_amdahl_parallelism_semantics","graph_fresh_verifier_enforcement"],"disposition":{"state":"included","reason":"Critical-path enforcement derives from the admitted dependency graph rather than a caller scalar."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"native graph critical-path receipt","environment":"exact measured dependency DAG","fail_closed":true},"dispatch_gate":"critical_path_graph_verified"},
+    {"id":"graph_full_one_writer_enforcement","category":"graph_execution_truth","phase":"post_activation","dependencies":["graph_critical_path_enforcement"],"disposition":{"state":"included","reason":"Every mutable resource in the full graph has one admitted writer and collision-safe recovery."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"graph resource lease and writer receipt","environment":"all active graph lanes and mutable resources","fail_closed":true},"dispatch_gate":"full_graph_one_writer_verified"},
+    {"id":"readme_contract_truth","category":"readme","phase":"inherited","dependencies":["graph_engineering_contract"],"disposition":{"state":"included","reason":"README and shared documentation describe only current governed behavior."},"acceptance_criteria":{"evidence_class":"integration","interface":"repository documentation truth gate","environment":"internal and sanitized public trees","fail_closed":true},"dispatch_gate":"documentation_truth_current"},
+    {"id":"langfuse_deferred","category":"langfuse_deferment","phase":"inherited","dependencies":["measurement_truth"],"disposition":{"state":"deferred","reason":"Langfuse remains explicitly deferred; no runtime dependency or hidden activation is admitted."},"acceptance_criteria":{"evidence_class":"design","interface":"explicit deferral ledger","environment":"source and runtime dependency scan","fail_closed":true},"dispatch_gate":"langfuse_absence_verified"},
+    {"id":"v226_activation_boundary","category":"postactivation_completeness","phase":"activation","dependencies":["false_acceptance_prevention","readme_contract_truth","langfuse_deferred"],"disposition":{"state":"included","reason":"Activation is a separate native authority event after exact delivery and installation."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"native activation receipt","environment":"intended installed runtime","fail_closed":true},"dispatch_gate":"v226_activation_verified"},
+    {"id":"postactivation_completeness_import","category":"postactivation_completeness","phase":"post_activation","dependencies":["v226_activation_boundary"],"disposition":{"state":"included","reason":"Recorded owner outcomes are imported and completeness-bound immediately after activation."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"host-private owner-intent completeness receipt","environment":"active v2.2.6 host boundary","fail_closed":true},"dispatch_gate":"all_recorded_outcomes_intent_bound"},
+    {"id":"all_owner_outcome_release_enforcement","category":"postactivation_completeness","phase":"post_activation","dependencies":["postactivation_completeness_import"],"disposition":{"state":"included","reason":"Full-proof enforcement covers product releases and every accepted owner outcome."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"outcome acceptance and release token gates","environment":"active host trust boundary","fail_closed":true},"dispatch_gate":"all_outcome_release_gates_active"},
+    {"id":"native_codex_claude_harness_proof","category":"native_harness","phase":"post_activation","dependencies":["all_owner_outcome_release_enforcement"],"disposition":{"state":"included","reason":"Both native harnesses must prove dispatch, wake, fan-out, fan-in, and no prompt steering."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"native Codex and Claude harnesses","environment":"real one-declaration autonomous execution","fail_closed":true},"dispatch_gate":"both_native_harnesses_verified"},
+    {"id":"adjacent_orchestrator_comparison","category":"adjacent_tool_comparison","phase":"post_activation","dependencies":["langfuse_deferred","native_codex_claude_harness_proof"],"disposition":{"state":"included","reason":"Any LangGraph or Langfuse proposal requires a factual current capability comparison and exact source/runtime dependency scan; neither is implied installed."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"authoritative comparison and dependency-scan receipt","environment":"current official sources plus exact installed dependency graph","fail_closed":true},"dispatch_gate":"adjacent_tool_comparison_owner_reviewed"},
+    {"id":"successor_runtime_delivery","category":"successor_runtime","phase":"post_activation","dependencies":["native_codex_claude_harness_proof"],"disposition":{"state":"included","reason":"A successor runtime is implemented and delivered only under active Engineering governance."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"successor runtime release","environment":"exact installed runtime with rollback","fail_closed":true},"dispatch_gate":"successor_runtime_verified_current"},
+    {"id":"capability_observability_api","category":"capability_api","phase":"post_activation","dependencies":["successor_runtime_delivery"],"disposition":{"state":"included","reason":"The exact observability and capability API contract is integrated before dependent consumers."},"acceptance_criteria":{"evidence_class":"end_to_end","interface":"observability and capability API","environment":"served exact successor runtime","fail_closed":true},"dispatch_gate":"capability_contract_verified"},
+    {"id":"named_consumer_contract_correction","category":"consumer_integration","phase":"post_activation","dependencies":["capability_observability_api"],"disposition":{"state":"included","reason":"A named direct-consumer contract correction is a separate accepted slice, not implicit in the wider frontend."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"named direct-consumer capability contract","environment":"served synthetic and disposable read-only live data","fail_closed":true},"dispatch_gate":"named_consumer_correction_owner_accepted"},
+    {"id":"primary_consumer_integration","category":"consumer_integration","phase":"post_activation","dependencies":["named_consumer_contract_correction"],"disposition":{"state":"included","reason":"A primary local consumer integrates the exact capability contract with synthetic and disposable read-only live data."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"governed local consumer slice","environment":"served synthetic and disposable read-only live data","fail_closed":true},"dispatch_gate":"primary_consumer_slice_owner_accepted"},
+    {"id":"external_consumer_owner_receipt","category":"external_consumer","phase":"post_activation","dependencies":["capability_observability_api"],"disposition":{"state":"included","reason":"External-consumer owner authority and acceptance remain in a receipt that Engineering can verify but never mint or impersonate."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"external consumer owner receipt","environment":"host-owned boundary outside candidate Git","fail_closed":true},"dispatch_gate":"external_consumer_authority_verified"},
+    {"id":"external_consumer_integration","category":"external_consumer","phase":"post_activation","dependencies":["external_consumer_owner_receipt"],"disposition":{"state":"included","reason":"An external consumer integrates only through its admitted exact contract and owner review."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"external consumer slice","environment":"served synthetic and disposable read-only live data","fail_closed":true},"dispatch_gate":"external_consumer_slice_owner_accepted"},
+    {"id":"unified_product","category":"unified_product","phase":"post_activation","dependencies":["primary_consumer_integration","external_consumer_integration"],"disposition":{"state":"included","reason":"Unified-product work begins only after the exact integrated capability slice is accepted."},"acceptance_criteria":{"evidence_class":"end_to_end","interface":"unified-product contract","environment":"isolated disjoint worktree","fail_closed":true},"dispatch_gate":"unified_product_admitted"},
+    {"id":"remaining_plugin_independent_frontend","category":"consumer_integration","phase":"post_activation","dependencies":["primary_consumer_integration","external_consumer_integration"],"disposition":{"state":"included","reason":"Remaining plugin-independent frontend work may proceed in parallel under disjoint writers."},"acceptance_criteria":{"evidence_class":"end_to_end","interface":"served frontend routes and controls","environment":"synthetic and read-only live-data browser acceptance","fail_closed":true},"dispatch_gate":"frontend_lane_admitted"},
+    {"id":"full_consumer_release_gate","category":"consumer_integration","phase":"post_activation","dependencies":["unified_product","remaining_plugin_independent_frontend"],"disposition":{"state":"included","reason":"Full frontend release requires whole-surface live-data acceptance, independent audits, and owner approval."},"acceptance_criteria":{"evidence_class":"real_outcome","interface":"complete consumer capability ledger","environment":"served browser with current live-data evidence","fail_closed":true},"dispatch_gate":"full_consumer_release_owner_accepted"}
+  ]
+}
